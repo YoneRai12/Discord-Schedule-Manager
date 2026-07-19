@@ -10,6 +10,19 @@ function capturedAlias(text, patterns) {
   return null;
 }
 
+const HELP_PATTERNS = Object.freeze([
+  /^(?:ヘルプ|help)(?:を)?(?:見せて|表示して|お願い)?$/iu,
+  /(?:使い方|使いかた)(?:を)?(?:教えて|知りたい|見せて|説明して)?/u,
+  /(?:どう|どー)(?:やって)?(?:使う|つかう|使えば|つかえば|使ったら|つかったら)(?:の|いい|いいの|いいですか)?/u,
+  /(?:何|なに)(?:が)?(?:できる|出来る)(?:の|のか|こと)?/u,
+  /(?:できること|出来ること|機能)(?:を)?(?:教えて|見せて|説明して|知りたい)/u,
+]);
+
+export function isHelpIntent(text) {
+  const normalized = String(text ?? "").normalize("NFKC").trim();
+  return HELP_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
 export function parseGuildNaturalCommand(rawText) {
   const text = String(rawText ?? "")
     .normalize("NFKC")
@@ -19,7 +32,7 @@ export function parseGuildNaturalCommand(rawText) {
   if (!text) return { action: "help" };
   const meetingId = meetingIdFrom(text);
 
-  if (/^(?:ヘルプ|help|使い方|何ができる)/iu.test(text)) return { action: "help" };
+  if (isHelpIntent(text)) return { action: "help" };
   if (/自分の(?:個別)?通知設定|個人通知設定|マイ通知/u.test(text) && /(?:見せて|確認|表示|どうなって)/u.test(text)) {
     return { action: "my_reminders_show" };
   }

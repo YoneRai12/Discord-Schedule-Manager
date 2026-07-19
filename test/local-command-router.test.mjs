@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { parseTemplateManagementMessage } from "../src/attendance-templates.mjs";
 import { buildMeetingCommand } from "../src/commands.mjs";
-import { parseGuildNaturalCommand } from "../src/local-command-router.mjs";
+import { isHelpIntent, parseGuildNaturalCommand } from "../src/local-command-router.mjs";
 import { parsePersonalReminderRequest } from "../src/personal-reminders.mjs";
 
 test("Slash Command相当の通常チャンネル@メンション操作をローカル判定する", () => {
@@ -22,6 +22,25 @@ test("Slash Command相当の通常チャンネル@メンション操作をロー
 });
 
 test("会議作成・更新の自由文はAI会議解析へフォールスルーする", () => {
+  assert.equal(parseGuildNaturalCommand("明日20時から定例会を登録して"), null);
+});
+
+test("くだけた聞き方でも使い方ヘルプとしてAIへ送らず判定する", () => {
+  for (const text of [
+    "どうやって使うの",
+    "どーやってつかうの？",
+    "このBotどう使えばいい？",
+    "使い方教えて",
+    "初めてだから使いかたを説明して",
+    "何できるの？",
+    "何が出来るのか教えて",
+    "機能を見せて",
+    "help",
+  ]) {
+    assert.equal(isHelpIntent(text), true, text);
+    assert.deepEqual(parseGuildNaturalCommand(text), { action: "help" }, text);
+  }
+  assert.equal(isHelpIntent("明日20時から定例会を登録して"), false);
   assert.equal(parseGuildNaturalCommand("明日20時から定例会を登録して"), null);
 });
 
