@@ -206,6 +206,42 @@ GOOGLE_SHEETS_SYNC_URLS=false
 
 `GOOGLE_SHEETS_SYNC_URLS=false`ではURL本体を同期しません。値は`RAW`で書き込み、数式注入を防止します。
 
+## 公開WEBへの片方向同期（任意）
+
+SQLiteを唯一の正本としたまま、公開用の最小スナップショットを任意のWEB受信口へHTTPS POSTできます。受信側からBotやSQLiteを書き換える経路はありません。
+
+```env
+MEETING_WEB_SYNC_URL=
+MEETING_WEB_SYNC_SECRET=
+MEETING_WEB_SYNC_INTERVAL_SECONDS=60
+MEETING_WEB_SYNC_TIMEOUT_MS=8000
+MEETING_WEB_SYNC_MAX_RETRIES=2
+```
+
+`MEETING_WEB_SYNC_URL`と32文字以上の`MEETING_WEB_SYNC_SECRET`の両方がある場合だけ有効です。片方だけ、または両方未設定ならsnapshotの作成もHTTP通信も行いません。短いsecretは設定ミスとして起動時に拒否します。
+
+公開される値は次だけです。
+
+- HMACから作る16文字の匿名`id`
+- 開始・終了日時、状態
+- チャンネル通知の時刻
+- URL本体ではなく`registered` / `missing`だけ
+- 参加・未定・欠席・未回答の人数
+
+会議名、会議URL、内部会議ID、DiscordのGuild/Channel/Message/User ID、氏名、呼び名、DM設定、配信ログはprojectionへ入りません。会議名を公開する設定自体を用意していません。
+
+各POSTは本文SHA-256と、次のcanonical文字列に対するHMAC-SHA256署名を付けます。
+
+```text
+POST
+<設定URLのpathname>
+<13桁timestampMs>
+<nonce>
+<bodySha256>
+```
+
+ヘッダーは`X-Meeting-Sync-Timestamp`、`X-Meeting-Sync-Nonce`、`X-Meeting-Sync-Body-SHA256`、`X-Meeting-Sync-Signature`です。payloadは`schemaVersion`、秘密を含まない`sourceRevision`、同じ`timestampMs`を使う`generatedAtMs`、`meetings`だけです。受信側は署名、timestampの許容時間、nonceの未使用を確認してリプレイを拒否してください。secretをGit、README、Issue、クライアント側JavaScriptへ入れてはいけません。secretを変更すると匿名IDも変わります。
+
 ## 通知の挙動
 
 - チャンネル通知の既定は30分前と開始時
@@ -232,6 +268,8 @@ GOOGLE_SHEETS_SYNC_URLS=false
 - `src/database.mjs`: SQLite会議・出欠・通知状態
 - `src/scheduler.mjs`: チャンネル通知
 - `src/sheets-sync.mjs`: 任意のSheetsミラー
+- `src/web-projection.mjs`: WEB公開用の明示allowlist projection
+- `src/web-sync.mjs`: HMAC署名付きの任意片方向WEB同期
 - `src/discord-ui.mjs`: 会議カード、DM、ボタン
 
 ## テスト

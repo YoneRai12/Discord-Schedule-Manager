@@ -10,6 +10,7 @@ import { MeetingInterpreter } from "./interpreter.mjs";
 import { PersonalReminderScheduler } from "./personal-reminder-scheduler.mjs";
 import { MeetingScheduler } from "./scheduler.mjs";
 import { GoogleSheetsSync } from "./sheets-sync.mjs";
+import { MeetingWebSync } from "./web-sync.mjs";
 
 const config = loadConfig();
 const client = createDiscordClient();
@@ -58,6 +59,14 @@ const personalReminderScheduler = new PersonalReminderScheduler({
   intervalSeconds: config.schedulerIntervalSeconds,
   maxLateMinutes: config.maxLateMinutes,
 });
+const webSync = new MeetingWebSync({
+  url: config.webSyncUrl,
+  secret: config.webSyncSecret,
+  intervalSeconds: config.webSyncIntervalSeconds,
+  timeoutMs: config.webSyncTimeoutMs,
+  maxRetries: config.webSyncMaxRetries,
+  store,
+});
 let sheetsInterval = null;
 let shuttingDown = false;
 
@@ -77,7 +86,8 @@ client.once(Events.ClientReady, async (readyClient) => {
     }
     scheduler.start();
     personalReminderScheduler.start();
-    console.log(`[ready] ${readyClient.user.tag} guild=${guild.id} sheets=${sheetsSync.configured ? "on" : "off"} ai=${interpreter.configured ? "on" : "off"}`);
+    webSync.start();
+    console.log(`[ready] ${readyClient.user.tag} guild=${guild.id} sheets=${sheetsSync.configured ? "on" : "off"} web=${webSync.configured ? "on" : "off"} ai=${interpreter.configured ? "on" : "off"}`);
   } catch (error) {
     const code = String(error?.code || error?.status || error?.name || "unknown").slice(0, 80);
     console.error(`[startup] 初期化失敗 code=${code}`);
@@ -137,6 +147,7 @@ async function shutdown(exitCode = 0) {
   shuttingDown = true;
   scheduler.stop();
   personalReminderScheduler.stop();
+  webSync.close();
   sheetsSync.close();
   if (sheetsInterval) clearInterval(sheetsInterval);
   try {
