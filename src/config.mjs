@@ -29,6 +29,14 @@ function boolean(name, fallback = false) {
   throw new Error(`${name} は true または false で指定してください`);
 }
 
+function choice(name, fallback, allowedValues) {
+  const value = String(process.env[name] || fallback).trim().toLowerCase();
+  if (!allowedValues.includes(value)) {
+    throw new Error(`${name} は ${allowedValues.join(", ")} のいずれかで指定してください`);
+  }
+  return value;
+}
+
 export function parseIntegerList(value, { min = 0, max = 10_080, maxItems = 12 } = {}) {
   const items = String(value ?? "")
     .split(",")
@@ -76,7 +84,12 @@ export function loadConfig({ requireSecrets = true } = {}) {
     dataDir,
     databasePath: path.join(dataDir, "meetings.sqlite3"),
     openaiApiKey: String(process.env.OPENAI_API_KEY ?? "").trim(),
-    openaiModel: String(process.env.OPENAI_MEETING_MODEL || "gpt-5.4-nano").trim(),
+    openaiModel: String(process.env.OPENAI_MEETING_MODEL || "gpt-5.6-terra").trim(),
+    openaiReasoningEffort: choice(
+      "OPENAI_REASONING_EFFORT",
+      "medium",
+      ["none", "low", "medium", "high", "xhigh", "max"],
+    ),
     openaiMaxOutputTokens: integer("OPENAI_MAX_OUTPUT_TOKENS", 1_200, { min: 200, max: 8_000 }),
     spreadsheetId: String(process.env.GOOGLE_SHEETS_SPREADSHEET_ID ?? "").trim(),
     googleServiceAccountFile: serviceAccountFile ? path.resolve(PROJECT_ROOT, serviceAccountFile) : "",

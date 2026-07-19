@@ -38,6 +38,8 @@ Copy-Item -LiteralPath ".env.example" -Destination ".env"
 DISCORD_BOT_TOKEN=
 DISCORD_GUILD_ID=
 OPENAI_API_KEY=
+OPENAI_MEETING_MODEL=gpt-5.6-terra
+OPENAI_REASONING_EFFORT=medium
 ```
 
 起動します。
@@ -185,6 +187,8 @@ AIを使わず項目を直接入力する場合は`/meeting create`を使いま�
 OpenAI APIの入出力は、組織またはプロジェクトがデータ共有へ明示的にオプトインしない限り、既定ではモデル学習に使われません。共有を有効にした場合は、その入出力が評価・学習に利用される場合があります。
 
 `store:false`はResponses APIのResponseオブジェクト保存を無効にしますが、不正利用監視ログまで無効にするものではなく、Zero Data Retentionの保証でもありません。通常の不正利用監視ログにはプロンプトや応答が含まれる場合があり、既定では最大30日保持されます。ZDR / Modified Abuse Monitoringは対象顧客がOpenAIの承認を受ける別制度です。
+
+`gpt-5.6-terra`は通常はAPI従量課金です。OpenAIの共有トラフィック特典へ登録済みの対象組織では無料トークン対象ですが、対象プロジェクトでの共有有効化、正のAPI残高、日次上限内であることが必要です。上限超過分は通常料金になります。最新条件はOpenAI公式の[データ共有特典](https://help.openai.com/en/articles/10306912-sharing-feedback-evaluation-and-fine-tuning-data-and-api-inputs-and-outputs-with-openai)と[API料金表](https://developers.openai.com/api/docs/pricing)を確認してください。
 
 そのため、このBotはデータ共有設定に頼らず、URLやDiscord識別子をAIへ送らない構成にしています。会議名そのものも外部APIへ出せない場合は、AIを使わない`/meeting create`と`/meeting url`を使ってください。詳細はOpenAI公式の[データ管理ガイド](https://developers.openai.com/api/docs/guides/your-data)、[Responses APIの保存説明](https://developers.openai.com/api/docs/guides/conversation-state)、[APIデータ利用方針](https://help.openai.com/en/articles/5722486-api-data-usage-policies)を確認してください。
 

@@ -17,6 +17,7 @@ const store = new MeetingDatabase(config.databasePath);
 const interpreter = new MeetingInterpreter({
   apiKey: config.openaiApiKey,
   model: config.openaiModel,
+  reasoningEffort: config.openaiReasoningEffort,
   maxOutputTokens: config.openaiMaxOutputTokens,
   timeZone: config.timeZone,
   defaultDurationMinutes: config.defaultDurationMinutes,

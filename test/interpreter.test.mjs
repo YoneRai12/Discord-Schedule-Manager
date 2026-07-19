@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { MeetingInterpreter, validateInterpretation } from "../src/interpreter.mjs";
+import {
+  MEETING_EXTRACTION_SCHEMA,
+  MeetingInterpreter,
+  validateInterpretation,
+} from "../src/interpreter.mjs";
 
 function validOutput(overrides = {}) {
   return {
@@ -18,7 +22,7 @@ function validOutput(overrides = {}) {
   };
 }
 
-test("OpenAIへは伏せ字本文とURL有無だけをstore:falseで送る", async () => {
+test("GPT-5.6 Terraへ伏せ字本文をreasoning medium・store:false・Structured Outputsで送る", async () => {
   const calls = [];
   const client = {
     responses: {
@@ -30,7 +34,6 @@ test("OpenAIへは伏せ字本文とURL有無だけをstore:falseで送る", asy
   };
   const interpreter = new MeetingInterpreter({
     client,
-    model: "test-model",
     defaultReminderMinutes: [30, 0],
   });
   const result = await interpreter.interpret({
@@ -42,8 +45,13 @@ test("OpenAIへは伏せ字本文とURL有無だけをstore:falseで送る", asy
   assert.equal(result.action, "create");
   assert.equal(result.missingFields.length, 0);
   assert.equal(calls.length, 1);
+  assert.equal(calls[0].model, "gpt-5.6-terra");
+  assert.deepEqual(calls[0].reasoning, { effort: "medium" });
   assert.equal(calls[0].store, false);
   assert.equal(calls[0].text.format.type, "json_schema");
+  assert.equal(calls[0].text.format.name, "meeting_extraction");
+  assert.equal(calls[0].text.format.strict, true);
+  assert.deepEqual(calls[0].text.format.schema, MEETING_EXTRACTION_SCHEMA);
   const serialized = JSON.stringify(calls[0]);
   assert.equal(serialized.includes("uniqueItems"), false);
   assert.equal(serialized.includes("meet.google.com"), false);

@@ -158,7 +158,8 @@ export function validateInterpretation(
 export class MeetingInterpreter {
   constructor({
     apiKey,
-    model = "gpt-5.4-nano",
+    model = "gpt-5.6-terra",
+    reasoningEffort = "medium",
     maxOutputTokens = 1_200,
     timeZone = "Asia/Tokyo",
     defaultDurationMinutes = 60,
@@ -167,6 +168,7 @@ export class MeetingInterpreter {
   }) {
     this.client = client || (apiKey ? new OpenAI({ apiKey }) : null);
     this.model = model;
+    this.reasoningEffort = reasoningEffort;
     this.maxOutputTokens = maxOutputTokens;
     this.timeZone = timeZone;
     this.defaultDurationMinutes = defaultDurationMinutes;
@@ -189,6 +191,7 @@ export class MeetingInterpreter {
     };
     const response = await this.client.responses.create({
       model: this.model,
+      reasoning: { effort: this.reasoningEffort },
       store: false,
       max_output_tokens: this.maxOutputTokens,
       input: [

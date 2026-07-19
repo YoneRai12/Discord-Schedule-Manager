@@ -8,6 +8,7 @@ if (!config.openaiApiKey) throw new Error("OPENAI_API_KEY がありません");
 const interpreter = new MeetingInterpreter({
   apiKey: config.openaiApiKey,
   model: config.openaiModel,
+  reasoningEffort: config.openaiReasoningEffort,
   maxOutputTokens: config.openaiMaxOutputTokens,
   timeZone: config.timeZone,
   defaultDurationMinutes: config.defaultDurationMinutes,
@@ -21,6 +22,7 @@ const result = await interpreter.interpret({
 
 console.log(JSON.stringify({
   model: config.openaiModel,
+  reasoningEffort: config.openaiReasoningEffort,
   action: result.action,
   complete: result.missingFields.length === 0,
   urlReturnedByAi: JSON.stringify(result).includes("https://"),
