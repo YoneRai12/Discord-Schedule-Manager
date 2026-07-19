@@ -62,6 +62,7 @@ const personalReminderScheduler = new PersonalReminderScheduler({
 const webSync = new MeetingWebSync({
   url: config.webSyncUrl,
   secret: config.webSyncSecret,
+  authToken: config.webAuthToken,
   intervalSeconds: config.webSyncIntervalSeconds,
   timeoutMs: config.webSyncTimeoutMs,
   maxRetries: config.webSyncMaxRetries,

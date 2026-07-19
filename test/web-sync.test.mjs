@@ -88,9 +88,11 @@ test("pathname・13桁timestampMs・nonce・本文hashを確定canonicalで署�
   const requests = [];
   const sleeps = [];
   const nowMs = 1_900_000_000_000;
+  const sitesAuthToken = "test-only-sites-bypass-token";
   const sync = new MeetingWebSync({
     url: "https://web-sync.example.invalid/api/internal/v1/projection?source=local",
     secret: SECRET,
+    authToken: sitesAuthToken,
     store: { getSnapshot: privateSnapshot },
     fetchImpl: async (_url, request) => {
       requests.push(request);
@@ -116,6 +118,8 @@ test("pathname・13桁timestampMs・nonce・本文hashを確定canonicalで署�
   assert.equal(timestamp, String(nowMs));
   assert.equal(payload.generatedAtMs, nowMs);
   assert.equal(request.headers["x-meeting-sync-body-sha256"], hash);
+  assert.equal(request.headers["oai-sites-authorization"], `Bearer ${sitesAuthToken}`);
+  assert.doesNotMatch(request.body, new RegExp(sitesAuthToken, "u"));
   const expected = signWebSyncRequest({
     secret: SECRET,
     pathname: "/api/internal/v1/projection",

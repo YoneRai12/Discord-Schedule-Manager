@@ -35,6 +35,7 @@ export class MeetingWebSync {
   constructor({
     url = "",
     secret = "",
+    authToken = "",
     store,
     intervalSeconds = 60,
     timeoutMs = 8_000,
@@ -50,6 +51,7 @@ export class MeetingWebSync {
     this.url = this.configured ? assertEndpoint(String(url).trim()) : "";
     this.pathname = this.configured ? new URL(this.url).pathname : "";
     this.secret = this.configured ? secretValue : "";
+    this.authToken = String(authToken).trim();
     this.store = store;
     this.intervalMs = Math.max(15, Number(intervalSeconds)) * 1_000;
     this.timeoutMs = Math.max(250, Number(timeoutMs));
@@ -130,15 +132,19 @@ export class MeetingWebSync {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
       try {
+        const headers = {
+          "content-type": "application/json",
+          "x-meeting-sync-timestamp": timestamp,
+          "x-meeting-sync-nonce": nonce,
+          "x-meeting-sync-body-sha256": bodyHash,
+          "x-meeting-sync-signature": signature,
+        };
+        if (this.authToken) {
+          headers["oai-sites-authorization"] = `Bearer ${this.authToken}`;
+        }
         const response = await this.fetchImpl(this.url, {
           method: "POST",
-          headers: {
-            "content-type": "application/json",
-            "x-meeting-sync-timestamp": timestamp,
-            "x-meeting-sync-nonce": nonce,
-            "x-meeting-sync-body-sha256": bodyHash,
-            "x-meeting-sync-signature": signature,
-          },
+          headers,
           body,
           signal: controller.signal,
           redirect: "error",

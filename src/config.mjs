@@ -97,6 +97,7 @@ export function loadConfig({ requireSecrets = true } = {}) {
     sheetsSyncIntervalSeconds: integer("GOOGLE_SHEETS_SYNC_INTERVAL_SECONDS", 60, { min: 15, max: 3_600 }),
     webSyncUrl: String(process.env.MEETING_WEB_SYNC_URL ?? "").trim(),
     webSyncSecret: String(process.env.MEETING_WEB_SYNC_SECRET ?? "").trim(),
+    webAuthToken: String(process.env.MEETING_WEB_AUTH_TOKEN ?? "").trim(),
     webSyncIntervalSeconds: integer("MEETING_WEB_SYNC_INTERVAL_SECONDS", 60, { min: 15, max: 3_600 }),
     webSyncTimeoutMs: integer("MEETING_WEB_SYNC_TIMEOUT_MS", 8_000, { min: 250, max: 60_000 }),
     webSyncMaxRetries: integer("MEETING_WEB_SYNC_MAX_RETRIES", 2, { min: 0, max: 5 }),

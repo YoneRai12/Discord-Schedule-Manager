@@ -213,12 +213,15 @@ SQLiteを唯一の正本としたまま、公開用の最小スナップショ�
 ```env
 MEETING_WEB_SYNC_URL=
 MEETING_WEB_SYNC_SECRET=
+MEETING_WEB_AUTH_TOKEN=
 MEETING_WEB_SYNC_INTERVAL_SECONDS=60
 MEETING_WEB_SYNC_TIMEOUT_MS=8000
 MEETING_WEB_SYNC_MAX_RETRIES=2
 ```
 
 `MEETING_WEB_SYNC_URL`と32文字以上の`MEETING_WEB_SYNC_SECRET`の両方がある場合だけ有効です。片方だけ、または両方未設定ならsnapshotの作成もHTTP通信も行いません。短いsecretは設定ミスとして起動時に拒否します。
+
+OpenAI Sitesを所有者限定で公開した場合は、無人API通信用に発行したbypass tokenを`MEETING_WEB_AUTH_TOKEN`へ設定します。これはHMAC secretとは別の認証情報です。一般的なHMAC受信口で不要なら空欄のままにします。値はログ、projection本文、Gitへ出しません。
 
 公開される値は次だけです。
 
