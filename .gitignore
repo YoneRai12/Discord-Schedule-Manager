@@ -1,0 +1,16 @@
+node_modules/
+.env*
+!.env.example
+data/
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+secrets/
+*service-account*.json
+credentials*.json
+*.pem
+*.key
+*.p12
+*.log
+.DS_Store

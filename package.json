@@ -1,0 +1,24 @@
+{
+  "name": "discord-meeting-manager-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "自然言語、参加者テンプレート、個人別通知、出欠集計、Google Sheets同期に対応した予定管理DiscordBOT",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "dev": "node --watch src/index.mjs",
+    "test": "node --test",
+    "check": "node --check src/index.mjs",
+    "security:public": "node scripts/check-public-safety.mjs"
+  },
+  "dependencies": {
+    "discord.js": "^14.27.0",
+    "dotenv": "^17.4.2",
+    "googleapis": "^173.0.0",
+    "openai": "^6.48.0"
+  }
+}
