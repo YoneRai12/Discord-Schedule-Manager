@@ -22,6 +22,23 @@ function privatePayload(payload) {
   };
 }
 
+function fetchedMessages(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (typeof value.values === "function") return [...value.values()];
+  return [value];
+}
+
+function hasMeetingInviteComponent(value, prefix, seen = new Set()) {
+  if (!value || typeof value !== "object" || seen.has(value)) return false;
+  seen.add(value);
+  const customId = value.customId ?? value.custom_id ?? value.data?.custom_id;
+  if (typeof customId === "string" && customId.startsWith(prefix)) return true;
+  const children = value.components ?? value.data?.components;
+  return Array.isArray(children)
+    && children.some((child) => hasMeetingInviteComponent(child, prefix, seen));
+}
+
 /**
  * Discord-specific DM transport.
  *
@@ -71,15 +88,104 @@ export class DiscordDirectMessenger {
     return member;
   }
 
-  async sendMeetingInvite({ meeting, recipient }) {
+  async humanUser(userId) {
+    if (!userId) throw Object.assign(new Error("DM recipient is missing"), { code: "recipient_missing" });
+    if (!this.client.users?.fetch) {
+      throw Object.assign(new Error("Discord user fetch is unavailable"), { code: "user_fetch_unavailable" });
+    }
+    const user = await this.client.users.fetch(String(userId));
+    if (!user || user.bot || user.system) {
+      throw Object.assign(new Error("Recipient is not a human Discord user"), {
+        code: "not_human_user",
+      });
+    }
+    return user;
+  }
+
+  async sendMeetingInvite({ meeting, recipient, beforeSend = null }) {
     this.assertGuild(meeting?.guildId);
     try {
       const member = await this.currentHumanMember(recipient?.userId);
       const payload = privatePayload(await this.buildInvitePayload(meeting, { recipient }));
+      if (beforeSend && !await beforeSend()) {
+        throw Object.assign(new Error("Invite send was superseded"), { code: "stale_invite_send" });
+      }
       const message = await member.user.send(payload);
       return { messageId: String(message.id) };
     } catch (error) {
       this.logger.warn?.(`[direct-messenger] invite_failed code=${compactErrorCode(error)}`);
+      throw error;
+    }
+  }
+
+  async findMeetingInviteMessages({ meeting, recipient, requireCurrentMember = true, limit = 50 }) {
+    this.assertGuild(meeting?.guildId);
+    if (!meeting?.id) {
+      throw Object.assign(new Error("Meeting id is missing"), { code: "meeting_id_missing" });
+    }
+    const botUserId = this.client.user?.id;
+    if (!botUserId) {
+      throw Object.assign(new Error("Bot identity is unavailable"), { code: "bot_identity_missing" });
+    }
+    try {
+      const user = requireCurrentMember
+        ? (await this.currentHumanMember(recipient?.userId)).user
+        : await this.humanUser(recipient?.userId);
+      const channel = await user.createDM();
+      const recent = await channel.messages.fetch({
+        limit: Math.max(1, Math.min(100, Number(limit) || 50)),
+      });
+      const prefix = `meeting:rsvp:${meeting.id}:`;
+      const matches = [];
+      const seen = new Set();
+      for (const message of fetchedMessages(recent)) {
+        if (!message?.id || String(message.author?.id ?? "") !== String(botUserId)) continue;
+        if (!hasMeetingInviteComponent(message, prefix)) continue;
+        const messageId = String(message.id);
+        if (seen.has(messageId)) continue;
+        seen.add(messageId);
+        matches.push({ messageId });
+      }
+      return matches;
+    } catch (error) {
+      this.logger.warn?.(`[direct-messenger] invite_scan_failed code=${compactErrorCode(error)}`);
+      throw error;
+    }
+  }
+
+  async updateMeetingInvite({ meeting, recipient, messageId, beforeEdit = null }) {
+    this.assertGuild(meeting?.guildId);
+    if (!messageId) throw Object.assign(new Error("DM message id is missing"), { code: "message_id_missing" });
+    try {
+      const member = await this.currentHumanMember(recipient?.userId);
+      const channel = await member.user.createDM();
+      const message = await channel.messages.fetch(String(messageId));
+      const payload = privatePayload(await this.buildInvitePayload(meeting, { recipient }));
+      if (beforeEdit && !await beforeEdit()) {
+        throw Object.assign(new Error("Invite update was superseded"), { code: "stale_invite_update" });
+      }
+      await message.edit(payload);
+      return { messageId: String(message.id) };
+    } catch (error) {
+      this.logger.warn?.(`[direct-messenger] invite_update_failed code=${compactErrorCode(error)}`);
+      throw error;
+    }
+  }
+
+  async deleteDirectMessage({ meeting = null, guildId = null, recipient = null, userId = null, messageId, beforeDelete = null }) {
+    this.assertGuild(meeting?.guildId ?? guildId);
+    if (!messageId) throw Object.assign(new Error("DM message id is missing"), { code: "message_id_missing" });
+    try {
+      const user = await this.humanUser(recipient?.userId ?? userId);
+      const channel = await user.createDM();
+      const message = await channel.messages.fetch(String(messageId));
+      if (beforeDelete && !await beforeDelete()) {
+        throw Object.assign(new Error("DM deletion was superseded"), { code: "stale_invite_update" });
+      }
+      await message.delete();
+      return { messageId: String(message.id) };
+    } catch (error) {
+      this.logger.warn?.(`[direct-messenger] direct_delete_failed code=${compactErrorCode(error)}`);
       throw error;
     }
   }

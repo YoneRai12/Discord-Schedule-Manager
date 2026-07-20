@@ -145,12 +145,20 @@ test("Codex App Serverをstdio・一時thread・read-only・承認なしで呼�
   assert.equal(path.dirname(spawnCall.options.cwd), paths.sandboxDir);
   assert.notEqual(spawnCall.options.cwd, spawnCall.options.env.CODEX_HOME);
   assert.ok(path.relative(spawnCall.options.cwd, spawnCall.options.env.CODEX_HOME).startsWith(".."));
-  assert.deepEqual(fs.readdirSync(spawnCall.options.cwd), []);
+  assert.deepEqual(fs.readdirSync(spawnCall.options.cwd), [
+    ".discord-meeting-ai-owner.json",
+  ]);
   assert.deepEqual(fs.readdirSync(spawnCall.options.env.CODEX_HOME).sort(), [
+    ".discord-meeting-ai-owner.json",
     "auth.json",
     "config.toml",
     "model_catalog.json",
   ]);
+  for (const directory of [spawnCall.options.cwd, spawnCall.options.env.CODEX_HOME]) {
+    const marker = JSON.parse(fs.readFileSync(path.join(directory, ".discord-meeting-ai-owner.json"), "utf8"));
+    assert.equal(marker.schemaVersion, 2);
+    assert.ok(Number.isSafeInteger(marker.ownerProcessStartedAtMs));
+  }
   assert.deepEqual(
     JSON.parse(fs.readFileSync(path.join(spawnCall.options.env.CODEX_HOME, "auth.json"), "utf8")),
     {
@@ -354,4 +362,127 @@ test("Codexの構造化結果がローカル上限を超えたら破棄する", 
     (error) => error.code === "output_too_large",
   );
   assert.equal(fake.child.killedByProvider, true);
+});
+
+test("起動時は所有markerがあり停止中の自領域だけを回収する", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-provider-stale-test-"));
+  const sandboxDir = path.join(root, "sandbox");
+  fs.mkdirSync(sandboxDir, { recursive: true });
+  const markerName = ".discord-meeting-ai-owner.json";
+  const makeOwned = (name, kind, ownerPid) => {
+    const target = path.join(sandboxDir, name);
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, markerName), JSON.stringify({
+      schemaVersion: 1,
+      owner: "discord-meeting-manager-bot.codex-app-server",
+      kind,
+      ownerPid,
+      instanceId: `test-${name}`,
+      createdAtMs: Date.now() - 60_000,
+    }));
+    return target;
+  };
+  const staleHome = makeOwned("codex-home-stale", "codex-home", 111);
+  fs.writeFileSync(path.join(staleHome, "auth.json"), "secret");
+  const staleWorkspace = makeOwned("workspace-stale", "workspace", 111);
+  const activeHome = makeOwned("codex-home-active", "codex-home", 222);
+  const unownedHome = path.join(sandboxDir, "codex-home-unowned");
+  const unrelated = path.join(sandboxDir, "other-directory");
+  fs.mkdirSync(unownedHome);
+  fs.mkdirSync(unrelated);
+
+  const provider = new CodexAppServerProvider({
+    sandboxDir,
+    isProcessAlive: (pid) => pid === 222,
+  });
+  const result = provider.recoverStaleOwnedDirectories();
+
+  assert.deepEqual(result, {
+    removed: 2,
+    skippedActive: 1,
+    skippedUnowned: 1,
+    failed: 0,
+  });
+  assert.equal(fs.existsSync(staleHome), false);
+  assert.equal(fs.existsSync(staleWorkspace), false);
+  assert.equal(fs.existsSync(activeHome), true);
+  assert.equal(fs.existsSync(unownedHome), true);
+  assert.equal(fs.existsSync(unrelated), true);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("PIDが再利用された所有markerは回収し、同じプロセス実体の領域は保持する", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-provider-pid-reuse-test-"));
+  const sandboxDir = path.join(root, "sandbox");
+  fs.mkdirSync(sandboxDir, { recursive: true });
+  const markerName = ".discord-meeting-ai-owner.json";
+  const makeOwned = (name, ownerPid, ownerProcessStartedAtMs) => {
+    const target = path.join(sandboxDir, name);
+    fs.mkdirSync(target);
+    fs.writeFileSync(path.join(target, markerName), JSON.stringify({
+      schemaVersion: 2,
+      owner: "discord-meeting-manager-bot.codex-app-server",
+      kind: "codex-home",
+      ownerPid,
+      ownerProcessStartedAtMs,
+      instanceId: `test-${name}`,
+      createdAtMs: Date.now() - 60_000,
+    }));
+    return target;
+  };
+  const reusedPidHome = makeOwned("codex-home-reused-pid", 444, 1_000);
+  fs.writeFileSync(path.join(reusedPidHome, "auth.json"), "");
+  const activeHome = makeOwned("codex-home-active-instance", 555, 3_000);
+
+  const provider = new CodexAppServerProvider({
+    sandboxDir,
+    isProcessAlive: (pid) => pid === 444 || pid === 555,
+    processStartedAtMs: (pid) => ({ 444: 2_000, 555: 3_000 })[pid] ?? null,
+  });
+  const result = provider.recoverStaleOwnedDirectories();
+
+  assert.deepEqual(result, {
+    removed: 1,
+    skippedActive: 1,
+    skippedUnowned: 0,
+    failed: 0,
+  });
+  assert.equal(fs.existsSync(reusedPidHome), false);
+  assert.equal(fs.existsSync(activeHome), true);
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("closeはauth.jsonを最優先で削除し一時領域の削除完了を待てる", async (t) => {
+  const paths = temporaryProviderPaths(t);
+  const fake = fakeAppServer();
+  const removals = [];
+  let firstAuthRemoval = true;
+  const provider = new CodexAppServerProvider({
+    environment: { PATH: "safe", USERPROFILE: paths.root, CODEX_HOME: paths.sourceHome },
+    sandboxDir: paths.sandboxDir,
+    spawnImpl: () => fake.child,
+    cleanupRetryDelayMs: 1,
+    removePath: (target, options) => {
+      removals.push(target);
+      if (target.endsWith(`${path.sep}auth.json`) && firstAuthRemoval) {
+        firstAuthRemoval = false;
+        throw Object.assign(new Error("locked"), { code: "EBUSY" });
+      }
+      fs.rmSync(target, options);
+    },
+  });
+  await provider.initialize();
+  const isolatedHome = provider.isolatedCodexHome;
+  const workspaceDir = provider.workspaceDir;
+
+  const closeResult = provider.close();
+  assert.equal(typeof closeResult?.then, "function");
+  await closeResult;
+
+  const firstAuth = removals.findIndex((target) => target.endsWith(`${path.sep}auth.json`));
+  const firstHome = removals.findIndex((target) => target === isolatedHome);
+  assert.ok(firstAuth >= 0);
+  assert.ok(firstHome > firstAuth);
+  assert.equal(fs.existsSync(isolatedHome), false);
+  assert.equal(fs.existsSync(workspaceDir), false);
 });

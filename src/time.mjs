@@ -52,12 +52,13 @@ export function formatJst(milliseconds) {
 }
 
 export function normalizeReminderMinutes(values, fallback = [30, 0]) {
-  const source = Array.isArray(values) ? values : fallback;
+  const source = values == null ? fallback : values;
+  if (!Array.isArray(source)) return [];
   const normalized = source
     .map((value) => Number(value))
     .filter((value) => Number.isSafeInteger(value) && value >= 0 && value <= 10_080);
   const unique = [...new Set(normalized)].slice(0, 12).sort((a, b) => b - a);
-  return unique.length ? unique : [...fallback];
+  return unique;
 }
 
 export function reminderLabel(minutes) {

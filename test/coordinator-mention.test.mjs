@@ -3,10 +3,21 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { MeetingCoordinator } from "../src/coordinator.mjs";
+import { formatMeetingListContent, MeetingCoordinator } from "../src/coordinator.mjs";
 import { MeetingDatabase } from "../src/database.mjs";
 
 const GUILD_ID = "guild-example";
+
+test("会議一覧はDiscordの本文上限内に収め、残件数を表示する", () => {
+  const meetings = Array.from({ length: 20 }, (_, index) => ({
+    id: `LIST${String(index).padStart(4, "0")}`,
+    title: "長い会議名".repeat(20),
+    startsAtMs: Date.now() + index * 60_000,
+  }));
+  const content = formatMeetingListContent(meetings);
+  assert.ok(content.length <= 1_900);
+  assert.match(content, /…ほか\d+件/u);
+});
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "meeting-mention-test-"));

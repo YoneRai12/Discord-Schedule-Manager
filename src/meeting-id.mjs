@@ -4,7 +4,7 @@ import crypto from "node:crypto";
 export const MEETING_ID_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 export const MEETING_ID_LENGTH = 8;
 export const LEGACY_MEETING_ID_MIN_LENGTH = 7;
-const STANDALONE_ID_STOPWORDS = new Set(["CALENDAR", "DISCORD", "MEETING", "REGISTER", "REMINDER"]);
+const STANDALONE_ID_STOPWORDS = new Set(["CALENDAR", "DISCORD", "MEETING", "REDACTED", "REGISTER", "REMINDER"]);
 
 export function normalizeMeetingId(value, { required = true } = {}) {
   const id = String(value ?? "").normalize("NFKC").trim().toUpperCase().replace(/^#/, "");
@@ -13,22 +13,56 @@ export function normalizeMeetingId(value, { required = true } = {}) {
   throw new Error("会議IDは7〜8文字で指定してください");
 }
 
-export function extractMeetingId(rawText) {
+export function extractMeetingId(rawText, options = {}) {
+  return extractMeetingIds(rawText, options)[0] || null;
+}
+
+export function extractMeetingIds(rawText, { knownIds = [] } = {}) {
   const text = String(rawText ?? "").normalize("NFKC");
-  const labelled = text.match(/(?<![A-Z0-9])(?:meeting\s*)?id\s*[:：=#]?\s*([A-Z0-9]{7,8})(?=$|[\s、。.!！?？:：のをへで])/iu);
-  if (labelled) return normalizeMeetingId(labelled[1], { required: false });
-  // ラベルなしはBotが表示する大文字表記だけを受け、英単語の誤認を避ける。
-  const standalone = text.match(/(?:^|[\s#])([A-Z0-9]{7,8})(?=$|[\s、。.!！?？:：のをへで])/u);
-  if (!standalone || STANDALONE_ID_STOPWORDS.has(standalone[1])) return null;
-  return normalizeMeetingId(standalone[1], { required: false });
+  const ids = [];
+  const seen = new Set();
+  const add = (value) => {
+    const id = normalizeMeetingId(value, { required: false });
+    if (!id || seen.has(id)) return;
+    seen.add(id);
+    ids.push(id);
+  };
+  const labelledPattern = /(?<![A-Z0-9])(?:meeting\s*)?id\s*[:：=#()（）\[\]「」『』-]?\s*([A-Z0-9]{7,8})(?![A-Z0-9])/giu;
+  for (const match of text.matchAll(labelledPattern)) add(match[1]);
+  // ラベルなしはBotが表示する大文字表記だけを受ける。括弧や引用符で
+  // 囲まれたIDもAIへ流さないため、ASCII英数字以外を境界として扱う。
+  const standalonePattern = /(?<![A-Z0-9])([A-Z0-9]{7,8})(?![A-Z0-9])/giu;
+  for (const match of text.matchAll(standalonePattern)) {
+    const raw = match[1];
+    const upper = raw.toUpperCase();
+    // Unlabelled lower-case words are common prose. Treat them as local IDs
+    // only when they contain a digit; labelled IDs above still accept letters.
+    if (raw !== upper && !/\d/u.test(raw)) continue;
+    if (!STANDALONE_ID_STOPWORDS.has(upper)) add(raw);
+  }
+  for (const value of knownIds || []) {
+    const id = normalizeMeetingId(value, { required: false });
+    if (!id) continue;
+    const escaped = id.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+    if (new RegExp(`(^|[^A-Z0-9])${escaped}(?=$|[^A-Z0-9])`, "iu").test(text)) add(id);
+  }
+  return ids;
 }
 
 export function redactMeetingId(rawText, meetingId = extractMeetingId(rawText)) {
+  return redactMeetingIds(rawText, meetingId ? [meetingId] : []);
+}
+
+export function redactMeetingIds(rawText, meetingIds = extractMeetingIds(rawText)) {
   const text = String(rawText ?? "").normalize("NFKC");
-  const id = normalizeMeetingId(meetingId, { required: false });
-  if (!id) return text;
-  const pattern = new RegExp(`(^|[^A-Z0-9])${id}(?=$|[^A-Z0-9])`, "giu");
-  return text.replace(pattern, (_whole, prefix) => `${prefix}[MEETING_ID]`);
+  let redacted = text;
+  for (const value of meetingIds || []) {
+    const id = normalizeMeetingId(value, { required: false });
+    if (!id) continue;
+    const pattern = new RegExp(`(^|[^A-Z0-9])${id}(?=$|[^A-Z0-9])`, "giu");
+    redacted = redacted.replace(pattern, (_whole, prefix) => `${prefix}[MEETING_ID]`);
+  }
+  return redacted;
 }
 
 function randomMeetingId(randomBytes = crypto.randomBytes) {

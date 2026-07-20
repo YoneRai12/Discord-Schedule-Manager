@@ -17,8 +17,12 @@ test("開始時通知だけ@everyoneを明示許可して送信済みにする",
   };
   const store = {
     claimDueDeliveries: () => [delivery],
+    isDeliveryClaimCurrent: () => true,
     listRsvps: () => [{ status: "attending" }, { status: "declined" }],
-    markDeliverySent: (...args) => marked.push(args),
+    markDeliverySent: (...args) => {
+      marked.push(args);
+      return true;
+    },
     markDeliveryFailed: () => assert.fail("失敗扱いになりました"),
   };
   const client = {
@@ -39,4 +43,197 @@ test("開始時通知だけ@everyoneを明示許可して送信済みにする",
   assert.match(sentPayloads[0].content, /^@everyone/u);
   assert.deepEqual(sentPayloads[0].allowedMentions, { parse: ["everyone"] });
   assert.equal(marked.length, 1);
+});
+
+test("claim後に延期または中止された配送は送信直前の再確認で止める", async () => {
+  let checks = 0;
+  let sends = 0;
+  let marked = 0;
+  const delivery = {
+    meetingId: "ABCD1234",
+    channelId: "channel-example",
+    offsetMinutes: 0,
+    scheduleRevision: 0,
+    claimToken: "claim-old",
+    startsAtMs: Date.now(),
+    endsAtMs: Date.now() + 60_000,
+    title: "会議",
+    meetingUrl: "https://meet.example.com/room",
+  };
+  const scheduler = new MeetingScheduler({
+    store: {
+      claimDueDeliveries: () => [delivery],
+      isDeliveryClaimCurrent: () => {
+        checks += 1;
+        return checks === 1;
+      },
+      listRsvps: () => [],
+      markDeliverySent: () => { marked += 1; },
+      markDeliveryFailed: () => { marked += 1; },
+    },
+    client: {
+      channels: {
+        fetch: async () => ({
+          isTextBased: () => true,
+          send: async () => {
+            sends += 1;
+            return { id: "must-not-send" };
+          },
+        }),
+      },
+    },
+    intervalSeconds: 15,
+  });
+
+  await scheduler.tick();
+  assert.equal(checks, 2);
+  assert.equal(sends, 0);
+  assert.equal(marked, 0);
+});
+
+test("Discord送信中に予定が更新された場合は古い通知を削除する", async () => {
+  let checks = 0;
+  let sends = 0;
+  let deletes = 0;
+  let marked = 0;
+  const delivery = {
+    meetingId: "ABCD1234",
+    channelId: "channel-example",
+    offsetMinutes: 0,
+    scheduleRevision: 0,
+    claimToken: "claim-old",
+    startsAtMs: Date.now(),
+    endsAtMs: Date.now() + 60_000,
+    title: "会議",
+    meetingUrl: "https://meet.example.com/room",
+  };
+  const scheduler = new MeetingScheduler({
+    store: {
+      claimDueDeliveries: () => [delivery],
+      isDeliveryClaimCurrent: () => {
+        checks += 1;
+        return checks < 3;
+      },
+      listRsvps: () => [],
+      markDeliverySent: () => { marked += 1; },
+      markDeliveryFailed: () => { marked += 1; },
+    },
+    client: {
+      channels: {
+        fetch: async () => ({
+          isTextBased: () => true,
+          send: async () => {
+            sends += 1;
+            return {
+              id: "stale-message",
+              delete: async () => { deletes += 1; },
+            };
+          },
+        }),
+      },
+    },
+    intervalSeconds: 15,
+  });
+
+  await scheduler.tick();
+  assert.equal(checks, 3);
+  assert.equal(sends, 1);
+  assert.equal(deletes, 1);
+  assert.equal(marked, 0);
+});
+
+test("stopAndDrainは進行中の送信完了まで待ってから停止する", async () => {
+  let releaseSend;
+  const sendBarrier = new Promise((resolve) => { releaseSend = resolve; });
+  let marked = false;
+  const scheduler = new MeetingScheduler({
+    store: {
+      claimDueDeliveries: () => [{
+        meetingId: "ABCD1234",
+        channelId: "channel-example",
+        offsetMinutes: 0,
+        scheduleRevision: 0,
+        claimToken: "claim-current",
+        startsAtMs: Date.now(),
+        endsAtMs: Date.now() + 60_000,
+        title: "会議",
+        meetingUrl: "https://meet.example.com/room",
+      }],
+      isDeliveryClaimCurrent: () => true,
+      listRsvps: () => [],
+      markDeliverySent: () => {
+        marked = true;
+        return true;
+      },
+      markDeliveryFailed: () => false,
+    },
+    client: {
+      channels: {
+        fetch: async () => ({
+          isTextBased: () => true,
+          send: async () => {
+            await sendBarrier;
+            return { id: "message-1" };
+          },
+        }),
+      },
+    },
+    intervalSeconds: 60,
+  });
+
+  const tick = scheduler.tick();
+  await new Promise((resolve) => setImmediate(resolve));
+  let drained = false;
+  const stopping = scheduler.stopAndDrain(1_000).then((value) => {
+    drained = value;
+    return value;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(drained, false);
+  releaseSend();
+  assert.equal(await stopping, true);
+  await tick;
+  assert.equal(marked, true);
+});
+
+test("送信成功後のreceipt保存失敗は再送待ちへ戻さない", async () => {
+  const uncertain = [];
+  const delivery = {
+    meetingId: "ABCD1234",
+    channelId: "channel-example",
+    offsetMinutes: 0,
+    scheduleRevision: 2,
+    claimToken: "claim-current",
+    startsAtMs: Date.now(),
+    endsAtMs: Date.now() + 60_000,
+    title: "会議",
+    meetingUrl: "https://meet.example.com/room",
+  };
+  const scheduler = new MeetingScheduler({
+    store: {
+      claimDueDeliveries: () => [delivery],
+      isDeliveryClaimCurrent: () => true,
+      listRsvps: () => [],
+      markDeliverySent: () => { throw Object.assign(new Error("db unavailable"), { code: "db_busy" }); },
+      markDeliveryFailed: () => assert.fail("再送待ちへ戻しました"),
+      markDeliveryUncertain: (...args) => {
+        uncertain.push(args);
+        return true;
+      },
+    },
+    client: {
+      channels: {
+        fetch: async () => ({
+          isTextBased: () => true,
+          send: async () => ({ id: "already-visible" }),
+        }),
+      },
+    },
+    logger: { error() {}, warn() {} },
+  });
+
+  await scheduler.tick();
+  assert.equal(uncertain.length, 1);
+  assert.equal(uncertain[0][2].errorCode, "receipt_persist_failed");
+  assert.equal(uncertain[0][2].discordMessageId, "already-visible");
 });

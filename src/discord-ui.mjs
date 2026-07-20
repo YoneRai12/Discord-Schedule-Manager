@@ -27,7 +27,7 @@ function reminderText(meeting, everyoneOffsets = [0]) {
   const everyone = new Set(everyoneOffsets.map(Number));
   return meeting.reminderMinutes
     .map((minutes) => `${reminderLabel(minutes)}${everyone.has(minutes) ? "（@everyone）" : ""}`)
-    .join("、");
+    .join("、") || "なし";
 }
 
 function unansweredNames(invitees, rsvps) {
@@ -41,28 +41,28 @@ function unansweredNames(invitees, rsvps) {
 }
 
 function buildRsvpRow(meeting, { includeUrl = true } = {}) {
-  const cancelled = meeting.status === "cancelled";
+  const inactive = meeting.status !== "active";
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId(`meeting:rsvp:${meeting.id}:attending`)
       .setLabel("参加")
       .setEmoji("✅")
       .setStyle(ButtonStyle.Success)
-      .setDisabled(cancelled),
+      .setDisabled(inactive),
     new ButtonBuilder()
       .setCustomId(`meeting:rsvp:${meeting.id}:maybe`)
       .setLabel("未定")
       .setEmoji("🤔")
       .setStyle(ButtonStyle.Secondary)
-      .setDisabled(cancelled),
+      .setDisabled(inactive),
     new ButtonBuilder()
       .setCustomId(`meeting:rsvp:${meeting.id}:declined`)
       .setLabel("欠席")
       .setEmoji("❌")
       .setStyle(ButtonStyle.Danger)
-      .setDisabled(cancelled),
+      .setDisabled(inactive),
   );
-  if (includeUrl && !cancelled && meeting.meetingUrl) {
+  if (includeUrl && !inactive && meeting.meetingUrl) {
     row.addComponents(
       new ButtonBuilder()
         .setLabel("会議URLを開く")
@@ -76,9 +76,10 @@ function buildRsvpRow(meeting, { includeUrl = true } = {}) {
 
 export function buildMeetingPayload(meeting, rsvps, { everyoneOffsets = [0], invitees = [] } = {}) {
   const cancelled = meeting.status === "cancelled";
+  const completed = meeting.status === "completed";
   const embed = new EmbedBuilder()
-    .setColor(cancelled ? 0x747f8d : 0x5865f2)
-    .setTitle(`${cancelled ? "【中止】" : "📅"} ${safeDisplayText(meeting.title, 100)}`)
+    .setColor(cancelled || completed ? 0x747f8d : 0x5865f2)
+    .setTitle(`${cancelled ? "【中止】" : completed ? "【終了】" : "📅"} ${safeDisplayText(meeting.title, 100)}`)
     .setDescription([
       `**開始:** ${discordTimestamp(meeting.startsAtMs, "F")}（${discordTimestamp(meeting.startsAtMs, "R")}）`,
       `**終了予定:** ${discordTimestamp(meeting.endsAtMs, "t")}`,
@@ -108,7 +109,7 @@ export function buildDraftPayload(draft) {
   }
   if (draft.startsAtMs != null) lines.push(`**開始:** ${discordTimestamp(draft.startsAtMs, "F")}`);
   if (draft.endsAtMs != null) lines.push(`**終了予定:** ${discordTimestamp(draft.endsAtMs, "t")}`);
-  if (draft.reminderMinutes) lines.push(`**通知:** ${draft.reminderMinutes.map(reminderLabel).join("、")}`);
+  if (draft.reminderMinutes) lines.push(`**通知:** ${draft.reminderMinutes.map(reminderLabel).join("、") || "なし"}`);
   lines.push(`**会議URL:** ${draft.meetingUrl ? "登録済み（GPTへは未送信）" : "変更なし"}`);
   if (draft.templateName) {
     lines.push(`**参加者テンプレート:** ${safeDisplayText(draft.templateName, 40)}（会議用に${draft.invitees?.length || 0}人を確定）`);
@@ -141,10 +142,19 @@ export function buildDraftPayload(draft) {
 }
 
 export function buildDirectInvitePayload(meeting, { personalReminderMinutes = [] } = {}) {
-  const embed = new EmbedBuilder()
-    .setColor(0x5865f2)
-    .setTitle(`📨 出席確認: ${safeDisplayText(meeting.title, 90)}`)
-    .setDescription([
+  const cancelled = meeting.status === "cancelled";
+  const completed = meeting.status === "completed";
+  const description = cancelled
+    ? [
+      "この会議は中止になりました。以前の会議URLは開けないようにしました。",
+      `**予定していた開始:** ${discordTimestamp(meeting.startsAtMs, "F")}`,
+    ]
+    : completed
+      ? [
+        "この会議は終了しました。会議URLと出欠ボタンは無効です。",
+        `**開始:** ${discordTimestamp(meeting.startsAtMs, "F")}`,
+      ]
+      : [
       `**開始:** ${discordTimestamp(meeting.startsAtMs, "F")}（${discordTimestamp(meeting.startsAtMs, "R")}）`,
       `**終了予定:** ${discordTimestamp(meeting.endsAtMs, "t")}`,
       "**会議URL:** 下の「会議URLを開く」ボタン",
@@ -152,7 +162,11 @@ export function buildDirectInvitePayload(meeting, { personalReminderMinutes = []
       "下のボタンを押すか、このDMに「参加します」「未定です」「欠席します」のように返信してください。",
       "通知時刻は「1時間前と10分前に通知して」「今回は通知なし」のように返信すると変更できます。",
       `複数の会議がある場合は、例: \`${meeting.id} 参加\` のように会議IDも書いてください。`,
-    ].join("\n"))
+    ];
+  const embed = new EmbedBuilder()
+    .setColor(cancelled || completed ? 0x747f8d : 0x5865f2)
+    .setTitle(`${cancelled ? "【中止】" : completed ? "【終了】" : "📨 出席確認:"} ${safeDisplayText(meeting.title, 90)}`)
+    .setDescription(description.join("\n"))
     .setFooter({ text: `会議ID: ${meeting.id} • DMの回答文はGPTへ送信されません` });
   return {
     embeds: [embed],

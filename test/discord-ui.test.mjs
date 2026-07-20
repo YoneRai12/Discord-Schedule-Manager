@@ -38,3 +38,13 @@ test("個別DMには出欠ボタン・会議URL・ローカル回答の説明を
   assert.equal(buttons.at(-1).url, meeting.meetingUrl);
   assert.match(embed.footer.text, /GPTへ送信されません/u);
 });
+
+test("終了済み会議はURLを隠し出欠ボタンを無効化する", () => {
+  const completed = { ...meeting, status: "completed" };
+  const payload = buildMeetingPayload(completed, []);
+  const embed = payload.embeds[0].toJSON();
+  const buttons = payload.components[0].toJSON().components;
+  assert.match(embed.title, /終了/u);
+  assert.equal(buttons.length, 3);
+  assert.equal(buttons.every((button) => button.disabled), true);
+});

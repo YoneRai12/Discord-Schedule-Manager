@@ -6,6 +6,8 @@ import { CodexAppServerProvider } from "./ai/codex-app-server-provider.mjs";
 import { MeetingDatabase } from "./database.mjs";
 import { createDiscordClient } from "./discord-client.mjs";
 import { DiscordDirectMessenger } from "./discord-direct-messenger.mjs";
+import { DirectInviteUpdateScheduler } from "./direct-invite-update-scheduler.mjs";
+import { MeetingCardUpdateScheduler } from "./meeting-card-update-scheduler.mjs";
 import { buildDirectInvitePayload, buildPersonalReminderPayload } from "./discord-ui.mjs";
 import { MeetingInterpreter } from "./interpreter.mjs";
 import { meetingMessageText } from "./message-routing.mjs";
@@ -13,6 +15,10 @@ import { PersonalReminderScheduler } from "./personal-reminder-scheduler.mjs";
 import { MeetingScheduler } from "./scheduler.mjs";
 import { GoogleSheetsSync } from "./sheets-sync.mjs";
 import { MeetingWebSync } from "./web-sync.mjs";
+import {
+  initializeOptionalSheets,
+  stopSchedulerAndDrain,
+} from "../scripts/runtime-support.mjs";
 
 const config = loadConfig();
 const client = createDiscordClient();
@@ -49,6 +55,17 @@ const directMessenger = new DiscordDirectMessenger({
   }),
   buildReminderPayload: buildPersonalReminderPayload,
 });
+const directInviteUpdateScheduler = new DirectInviteUpdateScheduler({
+  store,
+  directMessenger,
+  intervalSeconds: config.schedulerIntervalSeconds,
+});
+const meetingCardUpdateScheduler = new MeetingCardUpdateScheduler({
+  store,
+  client,
+  everyoneOffsets: config.everyoneOffsets,
+  intervalSeconds: config.schedulerIntervalSeconds,
+});
 const coordinator = new MeetingCoordinator({
   client,
   store,
@@ -56,6 +73,8 @@ const coordinator = new MeetingCoordinator({
   sheetsSync,
   config,
   directMessenger,
+  directInviteUpdateScheduler,
+  meetingCardUpdateScheduler,
 });
 const scheduler = new MeetingScheduler({
   client,
@@ -80,26 +99,26 @@ const webSync = new MeetingWebSync({
   store,
 });
 let sheetsInterval = null;
-let shuttingDown = false;
+let sheetsEnabled = false;
+let shutdownPromise = null;
 
 client.once(Events.ClientReady, async (readyClient) => {
   try {
     const guild = await readyClient.guilds.fetch(config.guildId);
     store.bindTenant({ guildId: guild.id, botUserId: readyClient.user.id });
     await coordinator.registerCommands();
-    if (sheetsSync.configured) {
-      await sheetsSync.initialize();
-      await sheetsSync.sync();
-      sheetsInterval = setInterval(() => void sheetsSync.sync().catch((error) => {
-        const code = String(error?.code || error?.status || "unknown").slice(0, 80);
-        console.error(`[sheets] 定期同期失敗 code=${code}`);
-      }), config.sheetsSyncIntervalSeconds * 1_000);
-      sheetsInterval.unref?.();
-    }
+    const sheetsStartup = await initializeOptionalSheets({
+      sheetsSync,
+      intervalMs: config.sheetsSyncIntervalSeconds * 1_000,
+    });
+    sheetsEnabled = sheetsStartup.enabled;
+    sheetsInterval = sheetsStartup.interval;
     scheduler.start();
     personalReminderScheduler.start();
+    directInviteUpdateScheduler.start();
+    meetingCardUpdateScheduler.start();
     webSync.start();
-    console.log(`[ready] ${readyClient.user.tag} guild=${guild.id} sheets=${sheetsSync.configured ? "on" : "off"} web=${webSync.configured ? "on" : "off"} ai=${interpreter.configured ? config.meetingAiProvider : "off"}`);
+    console.log(`[ready] ${readyClient.user.tag} guild=${guild.id} sheets=${sheetsEnabled ? "on" : "off"} web=${webSync.configured ? "on" : "off"} ai=${interpreter.configured ? config.meetingAiProvider : "off"}`);
     if (codexProvider) {
       void interpreter.initialize().then(() => {
         console.log(`[ai] codex app-server ready model=${config.codexMeetingModel} effort=${config.codexReasoningEffort}`);
@@ -175,20 +194,29 @@ client.on(Events.Error, (error) => {
 });
 
 async function shutdown(exitCode = 0) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  scheduler.stop();
-  personalReminderScheduler.stop();
-  webSync.close();
-  interpreter.close();
-  sheetsSync.close();
-  if (sheetsInterval) clearInterval(sheetsInterval);
-  try {
-    client.destroy();
-  } finally {
-    store.close();
-  }
-  process.exitCode = exitCode;
+  if (shutdownPromise) return shutdownPromise;
+  shutdownPromise = (async () => {
+    if (sheetsInterval) {
+      clearInterval(sheetsInterval);
+      sheetsInterval = null;
+    }
+    sheetsSync.close();
+    webSync.close();
+    await Promise.all([
+      stopSchedulerAndDrain(scheduler, { timeoutMs: 10_000, label: "meeting-scheduler" }),
+      stopSchedulerAndDrain(personalReminderScheduler, { timeoutMs: 10_000, label: "personal-reminder-scheduler" }),
+      stopSchedulerAndDrain(directInviteUpdateScheduler, { timeoutMs: 10_000, label: "direct-invite-update-scheduler" }),
+      stopSchedulerAndDrain(meetingCardUpdateScheduler, { timeoutMs: 10_000, label: "meeting-card-update-scheduler" }),
+    ]);
+    await codexProvider?.close?.();
+    try {
+      client.destroy();
+    } finally {
+      store.close();
+    }
+    process.exitCode = exitCode;
+  })();
+  return shutdownPromise;
 }
 
 process.once("SIGINT", () => void shutdown(0));

@@ -2,7 +2,7 @@
   "name": "discord-meeting-manager-bot",
   "version": "0.1.0",
   "private": true,
-  "description": "自然言語、参加者テンプレート、個人別通知、出欠集計、Google Sheets同期に対応した予定管理DiscordBOT",
+  "description": "自然言語、参加者テンプレート、個人別通知、出欠集計、Google Sheets同期に対応した予定管理Discord Bot",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -14,7 +14,8 @@
     "test": "node --test",
     "check": "node --check src/index.mjs",
     "security:public": "node scripts/check-public-safety.mjs",
-    "smoke:codex": "node scripts/smoke-codex-app-server.mjs"
+    "smoke:codex": "node scripts/smoke-codex-app-server.mjs",
+    "backup": "node scripts/backup-database.mjs"
   },
   "dependencies": {
     "discord.js": "^14.27.0",

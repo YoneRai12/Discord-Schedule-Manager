@@ -1,4 +1,5 @@
 const PARTICIPANT_DIRECTIVE_RE = /(?:参加者|対象者|DM送信先|送信先)\s*(?:は|:|：)\s*(.+?)(?=(?:\s+(?:URL|リンク)\s*(?:は|:|：))|(?:\s+(?:を|で|として)\s*(?:テンプレート(?:として)?\s*)?(?:保存|登録)(?:して|する)?(?:ください)?\s*$)|[\r\n。.!！?？]|$)/giu;
+const DISABLE_INVITES_RE = /(?:今回(?:は)?\s*)?(?:(?:参加者|対象者|招待者)\s*(?:は|:|：)?\s*(?:なし|不要|誰もなし)|(?:個別\s*)?DM(?:送信)?\s*(?:は|:|：)?\s*(?:なし|不要|送らない|送信しない)|招待\s*(?:は|:|：)?\s*(?:なし|不要|しない))/giu;
 const DISCORD_USER_MENTION_RE = /<@!?\d{16,20}>/gu;
 const ALIAS_BOUNDARY_RE = /[\s、,，・/／「」『』【】()（）:：]/u;
 const LEFT_PARTICLE_RE = /[はにとがをへで]/u;
@@ -23,14 +24,34 @@ export function normalizeMemberAlias(value) {
   };
 }
 
-export function parseMemberAliasList(value) {
-  const rawItems = String(value ?? "")
+function stripAliasDecoration(value) {
+  return String(value ?? "")
+    .replace(/^(?:と|及び|および)\s*/u, "")
+    .replace(/\s*(?:さん|さま|様|ちゃん|くん)$/u, "")
+    .replace(/\s*(?:と|及び|および)$/u, "")
+    .trim();
+}
+
+export function parseMemberAliasList(value, { knownAliases = [] } = {}) {
+  const normalizedValue = String(value ?? "").normalize("NFKC");
+  const detected = extractKnownMemberAliases(normalizedValue, knownAliases);
+  let unknownText = normalizedValue;
+  for (const alias of [...detected].sort((a, b) => [...b].length - [...a].length)) {
+    unknownText = unknownText.replace(new RegExp(escapeRegExp(alias), "giu"), " ");
+  }
+  unknownText = unknownText
+    .replace(/(?:さん|さま|様|ちゃん|くん)/gu, " ")
+    .replace(/(?:^|\s)(?:と|及び|および)(?=\s|$)/gu, " ")
+    .replace(/^\s*(?:と|及び|および)\s*/u, "")
+    .replace(/\s*(?:と|及び|および)\s*$/u, "");
+  const rawItems = unknownText
     .replace(DISCORD_USER_MENTION_RE, " ")
     .split(/[、,，\s]+/u)
-    .map((item) => item.trim())
+    .map(stripAliasDecoration)
     .filter(Boolean);
-  const aliases = [];
+  const aliases = [...detected];
   const keys = new Set();
+  for (const alias of detected) keys.add(normalizeMemberAlias(alias).aliasKey);
   for (const item of rawItems) {
     const normalized = normalizeMemberAlias(item);
     if (keys.has(normalized.aliasKey)) continue;
@@ -52,17 +73,22 @@ function splitParticipantListText(value) {
   return { participantText, remainderText };
 }
 
-export function extractParticipantDirective(rawText) {
+export function extractParticipantDirective(rawText, { knownAliases = [] } = {}) {
   const aliases = [];
   let found = false;
   let disableInvites = false;
-  const cleanedText = String(rawText ?? "").replace(PARTICIPANT_DIRECTIVE_RE, (whole, list) => {
+  let cleanedText = String(rawText ?? "").replace(DISABLE_INVITES_RE, () => {
+    found = true;
+    disableInvites = true;
+    return "[MEMBERS_REDACTED]";
+  });
+  cleanedText = cleanedText.replace(PARTICIPANT_DIRECTIVE_RE, (whole, list) => {
     found = true;
     const { participantText, remainderText } = splitParticipantListText(list);
     if (/^(?:なし|不要|誰もなし|DMなし|個別DMなし)$/iu.test(participantText)) {
       disableInvites = true;
-    } else if (participantText) {
-      aliases.push(...parseMemberAliasList(participantText));
+    } else if (participantText && !disableInvites) {
+      aliases.push(...parseMemberAliasList(participantText, { knownAliases }));
     }
     return `[MEMBERS_REDACTED]${remainderText ? ` ${remainderText}` : ""}`;
   });

@@ -12,6 +12,7 @@ function fixtureStore(deliveries = []) {
         calls.claims.push(options);
         return deliveries;
       },
+      isClaimCurrent: async () => true,
       markSent: async (...args) => calls.sent.push(args),
       markFailed: async (...args) => calls.failed.push(args),
     },
@@ -47,6 +48,127 @@ test("複数の個人通知を一括claimして、それぞれ一度だけ送信
     leaseMs: 120_000,
     limit: 25,
   });
+});
+
+test("延期または中止で古くなった個別DM claimは送信直前に止める", async () => {
+  let checks = 0;
+  let sends = 0;
+  const calls = { sent: 0, failed: 0 };
+  const scheduler = new PersonalReminderScheduler({
+    store: {
+      personalReminders: {
+        claimDueDeliveries: async () => [{
+          id: "delivery-old",
+          deliveryId: "delivery-old",
+          dueAtMs: 2_000_000,
+          scheduleRevision: 0,
+          claimToken: "claim-old",
+        }],
+        isClaimCurrent: async () => {
+          checks += 1;
+          return checks === 1;
+        },
+        markSent: async () => { calls.sent += 1; },
+        markFailed: async () => { calls.failed += 1; },
+      },
+    },
+    directMessenger: {
+      sendPersonalReminder: async () => {
+        sends += 1;
+        return { messageId: "must-not-send" };
+      },
+    },
+    now: () => 2_000_000,
+  });
+
+  const result = await scheduler.tick();
+  assert.equal(checks, 2);
+  assert.equal(sends, 0);
+  assert.equal(calls.sent, 0);
+  assert.equal(calls.failed, 0);
+  assert.deepEqual(result, { claimed: 1, sent: 0, failed: 0, stale: 1, skipped: false });
+});
+
+test("個別DM送信中に予定が更新された場合は古い通知を削除する", async () => {
+  let checks = 0;
+  let sends = 0;
+  let deletes = 0;
+  let marked = 0;
+  const scheduler = new PersonalReminderScheduler({
+    store: {
+      personalReminders: {
+        claimDueDeliveries: async () => [{
+          id: "delivery-old",
+          deliveryId: "delivery-old",
+          guildId: "guild-example",
+          userId: "user-example",
+          dueAtMs: 2_000_000,
+          scheduleRevision: 0,
+          claimToken: "claim-old",
+        }],
+        isClaimCurrent: async () => {
+          checks += 1;
+          return checks < 3;
+        },
+        markSent: async () => { marked += 1; },
+        markFailed: async () => { marked += 1; },
+      },
+    },
+    directMessenger: {
+      sendPersonalReminder: async () => {
+        sends += 1;
+        return { messageId: "stale-dm" };
+      },
+      deleteDirectMessage: async ({ messageId }) => {
+        assert.equal(messageId, "stale-dm");
+        deletes += 1;
+      },
+    },
+    now: () => 2_000_000,
+  });
+
+  const result = await scheduler.tick();
+  assert.equal(checks, 3);
+  assert.equal(sends, 1);
+  assert.equal(deletes, 1);
+  assert.equal(marked, 0);
+  assert.deepEqual(result, { claimed: 1, sent: 0, failed: 0, stale: 1, skipped: false });
+});
+
+test("個別DMのstopAndDrainも進行中送信を待つ", async () => {
+  let releaseSend;
+  const barrier = new Promise((resolve) => { releaseSend = resolve; });
+  const store = fixtureStore([{
+    id: "delivery-current",
+    deliveryId: "delivery-current",
+    dueAtMs: 4_000_000,
+    scheduleRevision: 0,
+    claimToken: "claim-current",
+  }]);
+  const scheduler = new PersonalReminderScheduler({
+    store,
+    directMessenger: {
+      sendPersonalReminder: async () => {
+        await barrier;
+        return { messageId: "message-current" };
+      },
+    },
+    now: () => 4_000_000,
+    intervalSeconds: 60,
+  });
+  const tick = scheduler.tick();
+  await new Promise((resolve) => setImmediate(resolve));
+  let drained = false;
+  const stopping = scheduler.stopAndDrain(1_000).then((value) => {
+    drained = value;
+    return value;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(drained, false);
+  releaseSend();
+  assert.equal(await stopping, true);
+  await tick;
+  assert.equal(store.calls.sent.length, 1);
 });
 
 test("同時tickは再入せず、最大遅延を超えた配送は送らない", async () => {
@@ -104,24 +226,52 @@ test("start/stopは多重タイマーを作らず再開できる", () => {
 
 test("DiscordDirectMessengerは在籍確認後にのみDMし、mentionを無効化する", async () => {
   const sentPayloads = [];
+  const editedPayloads = [];
+  let guildFetches = 0;
   const client = {
-    guilds: {
+    users: {
       fetch: async () => ({
-        id: "guild-template",
-        members: {
-          fetch: async () => ({
-            guild: { id: "guild-template" },
-            user: {
-              bot: false,
-              system: false,
-              send: async (payload) => {
-                sentPayloads.push(payload);
-                return { id: "message-template" };
-              },
-            },
-          }),
-        },
+        bot: false,
+        system: false,
+        createDM: async () => ({
+          messages: {
+            fetch: async () => ({
+              id: "message-template",
+              edit: async (payload) => { editedPayloads.push(payload); },
+              delete: async () => {},
+            }),
+          },
+        }),
       }),
+    },
+    guilds: {
+      fetch: async () => {
+        guildFetches += 1;
+        return {
+          id: "guild-template",
+          members: {
+            fetch: async () => ({
+              guild: { id: "guild-template" },
+              user: {
+                bot: false,
+                system: false,
+                send: async (payload) => {
+                  sentPayloads.push(payload);
+                  return { id: "message-template" };
+                },
+                createDM: async () => ({
+                  messages: {
+                    fetch: async () => ({
+                      id: "message-template",
+                      edit: async (payload) => { editedPayloads.push(payload); },
+                    }),
+                  },
+                }),
+              },
+            }),
+          },
+        };
+      },
     },
   };
   const messenger = new DiscordDirectMessenger({
@@ -138,7 +288,22 @@ test("DiscordDirectMessengerは在籍確認後にのみDMし、mentionを無効�
   });
 
   assert.deepEqual(receipt, { messageId: "message-template" });
+  assert.equal(guildFetches, 1);
   assert.deepEqual(sentPayloads[0].allowedMentions, { parse: [], repliedUser: false });
+  const updateReceipt = await messenger.updateMeetingInvite({
+    meeting: { guildId: "guild-template" },
+    recipient: { userId: "member-template" },
+    messageId: "message-template",
+  });
+  assert.deepEqual(updateReceipt, { messageId: "message-template" });
+  assert.equal(guildFetches, 2, "既存DMへ最新URLを反映する直前にもGuild在籍を確認する");
+  assert.deepEqual(editedPayloads[0].allowedMentions, { parse: [], repliedUser: false });
+  await messenger.deleteDirectMessage({
+    meeting: { guildId: "guild-template" },
+    recipient: { userId: "member-template" },
+    messageId: "message-template",
+  });
+  assert.equal(guildFetches, 2, "補償削除は退会者にも実行できるようGuild在籍確認をしない");
 });
 
 test("送信済みreceiptの保存に失敗した場合は再送不可として記録する", async () => {

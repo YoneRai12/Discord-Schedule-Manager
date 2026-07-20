@@ -11,10 +11,15 @@ import {
 import { buildMeetingCommand } from "./commands.mjs";
 import { buildDirectConfirmationPayload, buildDraftPayload, buildMeetingPayload } from "./discord-ui.mjs";
 import { parseGuildNaturalCommand } from "./local-command-router.mjs";
-import { extractMeetingId, normalizeMeetingId, redactMeetingId } from "./meeting-id.mjs";
+import {
+  extractMeetingIds,
+  normalizeMeetingId,
+  redactMeetingIds,
+} from "./meeting-id.mjs";
 import { MeetingTargetResolver } from "./meeting-target-resolver.mjs";
 import { resolveMeetingUrl } from "./meeting-url-resolver.mjs";
 import { resolveParticipantSnapshot } from "./participant-resolution.mjs";
+import { MAX_TEMPLATE_MEMBERS } from "./storage/attendance-template-repository.mjs";
 import {
   extractKnownMemberAliases,
   extractParticipantDirective,
@@ -39,13 +44,37 @@ import {
 const MISSING_LABELS = {
   title: "会議名",
   startsAt: "開始日時",
+  durationMinutes: "会議時間",
+  reminderMinutes: "通知時刻",
   meetingUrl: "会議URL",
   meetingId: "会議ID",
   requestedChanges: "変更内容",
 };
 const RSVP_LABELS = { attending: "参加", maybe: "未定", declined: "欠席" };
-const MAX_MEETING_INVITEES = 20;
+const MAX_MEETING_INVITEES = MAX_TEMPLATE_MEMBERS;
 const CALENDAR_INVITATION_HOSTS = new Set(["calendar.app.google", "calendar.google.com"]);
+
+function normalizeMeetingReminders(values, fallback) {
+  if (Array.isArray(values) && values.length === 0) return [];
+  return normalizeReminderMinutes(values, fallback);
+}
+
+export function formatMeetingListContent(meetings, { maxLength = 1_900 } = {}) {
+  if (!meetings.length) return "開催予定の会議はありません。";
+  const lines = meetings.map((meeting) => (
+    `• **${meeting.id}** ${safeDisplayText(meeting.title, 80)} — ${discordTimestamp(meeting.startsAtMs, "F")}`
+  ));
+  const selected = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const remaining = lines.length - index - 1;
+    const suffix = remaining > 0 ? `\n…ほか${remaining}件` : "";
+    const candidate = [...selected, lines[index]].join("\n");
+    if (`${candidate}${suffix}`.length > maxLength) break;
+    selected.push(lines[index]);
+  }
+  const remaining = lines.length - selected.length;
+  return `${selected.join("\n")}${remaining > 0 ? `\n…ほか${remaining}件` : ""}`;
+}
 
 function shortErrorCode(error) {
   return String(error?.code || error?.status || error?.name || "unknown").slice(0, 80);
@@ -116,6 +145,8 @@ export class MeetingCoordinator {
     sheetsSync,
     config,
     directMessenger = null,
+    directInviteUpdateScheduler = null,
+    meetingCardUpdateScheduler = null,
     meetingUrlResolver = resolveMeetingUrl,
     logger = console,
   }) {
@@ -125,6 +156,8 @@ export class MeetingCoordinator {
     this.sheetsSync = sheetsSync;
     this.config = config;
     this.directMessenger = directMessenger;
+    this.directInviteUpdateScheduler = directInviteUpdateScheduler;
+    this.meetingCardUpdateScheduler = meetingCardUpdateScheduler;
     this.meetingUrlResolver = meetingUrlResolver;
     this.logger = logger;
     this.drafts = new Map();
@@ -160,6 +193,48 @@ export class MeetingCoordinator {
     if (this.canManage(subject)) return true;
     await reply("この操作はサーバー管理者または会議管理ロールだけが使えます。");
     return false;
+  }
+
+  async canViewMeeting(subject, meeting) {
+    if (!meeting || meeting.guildId !== String(subject?.guildId ?? "")) return false;
+    if (String(subject?.channelId ?? "") === String(meeting.channelId)) return true;
+    try {
+      const channel = await this.client.channels.fetch(meeting.channelId);
+      let member = subject.member || null;
+      if (!member) {
+        const userId = subject.user?.id || subject.author?.id;
+        const guild = await this.client.guilds.fetch(meeting.guildId);
+        member = await guild.members.fetch(String(userId));
+      }
+      return Boolean(channel?.permissionsFor?.(member)?.has?.(PermissionFlagsBits.ViewChannel));
+    } catch {
+      return false;
+    }
+  }
+
+  async visibleUpcomingMeetings(subject, { limit = 20, sameChannelOnly = false } = {}) {
+    const meetings = this.store.listUpcoming(subject.guildId, { limit: 100 });
+    const visible = [];
+    for (const meeting of meetings) {
+      if (sameChannelOnly && String(meeting.channelId) !== String(subject.channelId)) continue;
+      if (await this.canViewMeeting(subject, meeting)) visible.push(meeting);
+      if (visible.length >= limit) break;
+    }
+    return visible;
+  }
+
+  async visibleMeetingTarget(subject, result, { sameChannelOnly = false } = {}) {
+    const candidates = result?.status === "resolved"
+      ? [result.meeting]
+      : (result?.candidates || []);
+    const visible = [];
+    for (const meeting of candidates) {
+      if (sameChannelOnly && String(meeting.channelId) !== String(subject?.channelId)) continue;
+      if (await this.canViewMeeting(subject, meeting)) visible.push(meeting);
+    }
+    if (visible.length === 1) return { status: "resolved", meeting: visible[0], candidates: visible };
+    if (visible.length > 1) return { status: "ambiguous", candidates: visible };
+    return { status: "not_found", candidates: [] };
   }
 
   cleanupDrafts() {
@@ -205,13 +280,13 @@ export class MeetingCoordinator {
     }
     if (!extracted.urls.length) throw new Error("新しい会議URLまたはGoogleカレンダーの招待URLを送ってください");
 
-    const target = this.meetingTargets.resolve({
+    const target = await this.visibleMeetingTarget(message, this.meetingTargets.resolve({
       guildId: message.guildId,
       channelId: message.channelId,
       authorId: message.author.id,
       rawText,
       replyMessageId: message.reference?.messageId || null,
-    });
+    }), { sameChannelOnly: true });
     if (target.status === "ambiguous") {
       await replyText(this.meetingTargetCandidatesText(target));
       return;
@@ -236,6 +311,8 @@ export class MeetingCoordinator {
       reminderMinutes: meeting.reminderMinutes,
       meetingUrl,
       urlOnly: true,
+      baseUpdatedAtMs: meeting.updatedAtMs,
+      changedFields: ["meetingUrl"],
     });
     const preview = await message.reply({
       ...buildDraftPayload(draft),
@@ -258,9 +335,12 @@ export class MeetingCoordinator {
       }
       try {
         const directUrl = await this.resolveSubmittedMeetingUrl([meeting.meetingUrl]);
-        this.store.updateMeetingUrl(meeting.id, directUrl);
+        const updated = this.store.updateMeetingUrlIfUnchanged(meeting.id, directUrl, {
+          expectedUpdatedAtMs: meeting.updatedAtMs,
+        });
         repaired += 1;
-        await this.refreshMeetingCard(this.store.getMeeting(meeting.id)).catch(() => {});
+        await this.refreshExistingDirectInvites(updated);
+        await this.refreshMeetingCard(updated).catch(() => {});
       } catch (error) {
         failed += 1;
         this.logger.warn(`[meeting-url] 招待URLの自動修復失敗 code=${shortErrorCode(error)}`);
@@ -346,18 +426,21 @@ export class MeetingCoordinator {
   }
 
   inviteesFromMention(message, rawText) {
-    const templateReference = extractTemplateReference(rawText);
-    const directive = extractParticipantDirective(templateReference.cleanedText);
+    const knownTemplateNames = this.store.attendanceTemplates.listTemplates(message.guildId)
+      .map((template) => template.name);
+    const templateReference = extractTemplateReference(rawText, { knownTemplateNames });
     const registered = this.store.listMemberAliases(message.guildId);
+    const knownAliases = registered.map((member) => member.alias);
+    const directive = extractParticipantDirective(templateReference.cleanedText, { knownAliases });
     const detectedAliases = extractKnownMemberAliases(
       templateReference.cleanedText,
-      registered.map((member) => member.alias),
+      knownAliases,
     );
     const users = [...message.mentions.users.values()]
       .filter((user) => user.id !== this.client.user?.id);
     return {
       cleanedText: directive.cleanedText,
-      knownAliases: registered.map((member) => member.alias),
+      knownAliases,
       explicitInvitees: this.resolveInvitees({
         guildId: message.guildId,
         aliases: [...new Set([...directive.aliases, ...detectedAliases])],
@@ -375,6 +458,15 @@ export class MeetingCoordinator {
       allowedMentions: { parse: [], repliedUser: false },
     });
 
+    // 全英字の小文字IDは一般語との誤認を避けるため、ローカルに実在する
+    // active IDだけを照合する。件数上限付きの一覧表示queryはprivacy gateに使わない。
+    const knownMeetingIds = this.store.listActiveMeetingIds(message.guildId);
+    const submittedMeetingIds = extractMeetingIds(rawText, { knownIds: knownMeetingIds });
+    if (submittedMeetingIds.length > 1) {
+      await replyText("会議IDが複数あります。更新する会議IDを1つだけ指定して、もう一度送ってください。内容はAIへ送信していません。");
+      return;
+    }
+
     let templateCommand;
     try {
       templateCommand = parseTemplateManagementMessage(rawText);
@@ -388,17 +480,17 @@ export class MeetingCoordinator {
       return;
     }
 
-    const localCommand = parseGuildNaturalCommand(rawText);
+    const localCommand = parseGuildNaturalCommand(rawText, { knownMeetingIds });
     if (localCommand?.action === "help") {
       await replyText(this.helpText());
       return;
     }
     if (localCommand?.action === "meeting_list") {
-      await this.replyMeetingList(message.guildId, replyText);
+      await this.replyMeetingList(message, replyText);
       return;
     }
     if (localCommand?.action === "meeting_status") {
-      await this.replyMeetingStatus(message.guildId, localCommand.meetingId, message.reply.bind(message));
+      await this.replyMeetingStatus(message, localCommand.meetingId, message.reply.bind(message));
       return;
     }
     if (localCommand?.action === "my_reminders_show") {
@@ -435,10 +527,7 @@ export class MeetingCoordinator {
     try {
       extracted = extractAndRedactSensitiveText(participantInput.cleanedText);
       extracted.sanitizedText = redactKnownMemberAliases(extracted.sanitizedText, participantInput.knownAliases);
-      extracted.sanitizedText = redactMeetingId(
-        extracted.sanitizedText,
-        extractMeetingId(participantInput.cleanedText),
-      );
+      extracted.sanitizedText = redactMeetingIds(extracted.sanitizedText, submittedMeetingIds);
       assertSafeForAi(extracted.sanitizedText);
     } catch {
       await replyText("URLを安全に分離できなかったため処理を止めました。URLと会議内容を分けてもう一度送ってください。");
@@ -484,13 +573,13 @@ export class MeetingCoordinator {
       };
     }
     if (interpretation.action === "update" && !interpretation.meetingId) {
-      const target = this.meetingTargets.resolve({
+      const target = await this.visibleMeetingTarget(message, this.meetingTargets.resolve({
         guildId: message.guildId,
         channelId: message.channelId,
         authorId: message.author.id,
         rawText,
         replyMessageId: message.reference?.messageId || null,
-      });
+      }), { sameChannelOnly: true });
       if (target.status === "ambiguous") {
         await replyText(this.meetingTargetCandidatesText(target));
         return;
@@ -504,6 +593,15 @@ export class MeetingCoordinator {
         meetingId: target.meeting.id,
         missingFields: interpretation.missingFields.filter((field) => field !== "meetingId"),
       };
+    }
+    if (interpretation.action === "update" && interpretation.meetingId) {
+      const targetMeeting = this.store.getMeeting(interpretation.meetingId);
+      if (!targetMeeting
+        || String(targetMeeting.channelId) !== String(message.channelId)
+        || !(await this.canViewMeeting(message, targetMeeting))) {
+        await replyText("更新する会議が見つかりませんでした。元の会議チャンネルで、もう一度送ってください。");
+        return;
+      }
     }
     if (interpretation.missingFields.length) {
       const fields = interpretation.missingFields.map((field) => MISSING_LABELS[field] || field).join("、");
@@ -557,22 +655,37 @@ export class MeetingCoordinator {
     }
   }
 
+  async replyPrivateAdminDetails(message, content, replyText) {
+    try {
+      if (typeof message?.author?.send !== "function") throw new Error("dm_unavailable");
+      await message.author.send({
+        content: String(content ?? "").slice(0, 1_900),
+        allowedMentions: { parse: [], repliedUser: false },
+      });
+      await replyText("管理情報をDMに送りました。");
+      return true;
+    } catch {
+      await replyText("管理情報をDMへ送れませんでした。DMを許可して、もう一度実行してください。内容はこのチャンネルには表示していません。");
+      return false;
+    }
+  }
+
   async handleNaturalTemplateCommand(message, rawText, command, replyText) {
     try {
       if (command.action === "list") {
         const templates = this.store.attendanceTemplates.listTemplates(message.guildId);
-        await replyText(templates.length
+        await this.replyPrivateAdminDetails(message, templates.length
           ? ["**参加者テンプレート**", ...templates.map((item) => `• **${safeDisplayText(item.name, 40)}** — ${item.memberCount}人${item.isDefault ? "（既定）" : ""}`)].join("\n")
-          : "参加者テンプレートはまだありません。");
+          : "参加者テンプレートはまだありません。", replyText);
         return;
       }
       if (command.action === "show") {
         const template = this.store.attendanceTemplates.getTemplate(message.guildId, command.name);
         if (!template) throw new Error("参加者テンプレートが見つかりません");
-        await replyText([
+        await this.replyPrivateAdminDetails(message, [
           `**${safeDisplayText(template.name, 40)}** — ${template.members.length}人${template.isDefault ? "（既定）" : ""}`,
           template.members.map((member) => safeDisplayText(member.displayName, 60)).join("、") || "メンバーなし",
-        ].join("\n"));
+        ].join("\n"), replyText);
         return;
       }
       if (command.action === "set_default") {
@@ -588,7 +701,8 @@ export class MeetingCoordinator {
         return;
       }
       if (command.action === "save") {
-        const directive = extractParticipantDirective(rawText);
+        const knownAliases = this.store.listMemberAliases(message.guildId).map((member) => member.alias);
+        const directive = extractParticipantDirective(rawText, { knownAliases });
         const users = [...message.mentions.users.values()]
           .filter((user) => user.id !== this.client.user?.id);
         const members = this.resolveInvitees({
@@ -620,11 +734,16 @@ export class MeetingCoordinator {
       }
       if (command.action === "meeting_cancel") {
         const current = this.store.getMeeting(command.meetingId);
-        if (!current || current.guildId !== message.guildId || current.status !== "active") {
+        if (!current
+          || current.guildId !== message.guildId
+          || current.status !== "active"
+          || String(current.channelId) !== String(message.channelId)
+          || !(await this.canViewMeeting(message, current))) {
           throw new Error("中止できる会議が見つかりません");
         }
         const cancelled = this.store.cancelMeeting(command.meetingId);
         if (!cancelled) throw new Error("中止できる会議が見つかりません");
+        await this.refreshExistingDirectInvites(cancelled);
         await this.refreshMeetingCard(cancelled);
         this.sheetsSync?.requestSync();
         await replyText(`会議 **${cancelled.id}** を中止しました。`);
@@ -632,9 +751,9 @@ export class MeetingCoordinator {
       }
       if (command.action === "member_list") {
         const members = this.store.listMemberAliases(message.guildId);
-        await replyText(members.length
+        await this.replyPrivateAdminDetails(message, members.length
           ? ["**登録済みの呼び名**", ...members.map((member) => `• **${safeDisplayText(member.alias, 32)}** → ${safeDisplayText(member.displayName, 80)}`)].join("\n")
-          : "登録済みの呼び名はありません。");
+          : "登録済みの呼び名はありません。", replyText);
         return;
       }
       if (command.action === "member_remove") {
@@ -660,7 +779,11 @@ export class MeetingCoordinator {
       }
       if (command.action === "meeting_invite") {
         const meeting = this.store.getMeeting(command.meetingId);
-        if (!meeting || meeting.guildId !== message.guildId || meeting.status !== "active") {
+        if (!meeting
+          || meeting.guildId !== message.guildId
+          || meeting.status !== "active"
+          || String(meeting.channelId) !== String(message.channelId)
+          || !(await this.canViewMeeting(message, meeting))) {
           throw new Error("招待できる会議が見つかりません");
         }
         const input = this.inviteesFromMention(message, rawText);
@@ -685,7 +808,10 @@ export class MeetingCoordinator {
         const parts = [`個別DM: 送信 ${result.sent}人`];
         if (result.failed) parts.push(`失敗 ${result.failed}人`);
         if (batch.alreadySent.length) parts.push(`送信済み ${batch.alreadySent.length}人`);
-        await replyText(parts.join(" / "));
+        await replyText([
+          ...parts,
+          ...(result.pending ? [`送信待ち ${result.pending}人（自動で再試行）`] : []),
+        ].join(" / "));
         return;
       }
       await replyText(this.helpText());
@@ -694,11 +820,10 @@ export class MeetingCoordinator {
     }
   }
 
-  async replyMeetingList(guildId, replyText) {
-    const meetings = this.store.listUpcoming(guildId, { limit: 20 });
-    const content = meetings.length
-      ? meetings.map((meeting) => `• **${meeting.id}** ${safeDisplayText(meeting.title, 80)} — ${discordTimestamp(meeting.startsAtMs, "F")}`).join("\n")
-      : "開催予定の会議はありません。";
+  async replyMeetingList(subject, replyText) {
+    // 通常メッセージの返信は公開されるため、別チャンネルの会議を持ち出さない。
+    const meetings = await this.visibleUpcomingMeetings(subject, { limit: 20, sameChannelOnly: true });
+    const content = formatMeetingListContent(meetings);
     await replyText(content);
   }
 
@@ -728,9 +853,14 @@ export class MeetingCoordinator {
     };
   }
 
-  async replyMeetingStatus(guildId, meetingId, replyPayload) {
+  async replyMeetingStatus(subject, meetingId, replyPayload) {
     try {
-      await replyPayload(this.meetingStatusPayload(guildId, meetingId));
+      const id = normalizeMeetingId(meetingId);
+      const meeting = this.store.getMeeting(id);
+      if (!meeting
+        || String(meeting.channelId) !== String(subject.channelId)
+        || !(await this.canViewMeeting(subject, meeting))) throw new Error("会議が見つかりません");
+      await replyPayload(this.meetingStatusPayload(subject.guildId, id));
     } catch (error) {
       await replyPayload({ content: safeDisplayText(error.message, 200), allowedMentions: { parse: [] } });
     }
@@ -748,7 +878,7 @@ export class MeetingCoordinator {
       title: safeDisplayText(title, 100),
       startsAtMs,
       endsAtMs: startsAtMs + duration * 60_000,
-      reminderMinutes: normalizeReminderMinutes(reminderMinutes, this.config.defaultReminders),
+      reminderMinutes: normalizeMeetingReminders(reminderMinutes, this.config.defaultReminders),
       meetingUrl,
       invitees,
       participantSource,
@@ -775,11 +905,15 @@ export class MeetingCoordinator {
       title: fields.has("title") ? interpretation.title : meeting.title,
       startsAtMs,
       endsAtMs: startsAtMs + duration * 60_000,
-      reminderMinutes: fields.has("reminderMinutes") ? interpretation.reminderMinutes : meeting.reminderMinutes,
+      reminderMinutes: fields.has("reminderMinutes")
+        ? normalizeMeetingReminders(interpretation.reminderMinutes, this.config.defaultReminders)
+        : meeting.reminderMinutes,
       meetingUrl: fields.has("meetingUrl") ? meetingUrl : meeting.meetingUrl,
       invitees,
       participantSource,
       templateName,
+      baseUpdatedAtMs: meeting.updatedAtMs,
+      changedFields: [...fields],
       urlOnly: fields.size === 1
         && fields.has("meetingUrl")
         && invitees.length === 0
@@ -811,7 +945,12 @@ export class MeetingCoordinator {
     this.cleanupDrafts();
     const draft = this.drafts.get(draftId);
     if (!draft || draft.expiresAtMs <= Date.now()) {
-      await interaction.reply({ content: "この確認は期限切れです。もう一度登録してください。", flags: MessageFlags.Ephemeral });
+      await interaction.update({
+        content: "この確認は期限切れです。もう一度登録してください。",
+        embeds: [],
+        components: [],
+        allowedMentions: { parse: [] },
+      });
       return;
     }
     if (draft.creatorId !== interaction.user.id) {
@@ -824,6 +963,14 @@ export class MeetingCoordinator {
       return;
     }
     if (action !== "confirm") return;
+    if (String(interaction.guildId ?? "") !== draft.guildId || String(interaction.channelId ?? "") !== draft.channelId) {
+      await interaction.reply({ content: "この確認は作成したサーバーとチャンネルでだけ確定できます。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!this.canManage(interaction)) {
+      await interaction.reply({ content: "現在は会議を管理する権限がないため確定できません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
     await interaction.deferUpdate();
     this.drafts.delete(draftId);
     try {
@@ -854,33 +1001,51 @@ export class MeetingCoordinator {
     if (this.config.everyoneOffsets.length && !permissions.has(PermissionFlagsBits.MentionEveryone)) {
       throw new Error("自動通知にはBotの「@everyone、@here、すべてのロールにメンション」権限が必要です");
     }
-    const meeting = this.store.createMeeting({
-      guildId: draft.guildId,
-      channelId: draft.channelId,
-      createdById: draft.creatorId,
-      createdByName: draft.creatorName,
-      title: draft.title,
-      startsAtMs: draft.startsAtMs,
-      endsAtMs: draft.endsAtMs,
-      timeZone: this.config.timeZone,
-      meetingUrl: draft.meetingUrl,
-      reminderMinutes: draft.reminderMinutes,
-      everyoneOffsets: this.config.everyoneOffsets,
-    });
-    const inviteBatch = draft.invitees?.length
-      ? this.store.prepareMeetingInvitees(meeting.id, draft.invitees, draft.creatorId, {
-        defaultReminderMinutes: this.config.personalDefaultReminders || [],
-      })
-      : { prepared: [], alreadySent: [] };
-    this.store.setMessageId(meeting.id, interaction.message.id);
-    const saved = this.store.getMeeting(meeting.id);
-    await interaction.editReply({
-      content: null,
-      ...buildMeetingPayload(saved, [], {
+    if (draft.invitees?.length && !this.directMessenger?.sendMeetingInvite) {
+      throw new Error("個別DM送信モジュールが初期化されていません");
+    }
+    let meeting = null;
+    let inviteBatch = { prepared: [], alreadySent: [] };
+    let saved = null;
+    try {
+      meeting = this.store.createMeeting({
+        guildId: draft.guildId,
+        channelId: draft.channelId,
+        createdById: draft.creatorId,
+        createdByName: draft.creatorName,
+        title: draft.title,
+        startsAtMs: draft.startsAtMs,
+        endsAtMs: draft.endsAtMs,
+        timeZone: this.config.timeZone,
+        meetingUrl: draft.meetingUrl,
+        reminderMinutes: draft.reminderMinutes,
         everyoneOffsets: this.config.everyoneOffsets,
-        invitees: this.store.listMeetingInvitees(meeting.id),
-      }),
-    });
+        messageId: interaction.message.id,
+      });
+      inviteBatch = draft.invitees?.length
+        ? this.store.prepareMeetingInvitees(meeting.id, draft.invitees, draft.creatorId, {
+          defaultReminderMinutes: this.config.personalDefaultReminders || [],
+        })
+        : inviteBatch;
+      saved = this.store.getMeeting(meeting.id);
+      await interaction.editReply({
+        content: null,
+        ...buildMeetingPayload(saved, [], {
+          everyoneOffsets: this.config.everyoneOffsets,
+          invitees: this.store.listMeetingInvitees(meeting.id),
+        }),
+      });
+      this.store.acknowledgePendingMeetingCardUpdate?.(saved.id, saved.cardRevision);
+    } catch (error) {
+      if (meeting?.id) {
+        try {
+          this.store.cancelMeeting(meeting.id);
+        } catch (cleanupError) {
+          this.logger.error(`[meeting] 作成失敗後の無効化失敗 code=${shortErrorCode(cleanupError)}`);
+        }
+      }
+      throw error;
+    }
     if (inviteBatch.prepared.length) {
       const result = await this.sendDirectInvites(saved, inviteBatch.prepared);
       await this.replyInvitationResult(interaction, result, inviteBatch.alreadySent.length);
@@ -888,20 +1053,44 @@ export class MeetingCoordinator {
   }
 
   async confirmUpdate(interaction, draft) {
-    const meeting = draft.urlOnly
-      ? this.store.updateMeetingUrl(draft.meetingId, draft.meetingUrl)
-      : this.store.updateMeeting(draft.meetingId, {
-        title: draft.title,
-        startsAtMs: draft.startsAtMs,
-        endsAtMs: draft.endsAtMs,
-        meetingUrl: draft.meetingUrl,
-        reminderMinutes: draft.reminderMinutes,
-      }, { everyoneOffsets: this.config.everyoneOffsets });
+    const current = this.store.getMeeting(draft.meetingId);
+    if (!current || current.status !== "active" || current.guildId !== draft.guildId) {
+      throw new Error("更新できる会議が見つかりません");
+    }
+    if (!Number.isFinite(draft.baseUpdatedAtMs) || current.updatedAtMs !== draft.baseUpdatedAtMs) {
+      throw new Error("確認中に会議内容が変更されました。最新の内容でもう一度入力してください");
+    }
+    const changedFields = new Set(draft.changedFields || (draft.urlOnly ? ["meetingUrl"] : []));
+    const patch = {};
+    if (changedFields.has("title")) patch.title = draft.title;
+    if (changedFields.has("startsAt") || changedFields.has("durationMinutes")) {
+      patch.startsAtMs = draft.startsAtMs;
+      patch.endsAtMs = draft.endsAtMs;
+    }
+    if (changedFields.has("meetingUrl")) patch.meetingUrl = draft.meetingUrl;
+    if (changedFields.has("reminderMinutes")) patch.reminderMinutes = draft.reminderMinutes;
+    let meeting;
+    try {
+      meeting = draft.urlOnly
+        ? this.store.updateMeetingUrlIfUnchanged(draft.meetingId, draft.meetingUrl, {
+          expectedUpdatedAtMs: draft.baseUpdatedAtMs,
+        })
+        : this.store.updateMeetingIfUnchanged(draft.meetingId, patch, {
+          expectedUpdatedAtMs: draft.baseUpdatedAtMs,
+          everyoneOffsets: this.config.everyoneOffsets,
+        });
+    } catch (error) {
+      if (error?.code === "meeting_update_conflict") {
+        throw new Error("確認中に会議内容が変更されました。最新の内容でもう一度入力してください");
+      }
+      throw error;
+    }
     const inviteBatch = draft.invitees?.length
       ? this.store.prepareMeetingInvitees(meeting.id, draft.invitees, draft.creatorId, {
         defaultReminderMinutes: this.config.personalDefaultReminders || [],
       })
       : { prepared: [], alreadySent: [] };
+    await this.refreshExistingDirectInvites(meeting);
     await this.refreshMeetingCard(meeting);
     await interaction.editReply({
       content: `✅ **${safeDisplayText(meeting.title, 100)}** の予定を更新しました。`,
@@ -916,6 +1105,23 @@ export class MeetingCoordinator {
   }
 
   async sendDirectInvites(meeting, invitees) {
+    if (this.directInviteUpdateScheduler && this.store?.getDirectInviteSendSummary) {
+      await this.directInviteUpdateScheduler.tick();
+      const statuses = invitees.map((invitee) => (
+        this.store.getMeetingInvitee(meeting.id, invitee.userId)?.deliveryStatus || "pending"
+      ));
+      const result = {
+        sent: statuses.filter((status) => status === "sent").length,
+        failed: statuses.filter((status) => status === "failed").length,
+        pending: statuses.filter((status) => status === "pending").length,
+      };
+      try {
+        await this.refreshMeetingCard(meeting.id);
+      } catch (error) {
+        this.logger.warn?.(`[dm] invite_card_refresh_failed code=${shortErrorCode(error)}`);
+      }
+      return result;
+    }
     if (!this.directMessenger?.sendMeetingInvite) {
       throw new Error("個別DM送信モジュールが初期化されていません");
     }
@@ -954,13 +1160,61 @@ export class MeetingCoordinator {
     return { sent, failed };
   }
 
+  async refreshExistingDirectInvites(meeting) {
+    if (this.directInviteUpdateScheduler && this.store?.queueDirectInviteUpdates) {
+      // MeetingDatabase commits the meeting mutation and this durable outbox in
+      // one SQLite transaction.  Re-enqueueing here would reset lease/retry state.
+      const before = this.store.getDirectInviteUpdateSummary(meeting.id, meeting.updatedAtMs);
+      const queued = before.unresolved;
+      if (!queued) return { queued: 0, updated: 0, failed: 0, pending: 0 };
+      const tick = await this.directInviteUpdateScheduler.tick();
+      const summary = this.store.getDirectInviteUpdateSummary(meeting.id, meeting.updatedAtMs);
+      const result = {
+        queued,
+        updated: Math.max(0, queued - summary.unresolved),
+        failed: summary.skipped,
+        pending: summary.pending + summary.sending,
+        tick,
+      };
+      if (result.pending || result.failed) {
+        this.logger.warn?.(`[dm] invite_update_deferred pending=${result.pending} skipped=${result.failed}`);
+      }
+      return result;
+    }
+    if (!this.directMessenger?.updateMeetingInvite) return { updated: 0, failed: 0 };
+    let updated = 0;
+    let failed = 0;
+    for (const invitee of this.store.listMeetingInvitees(meeting.id)) {
+      if (invitee.deliveryStatus !== "sent" || !invitee.dmMessageId) continue;
+      try {
+        const reminder = this.store.personalReminders.getMeetingReminders(meeting.id, invitee.userId);
+        await this.directMessenger.updateMeetingInvite({
+          meeting,
+          recipient: {
+            ...invitee,
+            personalReminderMinutes: reminder?.minutes || [],
+          },
+          messageId: invitee.dmMessageId,
+        });
+        updated += 1;
+      } catch (error) {
+        failed += 1;
+        this.logger.warn?.(`[dm] 既存招待更新失敗 code=${shortErrorCode(error)}`);
+      }
+    }
+    return { updated, failed };
+  }
+
   async replyInvitationResult(interaction, result, alreadySent = 0) {
     const parts = [`個別DM: 送信 ${result.sent}人`];
     if (result.failed) parts.push(`失敗 ${result.failed}人（相手のDM受信設定や在籍状況を確認してください）`);
     if (alreadySent) parts.push(`送信済み ${alreadySent}人`);
     try {
       await interaction.followUp({
-        content: parts.join(" / "),
+        content: [
+          ...parts,
+          ...(result.pending ? [`送信待ち ${result.pending}人（自動で再試行）`] : []),
+        ].join(" / "),
         flags: MessageFlags.Ephemeral,
         allowedMentions: { parse: [] },
       });
@@ -970,8 +1224,27 @@ export class MeetingCoordinator {
   }
 
   async refreshMeetingCard(meetingOrId) {
-    const meeting = typeof meetingOrId === "string" ? this.store.getMeeting(meetingOrId) : meetingOrId;
+    const suppliedMeeting = typeof meetingOrId === "string" ? null : meetingOrId;
+    const meeting = typeof meetingOrId === "string" ? this.store.getMeeting(meetingOrId) : this.store.getMeeting(suppliedMeeting?.id);
     if (!meeting) return;
+    if (meeting.messageId && this.meetingCardUpdateScheduler && this.store?.queueMeetingCardUpdate) {
+      const queued = this.store.queueMeetingCardUpdate(meeting.id, {
+        targetCardRevision: meeting.cardRevision,
+      });
+      const tick = await this.meetingCardUpdateScheduler.tick();
+      const summary = this.store.getMeetingCardUpdateSummary(meeting.id, meeting.cardRevision);
+      const result = {
+        queued,
+        updated: Math.max(0, queued - summary.unresolved),
+        failed: summary.skipped,
+        pending: summary.pending + summary.sending,
+        tick,
+      };
+      if (result.pending || result.failed) {
+        this.logger.warn?.(`[meeting-card] update_deferred pending=${result.pending} skipped=${result.failed}`);
+      }
+      return result;
+    }
     const channel = await this.client.channels.fetch(meeting.channelId);
     if (!channel?.isTextBased?.()) throw new Error("会議カードのチャンネルが見つかりません");
     const payload = buildMeetingPayload(meeting, this.store.listRsvps(meeting.id), {
@@ -998,8 +1271,17 @@ export class MeetingCoordinator {
     try {
       const meeting = this.store.getMeeting(meetingId);
       if (!meeting || meeting.guildId !== this.config.guildId) throw new Error("会議が見つかりません");
-      if (inDirectMessage && !this.store.isMeetingInvitee(meeting.id, interaction.user.id)) {
-        throw new Error("このDMから回答できる招待が見つかりません");
+      if (inDirectMessage) {
+        if (!this.directMessenger?.currentHumanMember) {
+          throw new Error("DMからの本人確認を実行できません");
+        }
+        await this.directMessenger.currentHumanMember(interaction.user.id);
+      }
+      const invitees = this.store.listMeetingInvitees(meeting.id);
+      if (invitees.length && !this.store.isMeetingInvitee(meeting.id, interaction.user.id)) {
+        throw new Error(inDirectMessage
+          ? "このDMから回答できる招待が見つかりません"
+          : "この会議は招待されたメンバーだけが回答できます");
       }
       this.store.upsertRsvp(meeting.id, {
         userId: interaction.user.id,
@@ -1160,7 +1442,9 @@ export class MeetingCoordinator {
     try {
       const id = normalizeMeetingId(interaction.options.getString("id", true));
       const meeting = this.store.getMeeting(id);
-      if (!meeting || meeting.guildId !== interaction.guildId) throw new Error("会議が見つかりません");
+      if (!meeting || meeting.guildId !== interaction.guildId || !(await this.canViewMeeting(interaction, meeting))) {
+        throw new Error("会議が見つかりません");
+      }
       const draft = this.createDraft({
         action: "update",
         meetingId: meeting.id,
@@ -1174,12 +1458,14 @@ export class MeetingCoordinator {
         reminderMinutes: meeting.reminderMinutes,
         meetingUrl: await this.resolveSubmittedMeetingUrl([rawUrl]),
         urlOnly: true,
+        baseUpdatedAtMs: meeting.updatedAtMs,
+        changedFields: ["meetingUrl"],
       });
       if (resolvingInvitation) {
         await interaction.editReply({ content: "招待URLから会議URLを確認しました。確認画面をチャンネルへ表示します。" });
-        await interaction.followUp(buildDraftPayload(draft));
+        await interaction.followUp({ ...buildDraftPayload(draft), flags: MessageFlags.Ephemeral });
       } else {
-        await interaction.reply(buildDraftPayload(draft));
+        await interaction.reply({ ...buildDraftPayload(draft), flags: MessageFlags.Ephemeral });
       }
     } catch (error) {
       const payload = { content: safeDisplayText(error.message, 240), flags: MessageFlags.Ephemeral };
@@ -1351,7 +1637,10 @@ export class MeetingCoordinator {
     try {
       const id = normalizeMeetingId(interaction.options.getString("id", true));
       const meeting = this.store.getMeeting(id);
-      if (!meeting || meeting.guildId !== interaction.guildId || meeting.status !== "active") {
+      if (!meeting
+        || meeting.guildId !== interaction.guildId
+        || meeting.status !== "active"
+        || !(await this.canViewMeeting(interaction, meeting))) {
         throw new Error("招待できる会議が見つかりません");
       }
       const participants = this.participantSelectionFromOptions(interaction);
@@ -1375,10 +1664,8 @@ export class MeetingCoordinator {
   }
 
   async commandList(interaction) {
-    const meetings = this.store.listUpcoming(interaction.guildId, { limit: 20 });
-    const content = meetings.length
-      ? meetings.map((meeting) => `• **${meeting.id}** ${safeDisplayText(meeting.title, 80)} — ${discordTimestamp(meeting.startsAtMs, "F")}`).join("\n")
-      : "開催予定の会議はありません。";
+    const meetings = await this.visibleUpcomingMeetings(interaction, { limit: 20 });
+    const content = formatMeetingListContent(meetings);
     await interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
   }
 
@@ -1386,7 +1673,7 @@ export class MeetingCoordinator {
     try {
       const id = normalizeMeetingId(interaction.options.getString("id", true));
       const meeting = this.store.getMeeting(id);
-      if (!meeting || meeting.guildId !== interaction.guildId) throw new Error("会議が見つかりません");
+      if (!meeting || !(await this.canViewMeeting(interaction, meeting))) throw new Error("会議が見つかりません");
       const rsvps = this.store.listRsvps(id);
       const invitees = this.store.listMeetingInvitees(id);
       const groups = Object.keys(RSVP_LABELS).map((status) => {
@@ -1417,9 +1704,12 @@ export class MeetingCoordinator {
     try {
       const id = normalizeMeetingId(interaction.options.getString("id", true));
       const meeting = this.store.getMeeting(id);
-      if (!meeting || meeting.guildId !== interaction.guildId) throw new Error("会議が見つかりません");
+      if (!meeting || meeting.guildId !== interaction.guildId || !(await this.canViewMeeting(interaction, meeting))) {
+        throw new Error("会議が見つかりません");
+      }
       const cancelled = this.store.cancelMeeting(id);
       if (!cancelled) throw new Error("会議はすでに中止または終了しています");
+      await this.refreshExistingDirectInvites(cancelled);
       await this.refreshMeetingCard(cancelled);
       this.sheetsSync?.requestSync();
       await interaction.reply({ content: `会議 **${id}** を中止しました。`, flags: MessageFlags.Ephemeral });

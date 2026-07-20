@@ -43,7 +43,7 @@ OPENAI_MEETING_MODEL=gpt-5.6-terra
 OPENAI_REASONING_EFFORT=medium
 ```
 
-ChatGPT ProのCodex SparkをこのPCだけで試す場合は、Codex CLIへChatGPTログインしたうえで次へ切り替えられます。App Serverは外部ポートを開かずstdioだけを使い、要求を直列化し、一時thread・read-only・承認なしで動かします。Bot専用の一時`CODEX_HOME`と空の作業フォルダーを作り、ChatGPT認証と対象モデル1件の検査済みカタログ情報だけを移します。普段のCodex設定・MCP・plugins・skills・memoriesは引き継がず、shell・web検索・アプリ・フック・サブエージェントも無効化します。子プロセスへDiscord、Sheets、OpenAI APIの秘密環境変数は継承しません。一時認証フォルダーは終了時に削除し、Windowsで一時的にロックされた場合も再試行します。
+ChatGPT ProのCodex SparkをこのPCだけで試す場合は、Codex CLIへChatGPTログインしたうえで次へ切り替えられます。App Serverは外部ポートを開かずstdioだけを使い、要求を直列化し、一時thread・read-only・承認なしで動かします。Bot専用の一時`CODEX_HOME`と、所有マーカー以外は空の作業フォルダーを作り、ChatGPT認証と対象モデル1件の検査済みカタログ情報だけを移します。普段のCodex設定・MCP・plugins・skills・memoriesは引き継がず、shell・web検索・アプリ・フック・サブエージェントも無効化します。子プロセスへDiscord、Sheets、OpenAI APIの秘密環境変数は継承しません。一時領域にはBot所有マーカー、PID、プロセス開始時刻を記録します。正常終了では`auth.json`を最初に削除して一時領域の削除完了を待ちます。異常終了後の次回起動ではPIDと開始時刻の両方を照合し、PIDが別プロセスへ再利用されていても古いBot所有領域を回収します。マーカーのない領域や、同じプロセス実体が稼働中の領域は削除しません。開始時刻を安全に確認できない環境では稼働中PIDを削除しない側へ倒します。
 
 ```env
 MEETING_AI_PROVIDER=codex_app_server
@@ -60,6 +60,32 @@ npm.cmd start
 ```
 
 起動時に対象サーバーへ`/meeting`を登録し、`data/meetings.sqlite3`を自動作成します。
+
+## Windowsログオン後に自動復旧する
+
+タスクスケジューラ用スクリプトは、実行しただけでは登録内容を変更しません。既定動作は確認です。`.env`の値やトークンをタスク引数へ保存せず、現在のWindowsユーザー権限で`start.ps1`を起動します。`SYSTEM`では動かさないため、CodexのChatGPT認証を別アカウントへコピーしません。
+
+登録（ログオンと起動の両トリガー）:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy RemoteSigned -File ".\scripts\manage-autostart.ps1" -Action Register
+```
+
+Windows起動時点で対話ユーザーのトークンがまだ無い場合は、起動トリガーでは開始できず、ログオントリガーで復旧します。多重起動はタスク設定の`IgnoreNew`で防止し、異常終了時は1分間隔で最大3回再試行します。
+
+登録内容と直近結果の確認:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy RemoteSigned -File ".\scripts\manage-autostart.ps1" -Action Verify
+```
+
+同名タスクがある場合、登録コマンドは勝手に上書きしません。内容を確認したうえで置換するときだけ`-Replace`を付けます。解除も確認フラグが必要です。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy RemoteSigned -File ".\scripts\manage-autostart.ps1" -Action Unregister -ConfirmRemoval
+```
+
+このリポジトリのスクリプトを移動した場合は、`-Replace`付きで再登録してから`-Action Verify`を実行してください。
 
 ## Discord側の準備
 
@@ -232,9 +258,25 @@ GOOGLE_SERVICE_ACCOUNT_FILE=
 GOOGLE_SHEETS_SYNC_URLS=false
 ```
 
-サービスアカウントでSheets APIを有効化し、対象スプレッドシートをその`client_email`へ共有します。起動後に`会議一覧`、`出欠`、`通知ログ`を不足分だけ作成します。
+サービスアカウントでSheets APIを有効化し、対象スプレッドシートをその`client_email`へ共有します。起動後に`会議一覧`、`出欠`、`通知ログ`を不足分だけ作成します。認証ファイル、権限、初回同期のいずれかに失敗した場合は、秘密を含まないエラーコードを警告してSheetsだけを無効化し、Discord BOTと通知処理は継続します。設定を直した後はBOTを再起動してください。
 
 `GOOGLE_SHEETS_SYNC_URLS=false`ではURL本体を同期しません。値は`RAW`で書き込み、数式注入を防止します。
+
+## SQLiteのオンラインバックアップ
+
+BOTを止めずに、WALにある確定済みデータを含む整合したSQLiteバックアップを作成できます。単純なファイルコピーではなくNode.jsのSQLite backup APIを使い、`PRAGMA quick_check`が`ok`になったファイルだけを完成扱いにします。
+
+```powershell
+npm.cmd run backup
+```
+
+既定の出力先はGit対象外の`data/backups/`です。元DBと出力先を明示する場合:
+
+```powershell
+node .\scripts\backup-database.mjs --source .\data\meetings.sqlite3 --output-dir D:\MeetingBotBackups
+```
+
+バックアップには会議URL、氏名、Discord IDなどSQLite内の非公開情報が含まれます。公開リポジトリ、共有ドライブ、無暗号の外部媒体へ置かないでください。復元するときはBOTを停止し、現在のDBを別名で保全してから、選んだバックアップを`data/meetings.sqlite3`へコピーします。
 
 ## 公開WEBへの片方向同期（任意）
 
@@ -283,6 +325,9 @@ POST
 - 各人は今後の既定値、または特定会議だけの値を変更可能
 - 欠席中の個人通知は送信せず、参加・未定へ戻すと未送信分を再生成
 - 再起動後はSQLiteから未送信通知を復元
+- 初回招待DMの予約は招待者登録と同じSQLite transactionで確定し、一時障害は自動再試行
+- 招待DMの作成・更新jobは会議参照、宛先のローカルDiscord user ID、世代・lease・再試行状態だけを保持し、URL・会議名・本文・message/channel IDは複製しない。完了・恒久失敗したjobは削除
+- 送信直後に停止した場合は、自Botが送った直近50件のDMから同じ会議ボタンを探して再利用し、重複送信を抑止
 - 遅れすぎた通知は、復旧直後の突然の大量送信を避けるためスキップ
 
 ## モジュール構成
@@ -294,6 +339,8 @@ POST
 - `src/personal-reminders.mjs`: 個人通知の自然言語解析
 - `src/self-service-controller.mjs`: DM/サーバー共通の本人操作
 - `src/discord-direct-messenger.mjs`: 在籍確認付きDM送信
+- `src/direct-invite-update-scheduler.mjs`: 初回招待DMと既存招待DM更新の永続送信・再試行・再起動復旧
+- `src/meeting-card-update-scheduler.mjs`: 会議カードの永続更新・再試行
 - `src/personal-reminder-scheduler.mjs`: 個人通知のclaimと配信
 - `src/storage/`: テンプレート・個人通知の永続化
 - `src/privacy.mjs`: AI送信前の秘密情報分離
@@ -304,6 +351,9 @@ POST
 - `src/web-projection.mjs`: WEB公開用の明示allowlist projection
 - `src/web-sync.mjs`: HMAC署名付きの任意片方向WEB同期
 - `src/discord-ui.mjs`: 会議カード、DM、ボタン
+- `scripts/runtime-support.mjs`: 任意連携の起動分離と安全な終了待ち
+- `scripts/manage-autostart.ps1`: Windowsタスクの登録・確認・解除
+- `scripts/backup-database.mjs`: WAL対応SQLiteオンラインバックアップ
 
 ## テスト
 

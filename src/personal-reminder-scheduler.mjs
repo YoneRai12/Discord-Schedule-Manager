@@ -56,6 +56,7 @@ export class PersonalReminderScheduler {
     this.logger = logger;
     this.timer = null;
     this.running = false;
+    this.activeTick = null;
   }
 
   start() {
@@ -73,11 +74,31 @@ export class PersonalReminderScheduler {
     return true;
   }
 
+  async stopAndDrain(timeoutMs = 5_000) {
+    this.stop();
+    const active = this.activeTick;
+    if (!active) return true;
+    const timeout = Math.max(0, Number(timeoutMs) || 0);
+    if (timeout === 0) return false;
+    let timer;
+    try {
+      return await Promise.race([
+        active.then(() => true, () => true),
+        new Promise((resolve) => {
+          timer = setTimeout(() => resolve(false), timeout);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
   async tick() {
     if (this.running) return { claimed: 0, sent: 0, failed: 0, skipped: true };
     this.running = true;
     const result = { claimed: 0, sent: 0, failed: 0, skipped: false };
-    try {
+    let stale = 0;
+    const execution = (async () => {
       const nowMs = Number(this.now());
       const deliveries = await this.reminders.claimDueDeliveries({
         nowMs,
@@ -88,22 +109,53 @@ export class PersonalReminderScheduler {
       result.claimed = deliveries.length;
       for (const delivery of deliveries) {
         const sent = await this.deliver(delivery, nowMs);
-        if (sent) result.sent += 1;
+        if (sent === null) stale += 1;
+        else if (sent) result.sent += 1;
         else result.failed += 1;
       }
+    })();
+    this.activeTick = execution;
+    try {
+      await execution;
     } catch (error) {
       result.failed += 1;
       this.logger.error?.(`[personal-reminder-scheduler] tick_failed code=${directMessageErrorCode(error)}`);
     } finally {
+      if (this.activeTick === execution) this.activeTick = null;
       this.running = false;
     }
+    if (stale) result.stale = stale;
     return result;
+  }
+
+  isCurrent(delivery) {
+    return typeof this.reminders.isClaimCurrent !== "function"
+      || this.reminders.isClaimCurrent(delivery);
+  }
+
+  async claimIsCurrent(delivery) {
+    const current = this.isCurrent(delivery);
+    return current && typeof current.then === "function" ? await current : current;
+  }
+
+  async deleteStaleReminder(delivery, receipt) {
+    if (!receipt?.messageId || typeof this.directMessenger.deleteDirectMessage !== "function") return;
+    try {
+      await this.directMessenger.deleteDirectMessage({
+        meeting: { guildId: delivery?.guildId ?? delivery?.meeting?.guildId },
+        recipient: { userId: delivery?.userId ?? delivery?.recipient?.userId },
+        messageId: receipt.messageId,
+      });
+    } catch (error) {
+      this.logger.warn?.(`[personal-reminder-scheduler] stale_message_delete_failed code=${directMessageErrorCode(error)}`);
+    }
   }
 
   async deliver(delivery, nowMs = Number(this.now())) {
     let id;
     try {
       id = deliveryId(delivery);
+      if (!await this.claimIsCurrent(delivery)) return null;
       const dueAtMs = Number(delivery.dueAtMs);
       const oldestAllowed = nowMs - this.maxLateMinutes * 60_000;
       if (!Number.isFinite(dueAtMs) || dueAtMs < oldestAllowed) {
@@ -116,17 +168,36 @@ export class PersonalReminderScheduler {
         return false;
       }
 
+      const current = this.isCurrent(delivery);
+      if (current && typeof current.then === "function") {
+        if (!await current) return null;
+      } else if (!current) {
+        return null;
+      }
       const receipt = await this.directMessenger.sendPersonalReminder(delivery);
+      if (!await this.claimIsCurrent(delivery)) {
+        await this.deleteStaleReminder(delivery, receipt);
+        return null;
+      }
       try {
-        await this.reminders.markSent(id, {
+        const persisted = await this.reminders.markSent(id, {
+          scheduleRevision: delivery.scheduleRevision,
+          claimToken: delivery.claimToken,
           discordMessageId: receipt?.messageId ?? null,
           sentAtMs: Number(this.now()),
         });
+        if (persisted === false) {
+          this.logger.warn?.("[personal-reminder-scheduler] sent_receipt_stale");
+          await this.deleteStaleReminder(delivery, receipt);
+          return null;
+        }
       } catch (persistError) {
         // The DM may already be visible.  Mark it non-retryable so a temporary
         // receipt-persistence failure does not create a duplicate notification.
         await this.safeMarkFailed(id, {
           errorCode: "receipt_persist_failed",
+          scheduleRevision: delivery.scheduleRevision,
+          claimToken: delivery.claimToken,
           retryable: false,
           maxAttempts: 0,
           possiblySent: true,
@@ -143,6 +214,8 @@ export class PersonalReminderScheduler {
         const retryable = !NON_RETRYABLE_CODES.has(errorCode);
         await this.safeMarkFailed(id, {
           errorCode,
+          scheduleRevision: delivery.scheduleRevision,
+          claimToken: delivery.claimToken,
           retryable,
           ...(retryable ? {} : { maxAttempts: 0 }),
           failedAtMs: Number(this.now()),

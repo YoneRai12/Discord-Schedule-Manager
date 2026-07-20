@@ -98,3 +98,28 @@ test("呼び名は安全な文字だけを許可して重複を除く", () => {
   assert.throws(() => normalizeMemberAlias("あ"), /2〜32/u);
   assert.throws(() => normalizeMemberAlias("https://example.com"), /使える/u);
 });
+
+test("参加者なし・個別DMなしは既定テンプレートより優先する", () => {
+  for (const input of ["参加者なし 7月27日20時 全体会議", "個別DMなし 7月27日20時 全体会議", "今回は招待しない 7月27日20時 全体会議"]) {
+    const directive = extractParticipantDirective(input);
+    assert.equal(directive.found, true, input);
+    assert.equal(directive.disableInvites, true, input);
+    assert.equal(directive.cleanedText.includes("なし"), false, input);
+    assert.deepEqual(resolveParticipantSnapshot({
+      disableInvites: directive.disableInvites,
+      defaultTemplate: { name: "固定", members: [{ userId: "member-a", displayName: "担当A" }] },
+    }).invitees, [], input);
+  }
+});
+
+test("登録済み参加者の接続助詞と敬称を自然な日本語として分離する", () => {
+  const knownAliases = ["担当A", "担当B"];
+  assert.deepEqual(
+    extractParticipantDirective("参加者: 担当Aと担当B", { knownAliases }).aliases,
+    ["担当A", "担当B"],
+  );
+  assert.deepEqual(
+    extractParticipantDirective("参加者: 担当Aさん、担当Bさん", { knownAliases }).aliases,
+    ["担当A", "担当B"],
+  );
+});

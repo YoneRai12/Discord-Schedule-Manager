@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { MeetingDatabase } from "../src/database.mjs";
-import { redactMeetingId } from "../src/meeting-id.mjs";
+import { extractMeetingIds, redactMeetingId, redactMeetingIds } from "../src/meeting-id.mjs";
 
 function meetingInput(overrides = {}) {
   const startsAtMs = Date.now() + 24 * 60 * 60_000;
@@ -59,6 +59,37 @@ test("新規会議IDは読み違えにくいalphabetの8文字で、一意に生
 
 test("全角化された会議IDもAI送信前に伏せ字化する", () => {
   assert.equal(redactMeetingId("会議ＩＤ：ＡＢＣ１２３４"), "会議ID:[MEETING_ID]");
+});
+
+test("本文中の全会議IDを抽出してAI送信前に一括マスクする", () => {
+  const raw = "ID: ABCD2345 ではなく ID: EFGH6789 を更新";
+  assert.deepEqual(extractMeetingIds(raw), ["ABCD2345", "EFGH6789"]);
+  const redacted = redactMeetingIds(raw);
+  assert.equal(redacted.includes("ABCD2345"), false);
+  assert.equal(redacted.includes("EFGH6789"), false);
+  assert.equal((redacted.match(/\[MEETING_ID\]/gu) || []).length, 2);
+});
+
+test("括弧や引用符で囲まれた会議IDもAI送信前に一括マスクする", () => {
+  const raw = "候補（ABCD2345）と『EFGH6789』のどちらかを更新";
+  assert.deepEqual(extractMeetingIds(raw), ["ABCD2345", "EFGH6789"]);
+  const redacted = redactMeetingIds(raw);
+  assert.equal(redacted.includes("ABCD2345"), false);
+  assert.equal(redacted.includes("EFGH6789"), false);
+});
+
+test("ラベルなしの小文字会議IDも数字を含む場合はローカルでマスクする", () => {
+  const raw = "abcd2345 の予定を更新して";
+  assert.deepEqual(extractMeetingIds(raw), ["ABCD2345"]);
+  assert.equal(redactMeetingIds(raw), "[MEETING_ID] の予定を更新して");
+});
+
+test("全英字の小文字IDは実在するローカル会議IDとの照合時だけマスクする", () => {
+  const raw = "abcdefgh の予定を更新して";
+  assert.deepEqual(extractMeetingIds(raw), []);
+  const ids = extractMeetingIds(raw, { knownIds: ["ABCDEFGH"] });
+  assert.deepEqual(ids, ["ABCDEFGH"]);
+  assert.equal(redactMeetingIds(raw, ids), "[MEETING_ID] の予定を更新して");
 });
 
 test("既存の7文字会議IDはDB再起動後も同じIDで参照・更新できる", (t) => {

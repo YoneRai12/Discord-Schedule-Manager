@@ -50,7 +50,7 @@ export function parseTemplateManagementMessage(rawText) {
   }
 
   const saveName = matchName(text, [
-    /テンプレートs*[「『"]([\p{L}\p{N}_ -]{2,40})[」』"]\s*として.{0,500}?(?:保存|登録)/u,
+    /テンプレート\s*[「『"]([\p{L}\p{N}_ -]{2,40})[」』"]\s*として.{0,500}?(?:保存|登録)/u,
     /[「『"]([\p{L}\p{N}_ -]{2,40})[」』"]\s*(?:という)?\s*テンプレートとして.{0,500}?(?:保存|登録)/u,
     /テンプレート(?:保存|登録)\s*(?:は|:|：)\s*([\p{L}\p{N}_ -]{2,40}?)(?=\s+(?:参加者|出席者)\s*[:：])/u,
     /テンプレート(?:保存|登録)\s*(?:は|:|：)?\s*[「『"]?([\p{L}\p{N}_ -]{2,40})[」』"]?$/u,
@@ -69,7 +69,11 @@ export function parseTemplateManagementMessage(rawText) {
   return null;
 }
 
-export function extractTemplateReference(rawText) {
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+export function extractTemplateReference(rawText, { knownTemplateNames = [] } = {}) {
   let templateName = null;
   const replaceReference = (_whole, captured) => {
       const normalized = normalizeTemplateName(captured);
@@ -79,7 +83,11 @@ export function extractTemplateReference(rawText) {
       templateName = normalized.name;
       return "[ATTENDANCE_TEMPLATE_REDACTED]";
     };
-  let cleanedText = String(rawText ?? "").replace(
+  let cleanedText = String(rawText ?? "").normalize("NFKC").replace(
+    /(?:参加者|出席者)?テンプレート\s*[「『"]([^」』"\r\n]{2,40})[」』"]\s*(?:を)?\s*使(?:う|って)/giu,
+    replaceReference,
+  );
+  cleanedText = cleanedText.replace(
     /(?:参加者|出席者)?テンプレート\s*(?:は|:|：)\s*[「『"]([^」』"\r\n]{2,40})[」』"]/giu,
     replaceReference,
   );
@@ -87,5 +95,21 @@ export function extractTemplateReference(rawText) {
     /(?:参加者|出席者)?テンプレート\s*(?:は|:|：)\s*([\p{L}\p{N}_ -]{2,40}?)(?=\s+(?:URL|リンク)\s*[:：]|\s+で(?:\s|会議|登録|作成|お願い)|\s+を使(?:う|って)|[\r\n。.!！?？]|$)/giu,
     replaceReference,
   );
+  const normalizedKnownNames = [...new Set((knownTemplateNames || []).map((name) => (
+    normalizeTemplateName(name).name
+  )))].sort((left, right) => [...right].length - [...left].length);
+  for (const name of normalizedKnownNames) {
+    const escaped = escapeRegExp(name);
+    for (const pattern of [
+      new RegExp(`(?:参加者|出席者)?テンプレート\\s*[「『"]?(${escaped})[」』"]?\\s*(?:を)?\\s*使(?:う|って)`, "giu"),
+      new RegExp(`(${escaped})\\s*(?:参加者|出席者)?テンプレート\\s*を\\s*使(?:う|って)`, "giu"),
+      new RegExp(`(${escaped})\\s*の\\s*(?:メンバー|参加者|出席者)\\s*(?:で|を|に)?`, "giu"),
+      new RegExp(`テンプレ(?:ート)?\\s*[「『"]?(${escaped})[」』"]?\\s*(?:で|を?\\s*使(?:う|って))`, "giu"),
+      new RegExp(`(?:参加者|出席者)\\s*(?:は|:|：)\\s*[「『"]?(${escaped})[」』"]?\\s*テンプレ(?:ート)?\\s*(?:で|を?\\s*使(?:う|って))?`, "giu"),
+      new RegExp(`(${escaped})\\s*の\\s*テンプレ(?:ート)?\\s*(?:を)?\\s*使(?:う|って)`, "giu"),
+    ]) {
+      cleanedText = cleanedText.replace(pattern, replaceReference);
+    }
+  }
   return { cleanedText, templateName, found: Boolean(templateName) };
 }

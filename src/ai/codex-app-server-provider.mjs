@@ -1,8 +1,18 @@
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+
+const TEMP_OWNER_MARKER = ".discord-meeting-ai-owner.json";
+const TEMP_OWNER_NAME = "discord-meeting-manager-bot.codex-app-server";
+const TEMP_OWNER_SCHEMA_VERSION = 2;
+const LEGACY_TEMP_OWNER_SCHEMA_VERSION = 1;
+const OWNED_DIRECTORY_KINDS = Object.freeze({
+  "codex-home-": "codex-home",
+  "workspace-": "workspace",
+});
 
 const SAFE_ENV_KEYS = Object.freeze([
   "PATH",
@@ -42,6 +52,68 @@ function codedError(message, code) {
 function pathIsInside(parent, candidate) {
   const relative = path.relative(parent, candidate);
   return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+function defaultIsProcessAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  if (pid === process.pid) return true;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // EPERM means that the process exists but cannot be signalled by this user.
+    return error?.code === "EPERM";
+  }
+}
+
+// A PID alone is not an ownership proof: operating systems can assign it to a
+// different process after the original owner exits.  This returns a stable
+// start timestamp when the host exposes one, without reading process arguments
+// or environment values (which may contain credentials).
+function defaultProcessStartedAtMs(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    if (process.platform === "linux") {
+      const startedAtMs = Math.trunc(fs.statSync(`/proc/${pid}`).ctimeMs);
+      return Number.isSafeInteger(startedAtMs) && startedAtMs > 0 ? startedAtMs : null;
+    }
+    if (process.platform === "win32") {
+      const output = execFileSync("powershell.exe", [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `[DateTimeOffset]::new((Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()`,
+      ], {
+        encoding: "utf8",
+        windowsHide: true,
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 2_000,
+        maxBuffer: 128,
+      }).trim();
+      const startedAtMs = Number(output);
+      return Number.isSafeInteger(startedAtMs) && startedAtMs > 0 ? startedAtMs : null;
+    }
+    const output = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf8",
+      env: { ...process.env, LC_ALL: "C" },
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 2_000,
+      maxBuffer: 128,
+    }).trim();
+    const startedAtMs = Date.parse(output);
+    return Number.isSafeInteger(startedAtMs) && startedAtMs > 0 ? startedAtMs : null;
+  } catch {
+    // Permission-restricted hosts must retain a live directory rather than
+    // risking deletion of another active provider's copied credential.
+    return null;
+  }
+}
+
+function delay(milliseconds) {
+  // Keep this timer referenced: shutdown awaits credential cleanup and must not
+  // let Node exit between Windows file-lock retry attempts.
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function sourceCodexHome(environment) {
@@ -139,6 +211,11 @@ export class CodexAppServerProvider {
     spawnImpl = spawn,
     logger = console,
     environment = process.env,
+    isProcessAlive = defaultIsProcessAlive,
+    processStartedAtMs = defaultProcessStartedAtMs,
+    removePath = (target, options) => fs.rmSync(target, options),
+    cleanupRetryDelayMs = 250,
+    cleanupMaxAttempts = 20,
   } = {}) {
     if (!Number.isSafeInteger(maxOutputBytes) || maxOutputBytes < 1 || maxOutputBytes > 1024 * 1024) {
       throw codedError("Codex出力サイズ上限が不正です", "invalid_output_limit");
@@ -156,6 +233,11 @@ export class CodexAppServerProvider {
     this.spawnImpl = spawnImpl;
     this.logger = logger;
     this.environment = safeChildEnvironment(environment);
+    this.isProcessAlive = isProcessAlive;
+    this.processStartedAtMs = processStartedAtMs;
+    this.removePath = removePath;
+    this.cleanupRetryDelayMs = Math.max(1, Number(cleanupRetryDelayMs) || 250);
+    this.cleanupMaxAttempts = Math.max(1, Math.trunc(Number(cleanupMaxAttempts) || 20));
     this.process = null;
     this.reader = null;
     this.nextRequestId = 1;
@@ -167,6 +249,7 @@ export class CodexAppServerProvider {
     this.startPromise = null;
     this.queue = Promise.resolve();
     this.closed = false;
+    this.cleanupTasks = new Set();
   }
 
   get configured() {
@@ -176,9 +259,9 @@ export class CodexAppServerProvider {
   async initialize() {
     if (this.closed) throw new Error("Codex App Server providerは終了済みです");
     if (this.startPromise) return this.startPromise;
-    this.startPromise = this.start().catch((error) => {
+    this.startPromise = this.start().catch(async (error) => {
       this.startPromise = null;
-      this.stopProcess();
+      await this.stopProcess();
       throw error;
     });
     return this.startPromise;
@@ -234,8 +317,10 @@ export class CodexAppServerProvider {
 
   prepareIsolatedCodexHome() {
     fs.mkdirSync(this.sandboxDir, { recursive: true, mode: 0o700 });
-    this.workspaceDir = fs.mkdtempSync(path.join(this.sandboxDir, "workspace-"));
-    const isolatedHome = fs.mkdtempSync(path.join(this.sandboxDir, "codex-home-"));
+    this.recoverStaleOwnedDirectories();
+    const instanceId = randomUUID();
+    this.workspaceDir = this.createOwnedDirectory("workspace-", "workspace", instanceId);
+    const isolatedHome = this.createOwnedDirectory("codex-home-", "codex-home", instanceId);
     if (!pathIsInside(this.sandboxDir, isolatedHome)) {
       throw codedError("Codex隔離homeはAI sandbox内に必要です", "isolated_home_outside_sandbox");
     }
@@ -338,6 +423,147 @@ export class CodexAppServerProvider {
       "",
     ].join("\n"), { encoding: "utf8", mode: 0o600 });
     try { fs.chmodSync(isolatedConfig, 0o600); } catch {}
+  }
+
+  createOwnedDirectory(prefix, kind, instanceId) {
+    const target = fs.mkdtempSync(path.join(this.sandboxDir, prefix));
+    if (!pathIsInside(this.sandboxDir, target)) {
+      throw codedError("Codex一時領域はAI sandbox内に必要です", "temporary_directory_outside_sandbox");
+    }
+    let ownerProcessStartedAtMs = null;
+    try {
+      ownerProcessStartedAtMs = this.processStartedAtMs(process.pid);
+    } catch {}
+    const hasProcessStartIdentity = Number.isSafeInteger(ownerProcessStartedAtMs) && ownerProcessStartedAtMs > 0;
+    const marker = {
+      schemaVersion: hasProcessStartIdentity ? TEMP_OWNER_SCHEMA_VERSION : LEGACY_TEMP_OWNER_SCHEMA_VERSION,
+      owner: TEMP_OWNER_NAME,
+      kind,
+      ownerPid: process.pid,
+      ...(hasProcessStartIdentity ? { ownerProcessStartedAtMs } : {}),
+      instanceId,
+      createdAtMs: Date.now(),
+    };
+    fs.writeFileSync(path.join(target, TEMP_OWNER_MARKER), JSON.stringify(marker), {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    try { fs.chmodSync(path.join(target, TEMP_OWNER_MARKER), 0o600); } catch {}
+    return target;
+  }
+
+  ownedDirectoryKind(name) {
+    for (const [prefix, kind] of Object.entries(OWNED_DIRECTORY_KINDS)) {
+      if (name.startsWith(prefix)) return kind;
+    }
+    return null;
+  }
+
+  readOwnerMarker(target, expectedKind = null) {
+    if (!target || !pathIsInside(this.sandboxDir, target)) return null;
+    const kind = this.ownedDirectoryKind(path.basename(target));
+    if (!kind || (expectedKind && kind !== expectedKind)) return null;
+    try {
+      const targetStat = fs.lstatSync(target);
+      if (!targetStat.isDirectory() || targetStat.isSymbolicLink()) return null;
+      const markerPath = path.join(target, TEMP_OWNER_MARKER);
+      const markerStat = fs.lstatSync(markerPath);
+      if (!markerStat.isFile() || markerStat.isSymbolicLink() || markerStat.size > 4_096) return null;
+      const marker = JSON.parse(fs.readFileSync(markerPath, "utf8"));
+      if (
+        ![LEGACY_TEMP_OWNER_SCHEMA_VERSION, TEMP_OWNER_SCHEMA_VERSION].includes(marker?.schemaVersion)
+        || marker?.owner !== TEMP_OWNER_NAME
+        || marker?.kind !== kind
+        || !Number.isSafeInteger(marker?.ownerPid)
+        || marker.ownerPid <= 0
+        || typeof marker?.instanceId !== "string"
+        || marker.instanceId.length < 1
+        || marker.instanceId.length > 200
+        || !Number.isSafeInteger(marker?.createdAtMs)
+        || (
+          marker.schemaVersion === TEMP_OWNER_SCHEMA_VERSION
+          && (!Number.isSafeInteger(marker?.ownerProcessStartedAtMs) || marker.ownerProcessStartedAtMs <= 0)
+        )
+      ) return null;
+      return marker;
+    } catch {
+      return null;
+    }
+  }
+
+  removeOwnedDirectoryNow(target, expectedKind = null) {
+    const marker = this.readOwnerMarker(target, expectedKind);
+    if (!marker) return false;
+    if (marker.kind === "codex-home") {
+      const authPath = path.join(target, "auth.json");
+      if (fs.existsSync(authPath)) {
+        try {
+          this.removePath(authPath, { force: true, maxRetries: 3, retryDelay: 50 });
+        } catch {
+          // Do not recursively remove the home until the copied credential was removed.
+          return false;
+        }
+        if (fs.existsSync(authPath)) return false;
+      }
+    }
+    try {
+      this.removePath(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      return !fs.existsSync(target);
+    } catch {
+      return false;
+    }
+  }
+
+  recoverStaleOwnedDirectories() {
+    const result = { removed: 0, skippedActive: 0, skippedUnowned: 0, failed: 0 };
+    if (!fs.existsSync(this.sandboxDir)) return result;
+    let entries;
+    try {
+      entries = fs.readdirSync(this.sandboxDir, { withFileTypes: true });
+    } catch {
+      return { ...result, failed: 1 };
+    }
+    for (const entry of entries) {
+      const kind = this.ownedDirectoryKind(entry.name);
+      if (!kind) continue;
+      const target = path.join(this.sandboxDir, entry.name);
+      const marker = entry.isDirectory() && !entry.isSymbolicLink()
+        ? this.readOwnerMarker(target, kind)
+        : null;
+      if (!marker) {
+        result.skippedUnowned += 1;
+        continue;
+      }
+      const active = this.isMarkerOwnerActive(marker);
+      if (active) {
+        result.skippedActive += 1;
+        continue;
+      }
+      if (this.removeOwnedDirectoryNow(target, kind)) result.removed += 1;
+      else result.failed += 1;
+    }
+    if (result.failed) {
+      this.logger.warn?.(`[ai] Codex stale temporary directory cleanup incomplete count=${result.failed}`);
+    }
+    return result;
+  }
+
+  isMarkerOwnerActive(marker) {
+    let active = true;
+    try {
+      active = Boolean(this.isProcessAlive(marker.ownerPid));
+    } catch {}
+    if (!active || marker.schemaVersion !== TEMP_OWNER_SCHEMA_VERSION) return active;
+
+    let observedStartedAtMs = null;
+    try {
+      observedStartedAtMs = this.processStartedAtMs(marker.ownerPid);
+    } catch {}
+    // If the platform cannot identify the running process instance, keeping the
+    // directory is the safe choice.  A value mismatch proves PID reuse.
+    return !Number.isSafeInteger(observedStartedAtMs)
+      || observedStartedAtMs === marker.ownerProcessStartedAtMs;
   }
 
   generateStructured(request) {
@@ -557,21 +783,11 @@ export class CodexAppServerProvider {
     }
     this.turnStates.clear();
     this.startPromise = null;
-    this.stopProcess(failedProcess);
-  }
-
-  cleanupDirectory(target) {
-    if (!target || !pathIsInside(this.sandboxDir, target)) return true;
-    try {
-      fs.rmSync(target, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
-      return !fs.existsSync(target);
-    } catch {
-      return false;
-    }
+    return this.stopProcess(failedProcess);
   }
 
   stopProcess(processToStop = this.process) {
-    if (processToStop && this.process && processToStop !== this.process) return;
+    if (processToStop && this.process && processToStop !== this.process) return Promise.resolve(false);
     const reader = this.reader;
     const child = processToStop || this.process;
     const isolatedTarget = this.isolatedCodexHome;
@@ -581,29 +797,6 @@ export class CodexAppServerProvider {
     this.isolatedCodexHome = null;
     this.workspaceDir = null;
 
-    let cleanupFinished = false;
-    let cleanupAttempts = 0;
-    let cleanupTimer = null;
-    const cleanup = () => {
-      if (cleanupFinished) return;
-      if (cleanupTimer) {
-        clearTimeout(cleanupTimer);
-        cleanupTimer = null;
-      }
-      cleanupAttempts += 1;
-      const homeRemoved = this.cleanupDirectory(isolatedTarget);
-      const workspaceRemoved = this.cleanupDirectory(workspaceTarget);
-      cleanupFinished = homeRemoved && workspaceRemoved;
-      if (cleanupFinished) {
-        try { child?.removeListener?.("close", cleanup); } catch {}
-      } else if (cleanupAttempts < 20) {
-        cleanupTimer = setTimeout(cleanup, 250);
-        cleanupTimer.unref?.();
-      } else {
-        this.logger.warn?.("[ai] Codex temporary directory cleanup incomplete");
-      }
-    };
-    try { child?.once?.("close", cleanup); } catch {}
     try { reader?.removeAllListeners?.(); } catch {}
     try { reader?.close(); } catch {}
     try { child?.stdin?.end?.(); } catch {}
@@ -611,15 +804,37 @@ export class CodexAppServerProvider {
     try { child?.stdout?.destroy?.(); } catch {}
     try { child?.stderr?.destroy?.(); } catch {}
     try { child?.kill?.(); } catch {}
-    cleanup();
+
+    if (!isolatedTarget && !workspaceTarget) return Promise.resolve(true);
+    const cleanupTask = (async () => {
+      for (let attempt = 0; attempt < this.cleanupMaxAttempts; attempt += 1) {
+        const homeRemoved = !isolatedTarget
+          || !fs.existsSync(isolatedTarget)
+          || this.removeOwnedDirectoryNow(isolatedTarget, "codex-home");
+        const workspaceRemoved = !workspaceTarget
+          || !fs.existsSync(workspaceTarget)
+          || this.removeOwnedDirectoryNow(workspaceTarget, "workspace");
+        if (homeRemoved && workspaceRemoved) return true;
+        if (attempt + 1 < this.cleanupMaxAttempts) await delay(this.cleanupRetryDelayMs);
+      }
+      this.logger.warn?.("[ai] Codex temporary directory cleanup incomplete");
+      return false;
+    })();
+    this.cleanupTasks.add(cleanupTask);
+    void cleanupTask.finally(() => this.cleanupTasks.delete(cleanupTask));
+    return cleanupTask;
   }
 
-  close() {
+  async close() {
     this.closed = true;
-    this.handleProcessFailure(
+    const currentCleanup = this.handleProcessFailure(
       codedError("Codex App Server providerを終了しました", "provider_closed"),
       this.process,
     );
+    await Promise.allSettled([
+      ...(currentCleanup ? [currentCleanup] : []),
+      ...this.cleanupTasks,
+    ]);
   }
 }
 

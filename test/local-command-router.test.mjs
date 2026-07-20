@@ -23,6 +23,8 @@ test("Slash Command相当の通常チャンネル@メンション操作をロー
 
 test("会議作成・更新の自由文はAI会議解析へフォールスルーする", () => {
   assert.equal(parseGuildNaturalCommand("明日20時から定例会を登録して"), null);
+  assert.equal(parseGuildNaturalCommand("7月27日20時 使い方改善会議 https://meet.google.com/example-room"), null);
+  assert.equal(parseGuildNaturalCommand("次の会議は7月27日20時 新商品MTG https://meet.google.com/example-room"), null);
 });
 
 test("会議URL差し替えは7〜8文字IDや自然な指示をローカル操作として判定する", () => {
@@ -53,6 +55,13 @@ test("会議URL差し替えは7〜8文字IDや自然な指示をローカル操�
   assert.equal(
     parseGuildNaturalCommand("全体MTGを新しく登録。Googleミートのリンク、これね https://meet.google.com/example-room"),
     null,
+  );
+});
+
+test("実在する全英字会議IDは小文字入力でもローカル管理操作に使える", () => {
+  assert.deepEqual(
+    parseGuildNaturalCommand("abcdefghを中止して", { knownMeetingIds: ["ABCDEFGH"] }),
+    { action: "meeting_cancel", meetingId: "ABCDEFGH" },
   );
 });
 
@@ -95,6 +104,7 @@ test("全Slashサブコマンドに通常チャンネル@メンションの自�
 
   assert.deepEqual(parseGuildNaturalCommand("使い方"), { action: "help" });
   assert.deepEqual(parseTemplateManagementMessage("テンプレート「全体定例」として参加者: メンバーA、メンバーB を保存"), { action: "save", name: "全体定例" });
+  assert.deepEqual(parseTemplateManagementMessage("テンプレート 「全体定例」として参加者: メンバーA、メンバーB を保存"), { action: "save", name: "全体定例" });
   assert.deepEqual(parseTemplateManagementMessage("テンプレート一覧を見せて"), { action: "list", name: null });
   assert.deepEqual(parseTemplateManagementMessage("テンプレート「全体定例」を見せて"), { action: "show", name: "全体定例" });
   assert.deepEqual(parseTemplateManagementMessage("テンプレート「全体定例」を既定にして"), { action: "set_default", name: "全体定例" });

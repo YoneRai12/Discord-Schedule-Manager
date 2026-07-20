@@ -126,3 +126,40 @@ test("AI出力にURLが混入した場合は結果全体を破棄する", () => 
     nowMs: Date.parse("2026-07-18T00:00:00Z"),
   }), /AI出力にURL/u);
 });
+
+test("値のない更新項目を既定値で上書きせず不足として返す", () => {
+  const duration = validateInterpretation(validOutput({
+    action: "update",
+    title: null,
+    startsAt: null,
+    durationMinutes: null,
+    reminderMinutes: null,
+    providedFields: ["durationMinutes"],
+  }), { hasMeetingUrl: false, nowMs: Date.parse("2026-07-18T00:00:00Z") });
+  assert.deepEqual(duration.providedFields, []);
+  assert.deepEqual(duration.missingFields, ["durationMinutes"]);
+
+  const url = validateInterpretation(validOutput({
+    action: "update",
+    title: null,
+    startsAt: null,
+    durationMinutes: null,
+    reminderMinutes: null,
+    providedFields: ["meetingUrl"],
+  }), { hasMeetingUrl: false, nowMs: Date.parse("2026-07-18T00:00:00Z") });
+  assert.deepEqual(url.missingFields, ["meetingUrl"]);
+});
+
+test("明示した通知なしの空配列と未指定nullを区別する", () => {
+  const disabled = validateInterpretation(validOutput({
+    action: "update",
+    title: null,
+    startsAt: null,
+    durationMinutes: null,
+    reminderMinutes: [],
+    providedFields: ["reminderMinutes"],
+  }), { hasMeetingUrl: false, defaultReminderMinutes: [30, 0], nowMs: Date.parse("2026-07-18T00:00:00Z") });
+  assert.deepEqual(disabled.reminderMinutes, []);
+  assert.deepEqual(disabled.providedFields, ["reminderMinutes"]);
+  assert.deepEqual(disabled.missingFields, []);
+});

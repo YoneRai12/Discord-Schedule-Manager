@@ -420,6 +420,25 @@ test("保存済み招待URLの修復はlegacy ID・通知配送・出欠を変�
   assert.equal(JSON.stringify(aiInputs).includes(REPLACEMENT_URL), false);
 });
 
+test("起動時の招待URL修復中に手動更新された場合は新しいURLを上書きしない", async (t) => {
+  const store = fixture(t);
+  const invitationUrl = "https://calendar.app.google/example-invitation";
+  const manualUrl = "https://meet.example.com/manually-updated";
+  const meeting = createMeeting(store, { id: "ABC1234", title: "全体会議" });
+  store.updateMeetingUrl(meeting.id, invitationUrl);
+  const { bot } = makeCoordinator(store, {
+    meetingUrlResolver: async () => {
+      store.updateMeetingUrl(meeting.id, manualUrl);
+      return REPLACEMENT_URL;
+    },
+  });
+
+  const result = await bot.repairActiveInvitationUrls();
+
+  assert.deepEqual(result, { repaired: 0, failed: 1, skippedByDeadline: 0 });
+  assert.equal(store.getMeeting(meeting.id).meetingUrl, manualUrl);
+});
+
 test("URLだけの確認確定では通知配送・試行状態・出欠を作り直さない", async (t) => {
   const store = fixture(t);
   const meeting = createMeeting(store, { id: "MEET0001", title: "全体定例" });
@@ -434,12 +453,15 @@ test("URLだけの確認確定では通知配送・試行状態・出欠を作�
   await bot.confirmUpdate({ editReply: async (payload) => { edits.push(payload); } }, {
     action: "update",
     meetingId: meeting.id,
+    guildId: meeting.guildId,
     meetingUrl: REPLACEMENT_URL,
     title: meeting.title,
     startsAtMs: meeting.startsAtMs,
     endsAtMs: meeting.endsAtMs,
     reminderMinutes: meeting.reminderMinutes,
     urlOnly: true,
+    baseUpdatedAtMs: meeting.updatedAtMs,
+    changedFields: ["meetingUrl"],
   });
 
   const after = store.getSnapshot();

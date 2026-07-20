@@ -43,7 +43,8 @@ export class MeetingTargetResolver {
     nowMs = Date.now(),
   }) {
     const tenantId = String(guildId);
-    const explicitId = extractMeetingId(rawText);
+    const activeMeetings = this.store.listUpcoming(tenantId, { limit: 100, nowMs });
+    const explicitId = extractMeetingId(rawText, { knownIds: activeMeetings.map((meeting) => meeting.id) });
     if (explicitId) {
       const meeting = this.store.getMeeting(explicitId);
       return meeting?.guildId === tenantId && meeting.status === "active"
@@ -61,7 +62,7 @@ export class MeetingTargetResolver {
     }
 
     const text = normalizedTitle(rawText);
-    const titleMatches = this.store.listUpcoming(tenantId, { limit: 100, nowMs })
+    const titleMatches = activeMeetings
       .map((meeting) => ({ meeting, title: normalizedTitle(meeting.title) }))
       .filter((item) => item.title.length >= 2 && text.includes(item.title));
     if (titleMatches.length) {

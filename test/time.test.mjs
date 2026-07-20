@@ -18,6 +18,8 @@ test("存在しない日時を拒否する", () => {
 
 test("通知分を重複除去して降順へ揃える", () => {
   assert.deepEqual(normalizeReminderMinutes([0, 30, 10, 30, -1, 99999]), [30, 10, 0]);
+  assert.deepEqual(normalizeReminderMinutes([], [30, 0]), []);
+  assert.deepEqual(normalizeReminderMinutes(undefined, [30, 0]), [30, 0]);
   assert.equal(reminderLabel(0), "開始時");
   assert.equal(reminderLabel(120), "2時間前");
 });

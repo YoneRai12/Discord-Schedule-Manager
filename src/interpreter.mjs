@@ -13,7 +13,7 @@ export const MEETING_EXTRACTION_SCHEMA = {
     startsAt: { type: ["string", "null"] },
     durationMinutes: { type: ["integer", "null"], minimum: 5, maximum: 1440 },
     reminderMinutes: {
-      type: "array",
+      type: ["array", "null"],
       maxItems: 12,
       items: { type: "integer", minimum: 0, maximum: 10080 },
     },
@@ -28,7 +28,7 @@ export const MEETING_EXTRACTION_SCHEMA = {
       type: "array",
       items: {
         type: "string",
-        enum: ["title", "startsAt", "meetingUrl", "meetingId", "requestedChanges"],
+        enum: ["title", "startsAt", "durationMinutes", "reminderMinutes", "meetingUrl", "meetingId", "requestedChanges"],
       },
     },
     confidence: { type: "number", minimum: 0, maximum: 1 },
@@ -67,7 +67,7 @@ const SYSTEM_PROMPT = `
 - startsAt は必ず UTCオフセット付きISO 8601（例: 2026-07-20T20:30:00+09:00）または null。
 - 「来週月曜」「明日」なども基準日時から解決します。曜日と日付が矛盾する場合は startsAt=null にします。
 - durationMinutes は明記されなければ null。
-- reminderMinutes は明記されなければ入力JSONの defaultReminderMinutes をそのまま使います。
+- reminderMinutes は明記されなければ null、明示的な「通知なし」は空配列 []、時刻指定があれば分単位の配列にします。
 
 action規則:
 - 新しい会議を登録する依頼は create。
@@ -107,8 +107,7 @@ export function validateInterpretation(
   }
 
   const action = ["create", "update", "unknown"].includes(raw.action) ? raw.action : "unknown";
-  const providedFields = new Set(Array.isArray(raw.providedFields) ? raw.providedFields : []);
-  if (hasMeetingUrl) providedFields.add("meetingUrl");
+  const requestedFields = new Set(Array.isArray(raw.providedFields) ? raw.providedFields : []);
   const title = safeDisplayText(raw.title, 100) || null;
   let startsAtMs = null;
   if (raw.startsAt) {
@@ -119,28 +118,35 @@ export function validateInterpretation(
     }
   }
   if (startsAtMs != null && startsAtMs < nowMs - 5 * 60_000) startsAtMs = null;
-  const durationMinutes = Number.isSafeInteger(raw.durationMinutes)
+  const hasDuration = Number.isSafeInteger(raw.durationMinutes)
     && raw.durationMinutes >= 5
-    && raw.durationMinutes <= 1_440
-    ? raw.durationMinutes
-    : defaultDurationMinutes;
-  const reminderMinutes = normalizeReminderMinutes(raw.reminderMinutes, defaultReminderMinutes);
+    && raw.durationMinutes <= 1_440;
+  const durationMinutes = hasDuration ? raw.durationMinutes : defaultDurationMinutes;
+  const hasReminderMinutes = Array.isArray(raw.reminderMinutes)
+    && raw.reminderMinutes.every((value) => Number.isSafeInteger(value) && value >= 0 && value <= 10_080);
+  const reminderMinutes = hasReminderMinutes
+    ? [...new Set(raw.reminderMinutes)].slice(0, 12).sort((a, b) => b - a)
+    : normalizeReminderMinutes(null, defaultReminderMinutes);
   const meetingId = normalizeMeetingId(raw.meetingId, { required: false });
   const missingFields = [];
+  const providedFields = new Set();
+  if (requestedFields.has("title") && title) providedFields.add("title");
+  if (requestedFields.has("startsAt") && startsAtMs != null) providedFields.add("startsAt");
+  if (requestedFields.has("durationMinutes") && hasDuration) providedFields.add("durationMinutes");
+  if (requestedFields.has("reminderMinutes") && hasReminderMinutes) providedFields.add("reminderMinutes");
+  if (hasMeetingUrl) providedFields.add("meetingUrl");
 
   if (action === "create") {
     if (!title) missingFields.push("title");
     if (startsAtMs == null) missingFields.push("startsAt");
     if (!hasMeetingUrl) missingFields.push("meetingUrl");
   } else if (action === "update") {
-    const updateFields = [...providedFields].filter((field) => (
-      field === "meetingUrl"
-      || (field === "title" && title)
-      || (field === "startsAt" && startsAtMs != null)
-      || field === "durationMinutes"
-      || field === "reminderMinutes"
-    ));
-    if (updateFields.length === 0) missingFields.push("requestedChanges");
+    if (requestedFields.has("title") && !title) missingFields.push("title");
+    if (requestedFields.has("startsAt") && startsAtMs == null) missingFields.push("startsAt");
+    if (requestedFields.has("durationMinutes") && !hasDuration) missingFields.push("durationMinutes");
+    if (requestedFields.has("reminderMinutes") && !hasReminderMinutes) missingFields.push("reminderMinutes");
+    if (requestedFields.has("meetingUrl") && !hasMeetingUrl) missingFields.push("meetingUrl");
+    if (providedFields.size === 0 && missingFields.length === 0) missingFields.push("requestedChanges");
   }
 
   return {

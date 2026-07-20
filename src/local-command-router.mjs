@@ -4,6 +4,12 @@ function hasUrlLike(text) {
   return /(?:https?:\/\/|www\.)\S+/iu.test(text);
 }
 
+function looksLikeMeetingComposition(text) {
+  const hasSchedule = /(?:今日|明日|明後日|今週|来週|再来週|\d{1,2}月\d{1,2}日|\d{1,2}(?:時|[:：]\d{1,2}))/u.test(text);
+  const hasMeetingWords = /(?:会議|予定|MTG|ミーティング|定例|打ち?合わせ|登録|作成)/iu.test(text);
+  return hasMeetingWords && (hasSchedule || hasUrlLike(text));
+}
+
 function isBareUrl(text) {
   const urls = String(text).match(/(?:https?:\/\/|www\.)\S+/giu) || [];
   if (urls.length !== 1) return false;
@@ -43,23 +49,24 @@ export function isHelpIntent(text) {
   return HELP_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
-export function parseGuildNaturalCommand(rawText) {
+export function parseGuildNaturalCommand(rawText, { knownMeetingIds = [] } = {}) {
   const text = String(rawText ?? "")
     .normalize("NFKC")
     .replace(/[\u0000-\u001F\u007F]/gu, " ")
     .replace(/\s+/gu, " ")
     .trim();
   if (!text) return { action: "help" };
-  const meetingId = extractMeetingId(text);
+  const meetingId = extractMeetingId(text, { knownIds: knownMeetingIds });
 
-  if (isHelpIntent(text)) return { action: "help" };
+  const meetingComposition = looksLikeMeetingComposition(text);
+  if (!meetingComposition && isHelpIntent(text)) return { action: "help" };
   if (isBareUrl(text) || isMeetingUrlUpdate(text)) {
     return { action: "meeting_url_update", meetingId, hasMeetingUrl: hasUrlLike(text) };
   }
   if (/自分の(?:個別)?通知設定|個人通知設定|マイ通知/u.test(text) && /(?:見せて|確認|表示|どうなって)/u.test(text)) {
     return { action: "my_reminders_show" };
   }
-  if (/(?:会議|予定)(?:の)?一覧|今後の(?:会議|予定)|次の会議/u.test(text)) return { action: "meeting_list" };
+  if (!meetingComposition && /(?:会議|予定)(?:の)?一覧|今後の(?:会議|予定)|次の会議/u.test(text)) return { action: "meeting_list" };
   if (meetingId && /(?:出欠|参加状況|回答状況|状況を見|誰が(?:来る|参加))/u.test(text)) {
     return { action: "meeting_status", meetingId };
   }

@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -10,12 +11,28 @@ import { normalizeReminderMinutes } from "./time.mjs";
 
 const RSVP_STATUSES = new Set(["attending", "maybe", "declined"]);
 
+function updateConflict() {
+  return Object.assign(new Error("会議が別の操作で更新されました。最新状態を確認してやり直してください"), {
+    code: "meeting_update_conflict",
+  });
+}
+
+function corruptReminderJson() {
+  return Object.assign(new Error("保存済みの通知設定が破損しています"), {
+    code: "corrupt_reminder_json",
+  });
+}
+
 function parseJsonArray(value) {
   try {
     const parsed = JSON.parse(String(value ?? "[]"));
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) throw corruptReminderJson();
+    if (parsed.some((item) => !Number.isSafeInteger(Number(item)) || Number(item) < 0 || Number(item) > 10_080)) {
+      throw corruptReminderJson();
+    }
+    return parsed;
   } catch {
-    return [];
+    throw corruptReminderJson();
   }
 }
 
@@ -34,6 +51,8 @@ function mapMeeting(row) {
     timeZone: row.time_zone,
     meetingUrl: row.meeting_url,
     status: row.status,
+    scheduleRevision: Number(row.schedule_revision || 0),
+    cardRevision: Number(row.card_revision || 0),
     reminderMinutes: parseJsonArray(row.reminder_minutes_json).map(Number),
     createdAtMs: Number(row.created_at_ms),
     updatedAtMs: Number(row.updated_at_ms),
@@ -57,7 +76,9 @@ function mapDelivery(row) {
     dueAtMs: Number(row.due_at_ms),
     mentionEveryone: Boolean(row.mention_everyone),
     status: row.status,
+    scheduleRevision: Number(row.schedule_revision || 0),
     attempts: Number(row.attempts),
+    claimToken: row.claim_token || null,
     discordMessageId: row.discord_message_id || null,
     sentAtMs: row.sent_at_ms == null ? null : Number(row.sent_at_ms),
   };
@@ -102,7 +123,11 @@ export class MeetingDatabase {
     const transaction = this.transaction.bind(this);
     migrateFeatureSchema(this.db, transaction);
     this.attendanceTemplates = new AttendanceTemplateRepository({ db: this.db, transaction });
-    this.personalReminders = new PersonalReminderRepository({ db: this.db, transaction });
+    this.personalReminders = new PersonalReminderRepository({
+      db: this.db,
+      transaction,
+      completeEndedMeetings: ({ nowMs }) => this.completeEndedMeetings({ nowMs }),
+    });
   }
 
   migrate() {
@@ -124,6 +149,8 @@ export class MeetingDatabase {
         time_zone TEXT NOT NULL,
         meeting_url TEXT NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('active', 'cancelled', 'completed')),
+        schedule_revision INTEGER NOT NULL DEFAULT 0 CHECK(schedule_revision >= 0),
+        card_revision INTEGER NOT NULL DEFAULT 0 CHECK(card_revision >= 0),
         reminder_minutes_json TEXT NOT NULL,
         created_at_ms INTEGER NOT NULL,
         updated_at_ms INTEGER NOT NULL
@@ -146,9 +173,9 @@ export class MeetingDatabase {
         created_by_id TEXT NOT NULL,
         created_at_ms INTEGER NOT NULL,
         updated_at_ms INTEGER NOT NULL,
-        PRIMARY KEY(guild_id, alias_key),
-        UNIQUE(guild_id, user_id)
+        PRIMARY KEY(guild_id, alias_key)
       );
+      CREATE INDEX IF NOT EXISTS member_aliases_user_idx ON member_aliases(guild_id, user_id);
       CREATE TABLE IF NOT EXISTS meeting_invitees (
         meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
         user_id TEXT NOT NULL,
@@ -163,8 +190,59 @@ export class MeetingDatabase {
       );
       CREATE INDEX IF NOT EXISTS invitees_user_idx
         ON meeting_invitees(user_id, meeting_id);
+      CREATE TABLE IF NOT EXISTS direct_invite_sends (
+        meeting_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        target_updated_at_ms INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'sending')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+        lease_expires_at_ms INTEGER,
+        claim_token TEXT,
+        last_error_code TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(meeting_id, user_id),
+        FOREIGN KEY(meeting_id, user_id)
+          REFERENCES meeting_invitees(meeting_id, user_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS direct_invite_sends_due_idx
+        ON direct_invite_sends(status, next_attempt_at_ms, updated_at_ms);
+      CREATE TABLE IF NOT EXISTS direct_invite_updates (
+        meeting_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        target_updated_at_ms INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'sending', 'skipped')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+        lease_expires_at_ms INTEGER,
+        claim_token TEXT,
+        last_error_code TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL,
+        PRIMARY KEY(meeting_id, user_id),
+        FOREIGN KEY(meeting_id, user_id)
+          REFERENCES meeting_invitees(meeting_id, user_id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS direct_invite_updates_due_idx
+        ON direct_invite_updates(status, next_attempt_at_ms, updated_at_ms);
+      CREATE TABLE IF NOT EXISTS meeting_card_updates (
+        meeting_id TEXT PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE,
+        target_card_revision INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'sending', 'skipped')),
+        attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+        lease_expires_at_ms INTEGER,
+        claim_token TEXT,
+        last_error_code TEXT,
+        created_at_ms INTEGER NOT NULL,
+        updated_at_ms INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS meeting_card_updates_due_idx
+        ON meeting_card_updates(status, next_attempt_at_ms, updated_at_ms);
       CREATE TABLE IF NOT EXISTS deliveries (
         meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+        schedule_revision INTEGER NOT NULL DEFAULT 0 CHECK(schedule_revision >= 0),
         offset_minutes INTEGER NOT NULL,
         due_at_ms INTEGER NOT NULL,
         mention_everyone INTEGER NOT NULL DEFAULT 0,
@@ -172,14 +250,117 @@ export class MeetingDatabase {
         attempts INTEGER NOT NULL DEFAULT 0,
         next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
         lease_expires_at_ms INTEGER,
+        claim_token TEXT,
         discord_message_id TEXT,
         last_error_code TEXT,
         sent_at_ms INTEGER,
-        PRIMARY KEY(meeting_id, offset_minutes)
+        PRIMARY KEY(meeting_id, schedule_revision, offset_minutes)
       );
       CREATE INDEX IF NOT EXISTS deliveries_due_idx
         ON deliveries(status, next_attempt_at_ms, due_at_ms);
     `);
+    this.migrateMeetingScheduleRevision();
+    this.migrateMeetingCardRevision();
+    this.migrateGroupDeliverySchema();
+    this.migrateMemberAliasSchema();
+  }
+
+  tableColumns(tableName) {
+    return new Set(this.db.prepare(`PRAGMA table_info(${tableName})`).all().map((row) => row.name));
+  }
+
+  migrateMemberAliasSchema() {
+    const table = this.db.prepare(`
+      SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'member_aliases'
+    `).get();
+    if (/UNIQUE\s*\(\s*guild_id\s*,\s*user_id\s*\)/iu.test(String(table?.sql ?? ""))) {
+      this.transaction(() => {
+        this.db.exec(`
+          DROP INDEX IF EXISTS member_aliases_user_idx;
+          ALTER TABLE member_aliases RENAME TO member_aliases_single_alias;
+          CREATE TABLE member_aliases (
+            guild_id TEXT NOT NULL,
+            alias_key TEXT NOT NULL,
+            alias TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            created_by_id TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(guild_id, alias_key)
+          );
+          INSERT INTO member_aliases(
+            guild_id, alias_key, alias, user_id, display_name, created_by_id,
+            created_at_ms, updated_at_ms
+          )
+          SELECT guild_id, alias_key, alias, user_id, display_name, created_by_id,
+                 created_at_ms, updated_at_ms
+          FROM member_aliases_single_alias;
+          DROP TABLE member_aliases_single_alias;
+        `);
+      });
+    }
+    this.db.exec("CREATE INDEX IF NOT EXISTS member_aliases_user_idx ON member_aliases(guild_id, user_id);");
+  }
+
+  migrateMeetingScheduleRevision() {
+    if (this.tableColumns("meetings").has("schedule_revision")) return;
+    this.db.exec(`
+      ALTER TABLE meetings
+      ADD COLUMN schedule_revision INTEGER NOT NULL DEFAULT 0 CHECK(schedule_revision >= 0);
+    `);
+  }
+
+  migrateMeetingCardRevision() {
+    if (this.tableColumns("meetings").has("card_revision")) return;
+    this.db.exec(`
+      ALTER TABLE meetings
+      ADD COLUMN card_revision INTEGER NOT NULL DEFAULT 0 CHECK(card_revision >= 0);
+    `);
+  }
+
+  migrateGroupDeliverySchema() {
+    const columns = this.tableColumns("deliveries");
+    if (columns.has("schedule_revision") && columns.has("claim_token")) return;
+    const revisionExpression = columns.has("schedule_revision")
+      ? "schedule_revision"
+      : "COALESCE((SELECT schedule_revision FROM meetings WHERE meetings.id = deliveries.meeting_id), 0)";
+    const claimExpression = columns.has("claim_token") ? "claim_token" : "NULL";
+    this.transaction(() => {
+      this.db.exec(`
+        DROP INDEX IF EXISTS deliveries_due_idx;
+        ALTER TABLE deliveries RENAME TO deliveries_before_revision;
+        CREATE TABLE deliveries (
+          meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
+          schedule_revision INTEGER NOT NULL DEFAULT 0 CHECK(schedule_revision >= 0),
+          offset_minutes INTEGER NOT NULL,
+          due_at_ms INTEGER NOT NULL,
+          mention_everyone INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL CHECK(status IN ('pending', 'sending', 'sent', 'skipped')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at_ms INTEGER NOT NULL DEFAULT 0,
+          lease_expires_at_ms INTEGER,
+          claim_token TEXT,
+          discord_message_id TEXT,
+          last_error_code TEXT,
+          sent_at_ms INTEGER,
+          PRIMARY KEY(meeting_id, schedule_revision, offset_minutes)
+        );
+        INSERT INTO deliveries(
+          meeting_id, schedule_revision, offset_minutes, due_at_ms, mention_everyone,
+          status, attempts, next_attempt_at_ms, lease_expires_at_ms, claim_token,
+          discord_message_id, last_error_code, sent_at_ms
+        )
+        SELECT
+          meeting_id, ${revisionExpression}, offset_minutes, due_at_ms, mention_everyone,
+          status, attempts, next_attempt_at_ms, lease_expires_at_ms, ${claimExpression},
+          discord_message_id, last_error_code, sent_at_ms
+        FROM deliveries_before_revision AS deliveries;
+        DROP TABLE deliveries_before_revision;
+        CREATE INDEX deliveries_due_idx
+          ON deliveries(status, next_attempt_at_ms, due_at_ms);
+      `);
+    });
   }
 
   transaction(callback) {
@@ -215,17 +396,19 @@ export class MeetingDatabase {
     const now = Date.now();
     const id = input.id ? normalizeMeetingId(input.id) : this.generateMeetingId();
     const reminders = normalizeReminderMinutes(input.reminderMinutes);
+    const messageId = input.messageId ? String(input.messageId) : null;
     this.transaction(() => {
       this.db.prepare(`
         INSERT INTO meetings(
           id, guild_id, channel_id, message_id, created_by_id, created_by_name,
           title, starts_at_ms, ends_at_ms, time_zone, meeting_url, status,
           reminder_minutes_json, created_at_ms, updated_at_ms
-        ) VALUES(?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
       `).run(
         id,
         String(input.guildId),
         String(input.channelId),
+        messageId,
         String(input.createdById),
         input.createdByName,
         input.title,
@@ -237,28 +420,75 @@ export class MeetingDatabase {
         now,
         now,
       );
-      this.replacePendingDeliveries(id, Number(input.startsAtMs), reminders, input.everyoneOffsets || [0]);
+      this.replacePendingDeliveries(id, Number(input.startsAtMs), reminders, input.everyoneOffsets || [0], {
+        scheduleRevision: 0,
+      });
+      if (messageId) this.queueMeetingCardUpdateInternal(id, 0, now);
     });
     return this.getMeeting(id);
   }
 
-  replacePendingDeliveries(meetingId, startsAtMs, reminders, everyoneOffsets) {
-    this.db.prepare("DELETE FROM deliveries WHERE meeting_id = ? AND status != 'sent'").run(meetingId);
+  replacePendingDeliveries(meetingId, startsAtMs, reminders, everyoneOffsets, { scheduleRevision = null } = {}) {
+    const revision = scheduleRevision ?? this.getMeeting(meetingId)?.scheduleRevision ?? 0;
+    const offsets = normalizeReminderMinutes(reminders);
+    const desired = new Set(offsets);
+    const existing = this.db.prepare(`
+      SELECT offset_minutes, status FROM deliveries
+      WHERE meeting_id = ? AND schedule_revision = ?
+    `).all(meetingId, revision);
+    const skip = this.db.prepare(`
+      UPDATE deliveries
+      SET status = 'skipped', lease_expires_at_ms = NULL, claim_token = NULL,
+          last_error_code = 'schedule_changed'
+      WHERE meeting_id = ? AND schedule_revision = ? AND offset_minutes = ?
+        AND status IN ('pending', 'sending')
+    `);
+    for (const row of existing) {
+      if (!desired.has(Number(row.offset_minutes))) {
+        skip.run(meetingId, revision, row.offset_minutes);
+      }
+    }
     const statement = this.db.prepare(`
-      INSERT OR IGNORE INTO deliveries(
-        meeting_id, offset_minutes, due_at_ms, mention_everyone, status, next_attempt_at_ms
-      ) VALUES(?, ?, ?, ?, 'pending', 0)
+      INSERT INTO deliveries(
+        meeting_id, schedule_revision, offset_minutes, due_at_ms,
+        mention_everyone, status, next_attempt_at_ms
+      ) VALUES(?, ?, ?, ?, ?, 'pending', 0)
+      ON CONFLICT(meeting_id, schedule_revision, offset_minutes) DO UPDATE SET
+        due_at_ms = excluded.due_at_ms,
+        mention_everyone = excluded.mention_everyone,
+        status = CASE
+          WHEN deliveries.status IN ('sent', 'sending') THEN deliveries.status
+          ELSE 'pending'
+        END,
+        attempts = CASE WHEN deliveries.status = 'skipped' THEN 0 ELSE deliveries.attempts END,
+        next_attempt_at_ms = CASE WHEN deliveries.status = 'skipped' THEN 0 ELSE deliveries.next_attempt_at_ms END,
+        lease_expires_at_ms = CASE WHEN deliveries.status = 'sending' THEN deliveries.lease_expires_at_ms ELSE NULL END,
+        claim_token = CASE WHEN deliveries.status = 'sending' THEN deliveries.claim_token ELSE NULL END,
+        last_error_code = CASE WHEN deliveries.status IN ('sent', 'sending') THEN deliveries.last_error_code ELSE NULL END
     `);
     const everyoneSet = new Set(everyoneOffsets.map(Number));
-    for (const offset of normalizeReminderMinutes(reminders)) {
-      statement.run(meetingId, offset, startsAtMs - offset * 60_000, everyoneSet.has(offset) ? 1 : 0);
+    for (const offset of offsets) {
+      statement.run(meetingId, revision, offset, startsAtMs - offset * 60_000, everyoneSet.has(offset) ? 1 : 0);
     }
   }
 
   updateMeeting(id, patch, { everyoneOffsets = [0] } = {}) {
+    return this.updateMeetingInternal(id, patch, { everyoneOffsets });
+  }
+
+  updateMeetingIfUnchanged(id, patch, { expectedUpdatedAtMs, everyoneOffsets = [0] } = {}) {
+    if (!Number.isSafeInteger(Number(expectedUpdatedAtMs))) throw updateConflict();
+    return this.updateMeetingInternal(id, patch, {
+      everyoneOffsets,
+      expectedUpdatedAtMs: Number(expectedUpdatedAtMs),
+    });
+  }
+
+  updateMeetingInternal(id, patch, { everyoneOffsets = [0], expectedUpdatedAtMs = null } = {}) {
     const current = this.getMeeting(id);
     if (!current) throw new Error("会議が見つかりません");
     if (current.status !== "active") throw new Error("終了または中止済みの会議は更新できません");
+    if (expectedUpdatedAtMs != null && current.updatedAtMs !== expectedUpdatedAtMs) throw updateConflict();
     const next = {
       title: patch.title ?? current.title,
       startsAtMs: patch.startsAtMs ?? current.startsAtMs,
@@ -268,48 +498,99 @@ export class MeetingDatabase {
     };
     const startsAtChanged = next.startsAtMs !== current.startsAtMs;
     const remindersChanged = JSON.stringify(next.reminderMinutes) !== JSON.stringify(current.reminderMinutes);
+    const nextRevision = startsAtChanged ? current.scheduleRevision + 1 : current.scheduleRevision;
+    const nextUpdatedAtMs = Math.max(Date.now(), current.updatedAtMs + 1);
     this.transaction(() => {
-      this.db.prepare(`
+      const update = this.db.prepare(`
         UPDATE meetings
         SET title = ?, starts_at_ms = ?, ends_at_ms = ?, meeting_url = ?,
-            reminder_minutes_json = ?, updated_at_ms = ?
-        WHERE id = ?
+            reminder_minutes_json = ?, schedule_revision = ?, card_revision = card_revision + 1,
+            updated_at_ms = ?
+        WHERE id = ? AND status = 'active' AND updated_at_ms = ?
       `).run(
         next.title,
         next.startsAtMs,
         next.endsAtMs,
         next.meetingUrl,
         JSON.stringify(next.reminderMinutes),
-        Date.now(),
+        nextRevision,
+        nextUpdatedAtMs,
         id,
+        current.updatedAtMs,
       );
-      if (startsAtChanged || remindersChanged) {
-        this.replacePendingDeliveries(id, next.startsAtMs, next.reminderMinutes, everyoneOffsets);
+      if (update.changes !== 1) throw updateConflict();
+      if (startsAtChanged) {
+        this.db.prepare(`
+          UPDATE deliveries
+          SET status = 'skipped', lease_expires_at_ms = NULL, claim_token = NULL,
+              last_error_code = 'schedule_superseded'
+          WHERE meeting_id = ? AND schedule_revision != ?
+            AND status IN ('pending', 'sending')
+        `).run(id, nextRevision);
       }
-    });
-    if (startsAtChanged) {
-      for (const invitee of this.listMeetingInvitees(id)) {
-        const personal = this.personalReminders.getMeetingReminders(id, invitee.userId);
-        if (!personal) continue;
-        this.personalReminders.replaceMeetingReminders({
-          meetingId: id,
-          userId: invitee.userId,
-          startsAtMs: next.startsAtMs,
-          minutes: personal.minutes,
-          source: personal.source,
+      if (startsAtChanged || remindersChanged) {
+        this.replacePendingDeliveries(id, next.startsAtMs, next.reminderMinutes, everyoneOffsets, {
+          scheduleRevision: nextRevision,
         });
       }
-    }
+      if (startsAtChanged) {
+        for (const invitee of this.listMeetingInvitees(id)) {
+          const personal = this.personalReminders.getMeetingReminders(id, invitee.userId);
+          if (!personal) continue;
+          this.personalReminders.replaceMeetingRemindersInternal({
+            meetingId: id,
+            userId: invitee.userId,
+            startsAtMs: next.startsAtMs,
+            minutes: personal.minutes,
+            source: personal.source,
+            nowMs: nextUpdatedAtMs,
+          });
+        }
+      }
+      this.invalidateSendingDeliveryClaimsInternal(id, nextUpdatedAtMs);
+      this.personalReminders.invalidateSendingClaimsForMeeting(id, { nowMs: nextUpdatedAtMs });
+      this.queueMeetingCardUpdateInternal(id, current.cardRevision + 1, nextUpdatedAtMs);
+      this.retargetDirectInviteSendsInternal(id, nextUpdatedAtMs, nextUpdatedAtMs);
+      this.queueDirectInviteUpdatesInternal(id, nextUpdatedAtMs, nextUpdatedAtMs);
+    });
     return this.getMeeting(id);
   }
 
   updateMeetingUrl(id, meetingUrl) {
+    return this.updateMeetingUrlInternal(id, meetingUrl);
+  }
+
+  updateMeetingUrlIfUnchanged(id, meetingUrl, { expectedUpdatedAtMs } = {}) {
+    if (!Number.isSafeInteger(Number(expectedUpdatedAtMs))) throw updateConflict();
+    return this.updateMeetingUrlInternal(id, meetingUrl, {
+      expectedUpdatedAtMs: Number(expectedUpdatedAtMs),
+    });
+  }
+
+  updateMeetingUrlInternal(id, meetingUrl, { expectedUpdatedAtMs = null } = {}) {
     const normalizedId = normalizeMeetingId(id);
     const current = this.getMeeting(normalizedId);
     if (!current) throw new Error("会議が見つかりません");
     if (current.status !== "active") throw new Error("終了または中止済みの会議は更新できません");
-    this.db.prepare("UPDATE meetings SET meeting_url = ?, updated_at_ms = ? WHERE id = ?")
-      .run(String(meetingUrl), Date.now(), normalizedId);
+    if (expectedUpdatedAtMs != null && current.updatedAtMs !== expectedUpdatedAtMs) throw updateConflict();
+    const nextUpdatedAtMs = Math.max(Date.now(), current.updatedAtMs + 1);
+    this.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE meetings SET meeting_url = ?, card_revision = card_revision + 1, updated_at_ms = ?
+        WHERE id = ? AND status = 'active' AND updated_at_ms = ?
+      `).run(
+        String(meetingUrl),
+        nextUpdatedAtMs,
+        normalizedId,
+        current.updatedAtMs,
+      );
+      if (result.changes !== 1) throw updateConflict();
+      this.invalidateSendingDeliveryClaimsInternal(normalizedId, nextUpdatedAtMs);
+      this.personalReminders.invalidateSendingClaimsForMeeting(normalizedId, { nowMs: nextUpdatedAtMs });
+      this.queueMeetingCardUpdateInternal(normalizedId, current.cardRevision + 1, nextUpdatedAtMs);
+      this.retargetDirectInviteSendsInternal(normalizedId, nextUpdatedAtMs, nextUpdatedAtMs);
+      this.queueDirectInviteUpdatesInternal(normalizedId, nextUpdatedAtMs, nextUpdatedAtMs);
+    });
     return this.getMeeting(normalizedId);
   }
 
@@ -319,16 +600,90 @@ export class MeetingDatabase {
   }
 
   cancelMeeting(id) {
+    const current = this.getMeeting(id);
+    if (!current || current.status !== "active") return null;
+    const now = Math.max(Date.now(), current.updatedAtMs + 1);
     const result = this.transaction(() => {
-      const update = this.db.prepare("UPDATE meetings SET status = 'cancelled', updated_at_ms = ? WHERE id = ? AND status = 'active'")
-        .run(Date.now(), id);
-      this.db.prepare("UPDATE deliveries SET status = 'skipped' WHERE meeting_id = ? AND status IN ('pending', 'sending')")
+      const updated = this.db.prepare(`
+        UPDATE meetings
+        SET status = 'cancelled', card_revision = card_revision + 1,
+            updated_at_ms = MAX(?, updated_at_ms + 1)
+        WHERE id = ? AND status = 'active'
+        RETURNING card_revision, updated_at_ms
+      `).get(now, id);
+      this.db.prepare(`
+        UPDATE deliveries
+        SET status = 'skipped', lease_expires_at_ms = NULL, claim_token = NULL,
+            last_error_code = 'meeting_cancelled'
+        WHERE meeting_id = ? AND status IN ('pending', 'sending')
+      `)
         .run(id);
-      this.db.prepare("UPDATE personal_deliveries SET status = 'skipped', last_error_code = 'meeting_cancelled' WHERE meeting_id = ? AND status IN ('pending', 'sending')")
-        .run(id);
-      return update.changes;
+      this.db.prepare(`
+        UPDATE personal_deliveries
+        SET status = 'skipped', lease_expires_at_ms = NULL, claim_token = NULL,
+            last_error_code = 'meeting_cancelled', updated_at_ms = ?
+        WHERE meeting_id = ? AND status IN ('pending', 'sending')
+      `).run(now, id);
+      if (updated) {
+        const committedAtMs = Number(updated.updated_at_ms);
+        this.queueMeetingCardUpdateInternal(id, Number(updated.card_revision), committedAtMs);
+        this.retargetDirectInviteSendsInternal(id, committedAtMs, committedAtMs);
+        this.queueDirectInviteUpdatesInternal(id, committedAtMs, committedAtMs);
+      }
+      return updated ? 1 : 0;
     });
     return result > 0 ? this.getMeeting(id) : null;
+  }
+
+  completeEndedMeetings({ nowMs = Date.now() } = {}) {
+    const now = Number(nowMs);
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error("現在日時が正しくありません");
+    return this.transaction(() => this.completeEndedMeetingsInternal(now));
+  }
+
+  completeEndedMeetingsInternal(nowMs) {
+    const rows = this.db.prepare(`
+      SELECT id, card_revision, updated_at_ms
+      FROM meetings
+      WHERE status = 'active' AND ends_at_ms < ?
+      ORDER BY ends_at_ms ASC
+    `).all(nowMs);
+    let ended = 0;
+    const update = this.db.prepare(`
+      UPDATE meetings
+      SET status = 'completed', card_revision = card_revision + 1, updated_at_ms = ?
+      WHERE id = ? AND status = 'active' AND updated_at_ms = ?
+    `);
+    for (const row of rows) {
+      const nextUpdatedAtMs = Math.max(Number(nowMs), Number(row.updated_at_ms) + 1);
+      if (update.run(nextUpdatedAtMs, row.id, row.updated_at_ms).changes !== 1) continue;
+      ended += 1;
+      this.queueMeetingCardUpdateInternal(row.id, Number(row.card_revision) + 1, nextUpdatedAtMs);
+      this.retargetDirectInviteSendsInternal(row.id, nextUpdatedAtMs, nextUpdatedAtMs);
+      this.queueDirectInviteUpdatesInternal(row.id, nextUpdatedAtMs, nextUpdatedAtMs);
+    }
+    if (!ended) return 0;
+    this.db.prepare(`
+      UPDATE deliveries
+      SET status = 'skipped', lease_expires_at_ms = NULL, claim_token = NULL,
+          last_error_code = 'meeting_completed'
+      WHERE status IN ('pending', 'sending')
+        AND EXISTS (
+          SELECT 1 FROM meetings m
+          WHERE m.id = deliveries.meeting_id AND m.status = 'completed'
+        )
+    `).run();
+    this.db.prepare(`
+      UPDATE personal_deliveries
+      SET status = 'skipped', lease_expires_at_ms = NULL, claim_token = NULL,
+          last_error_code = 'meeting_completed', updated_at_ms = ?
+      WHERE status IN ('pending', 'sending')
+        AND EXISTS (
+          SELECT 1 FROM meetings m
+          WHERE m.id = personal_deliveries.meeting_id AND m.status = 'completed'
+        )
+    `).run(nowMs);
+    return ended;
   }
 
   getMeeting(id) {
@@ -357,6 +712,14 @@ export class MeetingDatabase {
       WHERE guild_id = ? AND status = 'active' AND ends_at_ms >= ?
       ORDER BY starts_at_ms ASC LIMIT ?
     `).all(String(guildId), nowMs, limit).map(mapMeeting);
+  }
+
+  listActiveMeetingIds(guildId, { nowMs = Date.now() } = {}) {
+    return this.db.prepare(`
+      SELECT id FROM meetings
+      WHERE guild_id = ? AND status = 'active' AND ends_at_ms >= ?
+      ORDER BY starts_at_ms ASC
+    `).all(String(guildId), Number(nowMs)).map((row) => String(row.id));
   }
 
   listActiveMeetingsByChannel(guildId, channelId, { limit = 20, nowMs = Date.now() } = {}) {
@@ -388,10 +751,6 @@ export class MeetingDatabase {
       if (assigned && assigned.user_id !== discordUserId) {
         throw new Error(`呼び名「${normalized.alias}」は別のメンバーに登録済みです`);
       }
-      this.db.prepare(`
-        DELETE FROM member_aliases
-        WHERE guild_id = ? AND user_id = ? AND alias_key != ?
-      `).run(tenantId, discordUserId, normalized.aliasKey);
       this.db.prepare(`
         INSERT INTO member_aliases(
           guild_id, alias_key, alias, user_id, display_name, created_by_id,
@@ -425,6 +784,8 @@ export class MeetingDatabase {
   getMemberAliasByUserId(guildId, userId) {
     return mapMemberAlias(this.db.prepare(`
       SELECT * FROM member_aliases WHERE guild_id = ? AND user_id = ?
+      ORDER BY updated_at_ms DESC, alias_key ASC
+      LIMIT 1
     `).get(String(guildId), String(userId)));
   }
 
@@ -453,12 +814,16 @@ export class MeetingDatabase {
   }
 
   prepareMeetingInvitees(meetingId, invitees, invitedById, { defaultReminderMinutes = [] } = {}) {
-    const meeting = this.getMeeting(meetingId);
+    let meeting = this.getMeeting(meetingId);
     if (!meeting || meeting.status !== "active") throw new Error("招待できる会議が見つかりません");
     const prepared = [];
     const alreadySent = [];
     const seen = new Set();
     this.transaction(() => {
+      meeting = this.getMeeting(meeting.id);
+      if (!meeting || meeting.status !== "active") {
+        throw Object.assign(new Error("Meeting is no longer active"), { code: "meeting_not_active" });
+      }
       for (const invitee of invitees) {
         const userId = String(invitee.userId);
         if (seen.has(userId)) continue;
@@ -475,7 +840,7 @@ export class MeetingDatabase {
           this.db.prepare(`
             UPDATE meeting_invitees
             SET display_name = ?, invited_by_id = ?, delivery_status = 'pending',
-                delivery_error_code = NULL
+                delivery_error_code = NULL, dm_message_id = NULL, delivered_at_ms = NULL
             WHERE meeting_id = ? AND user_id = ?
           `).run(String(invitee.displayName).slice(0, 80), String(invitedById), meeting.id, userId);
         } else {
@@ -486,6 +851,7 @@ export class MeetingDatabase {
             ) VALUES(?, ?, ?, ?, 'pending', NULL, NULL, ?, NULL)
           `).run(meeting.id, userId, String(invitee.displayName).slice(0, 80), String(invitedById), now);
         }
+        this.queueDirectInviteSendInternal(meeting.id, userId, meeting.updatedAtMs, now);
         prepared.push(this.getMeetingInvitee(meeting.id, userId));
       }
     });
@@ -521,18 +887,880 @@ export class MeetingDatabase {
   markInviteeDelivery(meetingId, userId, { status, dmMessageId = null, errorCode = null } = {}) {
     if (!["sent", "failed"].includes(status)) throw new Error("DM配信ステータスが正しくありません");
     const deliveredAtMs = status === "sent" ? Date.now() : null;
-    this.db.prepare(`
-      UPDATE meeting_invitees
-      SET delivery_status = ?, delivery_error_code = ?, dm_message_id = ?, delivered_at_ms = ?
-      WHERE meeting_id = ? AND user_id = ?
+    this.transaction(() => {
+      this.db.prepare(`
+        UPDATE meeting_invitees
+        SET delivery_status = ?, delivery_error_code = ?, dm_message_id = ?, delivered_at_ms = ?
+        WHERE meeting_id = ? AND user_id = ?
+      `).run(
+        status,
+        errorCode ? String(errorCode).slice(0, 80) : null,
+        dmMessageId ? String(dmMessageId) : null,
+        deliveredAtMs,
+        String(meetingId).toUpperCase(),
+        String(userId),
+      );
+      this.db.prepare(`
+        DELETE FROM direct_invite_sends WHERE meeting_id = ? AND user_id = ?
+      `).run(String(meetingId).toUpperCase(), String(userId));
+    });
+  }
+
+  queueDirectInviteSendInternal(meetingId, userId, targetUpdatedAtMs, nowMs) {
+    return this.db.prepare(`
+      INSERT INTO direct_invite_sends(
+        meeting_id, user_id, target_updated_at_ms, status, attempts,
+        next_attempt_at_ms, lease_expires_at_ms, claim_token, last_error_code,
+        created_at_ms, updated_at_ms
+      )
+      SELECT i.meeting_id, i.user_id, ?, 'pending', 0, 0, NULL, NULL, NULL, ?, ?
+      FROM meeting_invitees i
+      JOIN meetings m ON m.id = i.meeting_id
+      WHERE i.meeting_id = ? AND i.user_id = ? AND i.delivery_status = 'pending'
+        AND m.updated_at_ms = ?
+      ON CONFLICT(meeting_id, user_id) DO UPDATE SET
+        target_updated_at_ms = excluded.target_updated_at_ms,
+        status = 'pending', attempts = 0, next_attempt_at_ms = 0,
+        lease_expires_at_ms = NULL, claim_token = NULL, last_error_code = NULL,
+        updated_at_ms = excluded.updated_at_ms
+      WHERE direct_invite_sends.target_updated_at_ms <> excluded.target_updated_at_ms
     `).run(
-      status,
-      errorCode ? String(errorCode).slice(0, 80) : null,
-      dmMessageId ? String(dmMessageId) : null,
-      deliveredAtMs,
+      Number(targetUpdatedAtMs),
+      Number(nowMs),
+      Number(nowMs),
       String(meetingId).toUpperCase(),
       String(userId),
+      Number(targetUpdatedAtMs),
+    ).changes;
+  }
+
+  retargetDirectInviteSendsInternal(meetingId, targetUpdatedAtMs, nowMs) {
+    return this.db.prepare(`
+      INSERT INTO direct_invite_sends(
+        meeting_id, user_id, target_updated_at_ms, status, attempts,
+        next_attempt_at_ms, lease_expires_at_ms, claim_token, last_error_code,
+        created_at_ms, updated_at_ms
+      )
+      SELECT i.meeting_id, i.user_id, ?, 'pending', 0, 0, NULL, NULL, NULL, ?, ?
+      FROM meeting_invitees i
+      JOIN meetings m ON m.id = i.meeting_id
+      WHERE i.meeting_id = ? AND i.delivery_status = 'pending'
+        AND m.updated_at_ms = ?
+      ON CONFLICT(meeting_id, user_id) DO UPDATE SET
+        target_updated_at_ms = excluded.target_updated_at_ms,
+        status = 'pending', attempts = 0, next_attempt_at_ms = 0,
+        lease_expires_at_ms = NULL, claim_token = NULL, last_error_code = NULL,
+        updated_at_ms = excluded.updated_at_ms
+      WHERE direct_invite_sends.target_updated_at_ms <> excluded.target_updated_at_ms
+    `).run(
+      Number(targetUpdatedAtMs),
+      Number(nowMs),
+      Number(nowMs),
+      String(meetingId).toUpperCase(),
+      Number(targetUpdatedAtMs),
+    ).changes;
+  }
+
+  claimDirectInviteSends({ nowMs = Date.now(), leaseMs = 120_000, limit = 25 } = {}) {
+    const now = Number(nowMs);
+    const lease = Math.max(1_000, Number(leaseMs));
+    const batchLimit = Math.max(1, Math.min(100, Number(limit)));
+    return this.transaction(() => {
+      this.completeEndedMeetingsInternal(now);
+      this.db.prepare(`
+        UPDATE direct_invite_sends
+        SET status = 'pending', lease_expires_at_ms = NULL, claim_token = NULL,
+            updated_at_ms = ?
+        WHERE status = 'sending' AND lease_expires_at_ms IS NOT NULL
+          AND lease_expires_at_ms <= ?
+      `).run(now, now);
+      this.db.prepare(`
+        UPDATE direct_invite_sends
+        SET target_updated_at_ms = (
+              SELECT m.updated_at_ms FROM meetings m WHERE m.id = direct_invite_sends.meeting_id
+            ),
+            status = 'pending', attempts = 0, next_attempt_at_ms = 0,
+            lease_expires_at_ms = NULL, claim_token = NULL,
+            last_error_code = 'target_superseded', updated_at_ms = ?
+        WHERE EXISTS (
+          SELECT 1 FROM meetings m
+          WHERE m.id = direct_invite_sends.meeting_id
+            AND m.updated_at_ms <> direct_invite_sends.target_updated_at_ms
+        )
+      `).run(now);
+      this.db.prepare(`
+        DELETE FROM direct_invite_sends
+        WHERE NOT EXISTS (
+          SELECT 1 FROM meeting_invitees i
+          WHERE i.meeting_id = direct_invite_sends.meeting_id
+            AND i.user_id = direct_invite_sends.user_id
+            AND i.delivery_status = 'pending'
+        )
+      `).run();
+      const rows = this.db.prepare(`
+        SELECT o.meeting_id, o.user_id, o.target_updated_at_ms, o.attempts
+        FROM direct_invite_sends o
+        JOIN meetings m ON m.id = o.meeting_id
+          AND m.updated_at_ms = o.target_updated_at_ms
+        JOIN meeting_invitees i ON i.meeting_id = o.meeting_id AND i.user_id = o.user_id
+        WHERE o.status = 'pending' AND o.next_attempt_at_ms <= ?
+          AND i.delivery_status = 'pending'
+        ORDER BY o.updated_at_ms ASC, o.meeting_id ASC, o.user_id ASC
+        LIMIT ?
+      `).all(now, batchLimit);
+      const claimStatement = this.db.prepare(`
+        UPDATE direct_invite_sends
+        SET status = 'sending', attempts = attempts + 1,
+            lease_expires_at_ms = ?, claim_token = ?, updated_at_ms = ?
+        WHERE meeting_id = ? AND user_id = ? AND target_updated_at_ms = ?
+          AND status = 'pending' AND next_attempt_at_ms <= ?
+      `);
+      const claims = [];
+      for (const row of rows) {
+        const claimToken = crypto.randomUUID();
+        if (claimStatement.run(
+          now + lease,
+          claimToken,
+          now,
+          row.meeting_id,
+          row.user_id,
+          row.target_updated_at_ms,
+          now,
+        ).changes !== 1) continue;
+        claims.push({
+          meetingId: row.meeting_id,
+          userId: row.user_id,
+          targetUpdatedAtMs: Number(row.target_updated_at_ms),
+          attempts: Number(row.attempts) + 1,
+          claimToken,
+        });
+      }
+      return claims;
+    });
+  }
+
+  isDirectInviteSendClaimCurrent(claim) {
+    if (!claim?.meetingId || !claim?.userId || !claim?.claimToken) return false;
+    return Boolean(this.db.prepare(`
+      SELECT 1
+      FROM direct_invite_sends o
+      JOIN meetings m ON m.id = o.meeting_id
+      JOIN meeting_invitees i ON i.meeting_id = o.meeting_id AND i.user_id = o.user_id
+      WHERE o.meeting_id = ? AND o.user_id = ? AND o.target_updated_at_ms = ?
+        AND o.status = 'sending' AND o.claim_token = ?
+        AND m.updated_at_ms = o.target_updated_at_ms
+        AND i.delivery_status = 'pending'
+    `).get(
+      String(claim.meetingId).toUpperCase(),
+      String(claim.userId),
+      Number(claim.targetUpdatedAtMs),
+      String(claim.claimToken),
+    ));
+  }
+
+  getDirectInviteSendData(claim) {
+    if (!this.isDirectInviteSendClaimCurrent(claim)) return null;
+    const meeting = this.getMeeting(claim.meetingId);
+    const invitee = this.getMeetingInvitee(claim.meetingId, claim.userId);
+    if (!meeting || meeting.updatedAtMs !== Number(claim.targetUpdatedAtMs)
+      || !invitee || invitee.deliveryStatus !== "pending") return null;
+    const reminder = this.personalReminders?.getMeetingReminders?.(meeting.id, invitee.userId);
+    if (!this.isDirectInviteSendClaimCurrent(claim)) return null;
+    return {
+      meeting,
+      invitee: {
+        ...invitee,
+        personalReminderMinutes: reminder?.minutes || [],
+      },
+    };
+  }
+
+  markDirectInviteSendSucceeded(claim, messageId, { sentAtMs = Date.now() } = {}) {
+    if (!claim?.meetingId || !claim?.userId || !claim?.claimToken || !messageId) return false;
+    return this.transaction(() => {
+      if (!this.isDirectInviteSendClaimCurrent(claim)) return false;
+      const meeting = this.getMeeting(claim.meetingId);
+      if (!meeting || meeting.status !== "active") return false;
+      const updated = this.db.prepare(`
+        UPDATE meeting_invitees
+        SET delivery_status = 'sent', delivery_error_code = NULL,
+            dm_message_id = ?, delivered_at_ms = ?
+        WHERE meeting_id = ? AND user_id = ? AND delivery_status = 'pending'
+      `).run(
+        String(messageId),
+        Number(sentAtMs),
+        String(claim.meetingId).toUpperCase(),
+        String(claim.userId),
+      );
+      if (updated.changes !== 1) return false;
+      const removed = this.db.prepare(`
+        DELETE FROM direct_invite_sends
+        WHERE meeting_id = ? AND user_id = ? AND target_updated_at_ms = ?
+          AND status = 'sending' AND claim_token = ?
+      `).run(
+        String(claim.meetingId).toUpperCase(),
+        String(claim.userId),
+        Number(claim.targetUpdatedAtMs),
+        String(claim.claimToken),
+      );
+      if (removed.changes !== 1) throw new Error("direct invite send receipt conflict");
+      this.db.prepare(`
+        DELETE FROM direct_invite_updates WHERE meeting_id = ? AND user_id = ?
+      `).run(String(claim.meetingId).toUpperCase(), String(claim.userId));
+      return true;
+    });
+  }
+
+  markDirectInviteSendFailed(claim, {
+    errorCode = "send_failed",
+    retryable = true,
+    maxAttempts = 5,
+    failedAtMs = Date.now(),
+  } = {}) {
+    if (!claim?.meetingId || !claim?.userId || !claim?.claimToken) return false;
+    const row = this.db.prepare(`
+      SELECT attempts FROM direct_invite_sends
+      WHERE meeting_id = ? AND user_id = ? AND target_updated_at_ms = ?
+        AND status = 'sending' AND claim_token = ?
+    `).get(
+      String(claim.meetingId).toUpperCase(),
+      String(claim.userId),
+      Number(claim.targetUpdatedAtMs),
+      String(claim.claimToken),
     );
+    if (!row || !this.isDirectInviteSendClaimCurrent(claim)) return false;
+    const attempts = Number(row.attempts || 1);
+    const now = Number(failedAtMs);
+    const shouldRetry = Boolean(retryable) && attempts < Math.max(0, Number(maxAttempts));
+    if (shouldRetry) {
+      const delayMs = Math.min(5 * 60_000, 5_000 * (2 ** Math.min(attempts - 1, 6)));
+      return this.db.prepare(`
+        UPDATE direct_invite_sends
+        SET status = 'pending', next_attempt_at_ms = ?, lease_expires_at_ms = NULL,
+            claim_token = NULL, last_error_code = ?, updated_at_ms = ?
+        WHERE meeting_id = ? AND user_id = ? AND target_updated_at_ms = ?
+          AND status = 'sending' AND claim_token = ?
+      `).run(
+        now + delayMs,
+        String(errorCode).slice(0, 80),
+        now,
+        String(claim.meetingId).toUpperCase(),
+        String(claim.userId),
+        Number(claim.targetUpdatedAtMs),
+        String(claim.claimToken),
+      ).changes === 1;
+    }
+    return this.transaction(() => {
+      if (!this.isDirectInviteSendClaimCurrent(claim)) return false;
+      this.db.prepare(`
+        UPDATE meeting_invitees
+        SET delivery_status = 'failed', delivery_error_code = ?,
+            dm_message_id = NULL, delivered_at_ms = NULL
+        WHERE meeting_id = ? AND user_id = ? AND delivery_status = 'pending'
+      `).run(
+        String(errorCode).slice(0, 80),
+        String(claim.meetingId).toUpperCase(),
+        String(claim.userId),
+      );
+      return this.db.prepare(`
+        DELETE FROM direct_invite_sends
+        WHERE meeting_id = ? AND user_id = ? AND target_updated_at_ms = ?
+          AND status = 'sending' AND claim_token = ?
+      `).run(
+        String(claim.meetingId).toUpperCase(),
+        String(claim.userId),
+        Number(claim.targetUpdatedAtMs),
+        String(claim.claimToken),
+      ).changes === 1;
+    });
+  }
+
+  closeDirectInviteSendForInactive(claim, { errorCode = "meeting_not_active" } = {}) {
+    if (!claim?.meetingId || !claim?.userId || !claim?.claimToken) return false;
+    return this.transaction(() => {
+      if (!this.isDirectInviteSendClaimCurrent(claim)) return false;
+      const meeting = this.getMeeting(claim.meetingId);
+      if (!meeting || meeting.status === "active") return false;
+      this.db.prepare(`
+        UPDATE meeting_invitees
+        SET delivery_status = 'failed', delivery_error_code = ?,
+            dm_message_id = NULL, delivered_at_ms = NULL
+        WHERE meeting_id = ? AND user_id = ? AND delivery_status = 'pending'
+      `).run(
+        String(errorCode).slice(0, 80),
+        String(claim.meetingId).toUpperCase(),
+        String(claim.userId),
+      );
+      return this.db.prepare(`
+        DELETE FROM direct_invite_sends
+        WHERE meeting_id = ? AND user_id = ? AND target_updated_at_ms = ?
+          AND status = 'sending' AND claim_token = ?
+      `).run(
+        String(claim.meetingId).toUpperCase(),
+        String(claim.userId),
+        Number(claim.targetUpdatedAtMs),
+        String(claim.claimToken),
+      ).changes === 1;
+    });
+  }
+
+  reconcileDirectInviteSendStaleReceipt(claim, messageId, { nowMs = Date.now() } = {}) {
+    if (!claim?.meetingId || !claim?.userId || !messageId) return "delete";
+    return this.transaction(() => {
+      const meeting = this.getMeeting(claim.meetingId);
+      const invitee = this.getMeetingInvitee(claim.meetingId, claim.userId);
+      if (meeting && invitee?.deliveryStatus === "sent") {
+        if (invitee.dmMessageId === String(messageId)) {
+          this.queueDirectInviteUpdateForRecipientInternal(
+            meeting.id,
+            invitee.userId,
+            meeting.updatedAtMs,
+            Number(nowMs),
+          );
+          return "repair_current";
+        }
+        return "delete";
+      }
+      if (meeting && invitee?.deliveryStatus === "pending") {
+        this.retargetDirectInviteSendsInternal(meeting.id, meeting.updatedAtMs, Number(nowMs));
+        // Leave the visible message for the next-generation job.  Its recent-DM
+        // scan will update and adopt it, avoiding a delete/adopt race and resend.
+        return "keep_for_recovery";
+      }
+      return "delete";
+    });
+  }
+
+  getDirectInviteSendSummary(meetingId, targetUpdatedAtMs = null) {
+    const meeting = this.getMeeting(meetingId);
+    const target = targetUpdatedAtMs == null ? meeting?.updatedAtMs : Number(targetUpdatedAtMs);
+    const rows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count, MAX(next_attempt_at_ms) AS next_attempt_at_ms
+      FROM direct_invite_sends
+      WHERE meeting_id = ? AND target_updated_at_ms = ?
+      GROUP BY status
+    `).all(String(meetingId).toUpperCase(), target);
+    const summary = { pending: 0, sending: 0, unresolved: 0, nextAttemptAtMs: 0 };
+    for (const row of rows) {
+      summary[row.status] = Number(row.count);
+      summary.nextAttemptAtMs = Math.max(summary.nextAttemptAtMs, Number(row.next_attempt_at_ms || 0));
+    }
+    summary.unresolved = summary.pending + summary.sending;
+    return summary;
+  }
+
+  queueMeetingCardUpdateInternal(meetingId, targetCardRevision, nowMs) {
+    return this.db.prepare(`
+      INSERT INTO meeting_card_updates(
+        meeting_id, target_card_revision, status, attempts, next_attempt_at_ms,
+        lease_expires_at_ms, claim_token, last_error_code, created_at_ms, updated_at_ms
+      )
+      SELECT id, ?, 'pending', 0, 0, NULL, NULL, NULL, ?, ?
+      FROM meetings
+      WHERE id = ? AND message_id IS NOT NULL AND card_revision = ?
+      ON CONFLICT(meeting_id) DO UPDATE SET
+        target_card_revision = excluded.target_card_revision,
+        status = 'pending', attempts = 0, next_attempt_at_ms = 0,
+        lease_expires_at_ms = NULL, claim_token = NULL, last_error_code = NULL,
+        updated_at_ms = excluded.updated_at_ms
+      WHERE meeting_card_updates.target_card_revision <> excluded.target_card_revision
+    `).run(
+      Number(targetCardRevision),
+      Number(nowMs),
+      Number(nowMs),
+      String(meetingId).toUpperCase(),
+      Number(targetCardRevision),
+    ).changes;
+  }
+
+  queueMeetingCardUpdate(meetingId, { targetCardRevision = null, nowMs = Date.now() } = {}) {
+    const meeting = this.getMeeting(meetingId);
+    if (!meeting) throw new Error("会議が見つかりません");
+    const target = targetCardRevision == null ? meeting.cardRevision : Number(targetCardRevision);
+    if (!Number.isSafeInteger(target) || target !== meeting.cardRevision) throw updateConflict();
+    const now = Number(nowMs);
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error("現在日時が正しくありません");
+    return this.queueMeetingCardUpdateInternal(meeting.id, target, now);
+  }
+
+  acknowledgePendingMeetingCardUpdate(meetingId, targetCardRevision) {
+    return this.db.prepare(`
+      DELETE FROM meeting_card_updates
+      WHERE meeting_id = ? AND target_card_revision = ? AND status = 'pending'
+    `).run(
+      String(meetingId).toUpperCase(),
+      Number(targetCardRevision),
+    ).changes === 1;
+  }
+
+  claimMeetingCardUpdates({ nowMs = Date.now(), leaseMs = 120_000, limit = 25 } = {}) {
+    const now = Number(nowMs);
+    const lease = Math.max(1_000, Number(leaseMs));
+    const batchLimit = Math.max(1, Math.min(100, Number(limit)));
+    return this.transaction(() => {
+      this.db.prepare("DELETE FROM direct_invite_updates WHERE status = 'skipped'").run();
+      this.db.prepare(`
+        UPDATE meeting_card_updates
+        SET status = 'pending', lease_expires_at_ms = NULL, claim_token = NULL, updated_at_ms = ?
+        WHERE status = 'sending' AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms <= ?
+      `).run(now, now);
+      this.db.prepare(`
+        UPDATE meeting_card_updates
+        SET status = 'skipped', lease_expires_at_ms = NULL, claim_token = NULL,
+            last_error_code = 'target_superseded', updated_at_ms = ?
+        WHERE status IN ('pending', 'sending')
+          AND NOT EXISTS (
+            SELECT 1 FROM meetings m
+            WHERE m.id = meeting_card_updates.meeting_id
+              AND m.card_revision = meeting_card_updates.target_card_revision
+              AND m.message_id IS NOT NULL
+          )
+      `).run(now);
+      const rows = this.db.prepare(`
+        SELECT meeting_id, target_card_revision, attempts
+        FROM meeting_card_updates
+        WHERE status = 'pending' AND next_attempt_at_ms <= ?
+        ORDER BY updated_at_ms ASC, meeting_id ASC
+        LIMIT ?
+      `).all(now, batchLimit);
+      const statement = this.db.prepare(`
+        UPDATE meeting_card_updates
+        SET status = 'sending', attempts = attempts + 1,
+            lease_expires_at_ms = ?, claim_token = ?, updated_at_ms = ?
+        WHERE meeting_id = ? AND target_card_revision = ?
+          AND status = 'pending' AND next_attempt_at_ms <= ?
+      `);
+      const claims = [];
+      for (const row of rows) {
+        const claimToken = crypto.randomUUID();
+        const result = statement.run(
+          now + lease,
+          claimToken,
+          now,
+          row.meeting_id,
+          row.target_card_revision,
+          now,
+        );
+        if (result.changes !== 1) continue;
+        claims.push({
+          meetingId: row.meeting_id,
+          targetCardRevision: Number(row.target_card_revision),
+          attempts: Number(row.attempts) + 1,
+          claimToken,
+        });
+      }
+      return claims;
+    });
+  }
+
+  isMeetingCardUpdateClaimCurrent(claim) {
+    if (!claim?.meetingId || !claim?.claimToken) return false;
+    return Boolean(this.db.prepare(`
+      SELECT 1
+      FROM meeting_card_updates o
+      JOIN meetings m ON m.id = o.meeting_id
+      WHERE o.meeting_id = ? AND o.target_card_revision = ?
+        AND o.status = 'sending' AND o.claim_token = ?
+        AND m.card_revision = o.target_card_revision AND m.message_id IS NOT NULL
+    `).get(
+      String(claim.meetingId).toUpperCase(),
+      Number(claim.targetCardRevision),
+      String(claim.claimToken),
+    ));
+  }
+
+  getMeetingCardUpdateData(claim) {
+    if (!this.isMeetingCardUpdateClaimCurrent(claim)) return null;
+    const meeting = this.getMeeting(claim.meetingId);
+    if (!meeting) return null;
+    return {
+      meeting,
+      rsvps: this.listRsvps(meeting.id),
+      invitees: this.listMeetingInvitees(meeting.id),
+    };
+  }
+
+  markMeetingCardUpdateSucceeded(claim) {
+    if (!claim?.meetingId || !claim?.claimToken) return false;
+    return this.db.prepare(`
+      DELETE FROM meeting_card_updates
+      WHERE meeting_id = ? AND target_card_revision = ?
+        AND status = 'sending' AND claim_token = ?
+        AND EXISTS (
+          SELECT 1 FROM meetings m
+          WHERE m.id = meeting_card_updates.meeting_id
+            AND m.card_revision = meeting_card_updates.target_card_revision
+            AND m.message_id IS NOT NULL
+        )
+    `).run(
+      String(claim.meetingId).toUpperCase(),
+      Number(claim.targetCardRevision),
+      String(claim.claimToken),
+    ).changes === 1;
+  }
+
+  adoptRecreatedMeetingCard(claim, { expectedMessageId, newMessageId } = {}) {
+    if (!claim?.meetingId || !claim?.claimToken || !expectedMessageId || !newMessageId) return false;
+    return this.transaction(() => {
+      const adopted = this.db.prepare(`
+        UPDATE meetings
+        SET message_id = ?
+        WHERE id = ? AND message_id = ? AND card_revision = ?
+          AND EXISTS (
+            SELECT 1 FROM meeting_card_updates o
+            WHERE o.meeting_id = meetings.id
+              AND o.target_card_revision = ?
+              AND o.status = 'sending' AND o.claim_token = ?
+          )
+      `).run(
+        String(newMessageId),
+        String(claim.meetingId).toUpperCase(),
+        String(expectedMessageId),
+        Number(claim.targetCardRevision),
+        Number(claim.targetCardRevision),
+        String(claim.claimToken),
+      );
+      if (adopted.changes !== 1) return false;
+      const receipt = this.db.prepare(`
+        DELETE FROM meeting_card_updates
+        WHERE meeting_id = ? AND target_card_revision = ?
+          AND status = 'sending' AND claim_token = ?
+      `).run(
+        String(claim.meetingId).toUpperCase(),
+        Number(claim.targetCardRevision),
+        String(claim.claimToken),
+      );
+      if (receipt.changes !== 1) {
+        throw Object.assign(new Error("Meeting card recreation receipt was not saved"), {
+          code: "card_recreation_receipt_failed",
+        });
+      }
+      return true;
+    });
+  }
+
+  markMeetingCardUpdateFailed(claim, {
+    errorCode = "card_update_failed",
+    retryable = true,
+    maxAttempts = 5,
+    failedAtMs = Date.now(),
+  } = {}) {
+    if (!claim?.meetingId || !claim?.claimToken) return false;
+    const row = this.db.prepare(`
+      SELECT attempts FROM meeting_card_updates
+      WHERE meeting_id = ? AND target_card_revision = ?
+        AND status = 'sending' AND claim_token = ?
+    `).get(
+      String(claim.meetingId).toUpperCase(),
+      Number(claim.targetCardRevision),
+      String(claim.claimToken),
+    );
+    if (!row || !this.isMeetingCardUpdateClaimCurrent(claim)) return false;
+    const attempts = Number(row.attempts || 1);
+    const now = Number(failedAtMs);
+    const shouldRetry = Boolean(retryable) && attempts < Math.max(0, Number(maxAttempts));
+    const delayMs = Math.min(5 * 60_000, 5_000 * (2 ** Math.min(attempts - 1, 6)));
+    return this.db.prepare(`
+      UPDATE meeting_card_updates
+      SET status = ?, next_attempt_at_ms = ?, lease_expires_at_ms = NULL,
+          claim_token = NULL, last_error_code = ?, updated_at_ms = ?
+      WHERE meeting_id = ? AND target_card_revision = ?
+        AND status = 'sending' AND claim_token = ?
+    `).run(
+      shouldRetry ? "pending" : "skipped",
+      shouldRetry ? now + delayMs : 0,
+      String(errorCode).slice(0, 80),
+      now,
+      String(claim.meetingId).toUpperCase(),
+      Number(claim.targetCardRevision),
+      String(claim.claimToken),
+    ).changes === 1;
+  }
+
+  getMeetingCardUpdateSummary(meetingId, targetCardRevision = null) {
+    const meeting = this.getMeeting(meetingId);
+    const target = targetCardRevision == null ? meeting?.cardRevision : Number(targetCardRevision);
+    const rows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count, MAX(next_attempt_at_ms) AS next_attempt_at_ms
+      FROM meeting_card_updates
+      WHERE meeting_id = ? AND target_card_revision = ?
+      GROUP BY status
+    `).all(String(meetingId).toUpperCase(), target);
+    const summary = { pending: 0, sending: 0, skipped: 0, unresolved: 0, nextAttemptAtMs: 0 };
+    for (const row of rows) {
+      summary[row.status] = Number(row.count);
+      summary.nextAttemptAtMs = Math.max(summary.nextAttemptAtMs, Number(row.next_attempt_at_ms || 0));
+    }
+    summary.unresolved = summary.pending + summary.sending + summary.skipped;
+    return summary;
+  }
+
+  invalidateSendingDeliveryClaimsInternal(meetingId, nowMs, reason = "content_superseded") {
+    return this.db.prepare(`
+      UPDATE deliveries
+      SET status = 'pending', next_attempt_at_ms = 0,
+          lease_expires_at_ms = NULL, claim_token = NULL,
+          last_error_code = ?
+      WHERE meeting_id = ? AND status = 'sending'
+    `).run(
+      String(reason).slice(0, 80),
+      String(meetingId).toUpperCase(),
+    ).changes;
+  }
+
+  queueDirectInviteUpdatesInternal(meetingId, targetUpdatedAtMs, nowMs) {
+    return this.db.prepare(`
+      INSERT INTO direct_invite_updates(
+        meeting_id, user_id, target_updated_at_ms, status, attempts,
+        next_attempt_at_ms, lease_expires_at_ms, claim_token, last_error_code,
+        created_at_ms, updated_at_ms
+      )
+      SELECT meeting_id, user_id, ?, 'pending', 0, 0, NULL, NULL, NULL, ?, ?
+      FROM meeting_invitees
+      WHERE meeting_id = ? AND delivery_status = 'sent' AND dm_message_id IS NOT NULL
+      ON CONFLICT(meeting_id, user_id) DO UPDATE SET
+        target_updated_at_ms = excluded.target_updated_at_ms,
+        status = 'pending', attempts = 0, next_attempt_at_ms = 0,
+        lease_expires_at_ms = NULL, claim_token = NULL, last_error_code = NULL,
+        updated_at_ms = excluded.updated_at_ms
+    `).run(
+      Number(targetUpdatedAtMs),
+      Number(nowMs),
+      Number(nowMs),
+      String(meetingId).toUpperCase(),
+    ).changes;
+  }
+
+  queueDirectInviteUpdateForRecipientInternal(meetingId, userId, targetUpdatedAtMs, nowMs) {
+    return this.db.prepare(`
+      INSERT INTO direct_invite_updates(
+        meeting_id, user_id, target_updated_at_ms, status, attempts,
+        next_attempt_at_ms, lease_expires_at_ms, claim_token, last_error_code,
+        created_at_ms, updated_at_ms
+      )
+      SELECT i.meeting_id, i.user_id, ?, 'pending', 0, 0, NULL, NULL, NULL, ?, ?
+      FROM meeting_invitees i
+      JOIN meetings m ON m.id = i.meeting_id
+      WHERE i.meeting_id = ? AND i.user_id = ?
+        AND i.delivery_status = 'sent' AND i.dm_message_id IS NOT NULL
+        AND m.updated_at_ms = ?
+      ON CONFLICT(meeting_id, user_id) DO UPDATE SET
+        target_updated_at_ms = excluded.target_updated_at_ms,
+        status = 'pending', attempts = 0, next_attempt_at_ms = 0,
+        lease_expires_at_ms = NULL, claim_token = NULL, last_error_code = NULL,
+        updated_at_ms = excluded.updated_at_ms
+      WHERE direct_invite_updates.target_updated_at_ms <> excluded.target_updated_at_ms
+    `).run(
+      Number(targetUpdatedAtMs),
+      Number(nowMs),
+      Number(nowMs),
+      String(meetingId).toUpperCase(),
+      String(userId),
+      Number(targetUpdatedAtMs),
+    ).changes;
+  }
+
+  queueDirectInviteUpdates(meetingId, { targetUpdatedAtMs = null, nowMs = Date.now() } = {}) {
+    const meeting = this.getMeeting(meetingId);
+    if (!meeting) throw new Error("会議が見つかりません");
+    const target = targetUpdatedAtMs == null ? meeting.updatedAtMs : Number(targetUpdatedAtMs);
+    if (!Number.isSafeInteger(target) || target !== meeting.updatedAtMs) {
+      throw updateConflict();
+    }
+    const now = Number(nowMs);
+    if (!Number.isSafeInteger(now) || now < 0) throw new Error("現在日時が正しくありません");
+    return this.queueDirectInviteUpdatesInternal(meeting.id, target, now);
+  }
+
+  claimDirectInviteUpdates({ nowMs = Date.now(), leaseMs = 120_000, limit = 25 } = {}) {
+    const now = Number(nowMs);
+    const lease = Math.max(1_000, Number(leaseMs));
+    const batchLimit = Math.max(1, Math.min(100, Number(limit)));
+    return this.transaction(() => {
+      this.db.prepare(`
+        UPDATE direct_invite_updates
+        SET status = 'pending', lease_expires_at_ms = NULL, claim_token = NULL,
+            updated_at_ms = ?
+        WHERE status = 'sending' AND lease_expires_at_ms IS NOT NULL
+          AND lease_expires_at_ms <= ?
+      `).run(now, now);
+      this.db.prepare(`
+        DELETE FROM direct_invite_updates
+        WHERE status IN ('pending', 'sending')
+          AND NOT EXISTS (
+            SELECT 1 FROM meetings m
+            WHERE m.id = direct_invite_updates.meeting_id
+              AND m.updated_at_ms = direct_invite_updates.target_updated_at_ms
+          )
+      `).run();
+      const rows = this.db.prepare(`
+        SELECT o.meeting_id, o.user_id, o.target_updated_at_ms, o.attempts,
+               i.display_name, i.dm_message_id
+        FROM direct_invite_updates o
+        JOIN meetings m ON m.id = o.meeting_id
+          AND m.updated_at_ms = o.target_updated_at_ms
+        JOIN meeting_invitees i ON i.meeting_id = o.meeting_id AND i.user_id = o.user_id
+        WHERE o.status = 'pending' AND o.next_attempt_at_ms <= ?
+          AND i.delivery_status = 'sent' AND i.dm_message_id IS NOT NULL
+        ORDER BY o.updated_at_ms ASC, o.meeting_id ASC, o.user_id ASC
+        LIMIT ?
+      `).all(now, batchLimit);
+      const claimed = [];
+      const claimStatement = this.db.prepare(`
+        UPDATE direct_invite_updates
+        SET status = 'sending', attempts = attempts + 1,
+            lease_expires_at_ms = ?, claim_token = ?, updated_at_ms = ?
+        WHERE meeting_id = ? AND user_id = ? AND target_updated_at_ms = ?
+          AND status = 'pending' AND next_attempt_at_ms <= ?
+      `);
+      for (const row of rows) {
+        const claimToken = crypto.randomUUID();
+        const result = claimStatement.run(
+          now + lease,
+          claimToken,
+          now,
+          row.meeting_id,
+          row.user_id,
+          row.target_updated_at_ms,
+          now,
+        );
+        if (result.changes !== 1) continue;
+        claimed.push({
+          meetingId: row.meeting_id,
+          userId: row.user_id,
+          targetUpdatedAtMs: Number(row.target_updated_at_ms),
+          displayName: row.display_name,
+          dmMessageId: row.dm_message_id,
+          attempts: Number(row.attempts) + 1,
+          claimToken,
+          meeting: this.getMeeting(row.meeting_id),
+        });
+      }
+      return claimed;
+    });
+  }
+
+  isDirectInviteUpdateClaimCurrent(claim) {
+    if (!claim?.meetingId || !claim?.userId || !claim?.claimToken) return false;
+    return Boolean(this.db.prepare(`
+      SELECT 1
+      FROM direct_invite_updates o
+      JOIN meetings m ON m.id = o.meeting_id
+      WHERE o.meeting_id = ? AND o.user_id = ? AND o.target_updated_at_ms = ?
+        AND o.status = 'sending' AND o.claim_token = ?
+        AND m.updated_at_ms = o.target_updated_at_ms
+    `).get(
+      String(claim.meetingId).toUpperCase(),
+      String(claim.userId),
+      Number(claim.targetUpdatedAtMs),
+      String(claim.claimToken),
+    ));
+  }
+
+  markDirectInviteUpdateSucceeded(claim) {
+    if (!claim?.meetingId || !claim?.userId || !claim?.claimToken) return false;
+    return this.transaction(() => {
+      const removed = this.db.prepare(`
+        DELETE FROM direct_invite_updates
+        WHERE meeting_id = ? AND user_id = ? AND target_updated_at_ms = ?
+          AND status = 'sending' AND claim_token = ?
+          AND EXISTS (
+            SELECT 1 FROM meetings m
+            WHERE m.id = direct_invite_updates.meeting_id
+              AND m.updated_at_ms = direct_invite_updates.target_updated_at_ms
+          )
+      `).run(
+        String(claim.meetingId).toUpperCase(),
+        String(claim.userId),
+        Number(claim.targetUpdatedAtMs),
+        String(claim.claimToken),
+      );
+      if (removed.changes === 1) return true;
+
+      // The Discord edit may have completed after a newer generation was
+      // already acknowledged and removed.  Re-enqueue the current generation
+      // so the late old edit is deterministically repaired on the next tick.
+      const current = this.getMeeting(claim.meetingId);
+      if (current) {
+        this.queueDirectInviteUpdateForRecipientInternal(
+          current.id,
+          claim.userId,
+          current.updatedAtMs,
+          Date.now(),
+        );
+      }
+      return false;
+    });
+  }
+
+  markDirectInviteUpdateFailed(claim, {
+    errorCode = "update_failed",
+    retryable = true,
+    maxAttempts = 5,
+    failedAtMs = Date.now(),
+  } = {}) {
+    if (!claim?.meetingId || !claim?.userId || !claim?.claimToken) return false;
+    const row = this.db.prepare(`
+      SELECT attempts FROM direct_invite_updates
+      WHERE meeting_id = ? AND user_id = ? AND target_updated_at_ms = ?
+        AND status = 'sending' AND claim_token = ?
+    `).get(
+      String(claim.meetingId).toUpperCase(),
+      String(claim.userId),
+      Number(claim.targetUpdatedAtMs),
+      String(claim.claimToken),
+    );
+    if (!row || !this.isDirectInviteUpdateClaimCurrent(claim)) return false;
+    const attempts = Number(row.attempts || 1);
+    const now = Number(failedAtMs);
+    const shouldRetry = Boolean(retryable) && attempts < Math.max(0, Number(maxAttempts));
+    const delayMs = Math.min(5 * 60_000, 5_000 * (2 ** Math.min(attempts - 1, 6)));
+    if (!shouldRetry) {
+      return this.db.prepare(`
+        DELETE FROM direct_invite_updates
+        WHERE meeting_id = ? AND user_id = ? AND target_updated_at_ms = ?
+          AND status = 'sending' AND claim_token = ?
+      `).run(
+        String(claim.meetingId).toUpperCase(),
+        String(claim.userId),
+        Number(claim.targetUpdatedAtMs),
+        String(claim.claimToken),
+      ).changes === 1;
+    }
+    return this.db.prepare(`
+      UPDATE direct_invite_updates
+      SET status = ?, next_attempt_at_ms = ?, lease_expires_at_ms = NULL,
+          claim_token = NULL, last_error_code = ?, updated_at_ms = ?
+      WHERE meeting_id = ? AND user_id = ? AND target_updated_at_ms = ?
+        AND status = 'sending' AND claim_token = ?
+    `).run(
+      "pending",
+      now + delayMs,
+      String(errorCode).slice(0, 80),
+      now,
+      String(claim.meetingId).toUpperCase(),
+      String(claim.userId),
+      Number(claim.targetUpdatedAtMs),
+      String(claim.claimToken),
+    ).changes === 1;
+  }
+
+  getDirectInviteUpdateSummary(meetingId, targetUpdatedAtMs = null) {
+    const meeting = this.getMeeting(meetingId);
+    const target = targetUpdatedAtMs == null ? meeting?.updatedAtMs : Number(targetUpdatedAtMs);
+    const rows = this.db.prepare(`
+      SELECT status, COUNT(*) AS count, MAX(next_attempt_at_ms) AS next_attempt_at_ms
+      FROM direct_invite_updates
+      WHERE meeting_id = ? AND target_updated_at_ms = ?
+      GROUP BY status
+    `).all(String(meetingId).toUpperCase(), target);
+    const summary = { pending: 0, sending: 0, skipped: 0, unresolved: 0, nextAttemptAtMs: 0 };
+    for (const row of rows) {
+      summary[row.status] = Number(row.count);
+      summary.nextAttemptAtMs = Math.max(summary.nextAttemptAtMs, Number(row.next_attempt_at_ms || 0));
+    }
+    summary.unresolved = summary.pending + summary.sending + summary.skipped;
+    return summary;
   }
 
   listOpenInvitationsForUser(userId, { nowMs = Date.now(), limit = 20 } = {}) {
@@ -559,16 +1787,26 @@ export class MeetingDatabase {
 
   upsertRsvp(meetingId, { userId, displayName, status }) {
     if (!RSVP_STATUSES.has(status)) throw new Error("出欠ステータスが正しくありません");
+    this.completeEndedMeetings();
     const meeting = this.getMeeting(meetingId);
     if (!meeting || meeting.status !== "active") throw new Error("回答できる会議が見つかりません");
-    this.db.prepare(`
-      INSERT INTO rsvps(meeting_id, user_id, display_name, status, updated_at_ms)
-      VALUES(?, ?, ?, ?, ?)
-      ON CONFLICT(meeting_id, user_id) DO UPDATE SET
-        display_name = excluded.display_name,
-        status = excluded.status,
-        updated_at_ms = excluded.updated_at_ms
-    `).run(meeting.id, String(userId), displayName, status, Date.now());
+    const now = Date.now();
+    this.transaction(() => {
+      this.db.prepare(`
+        INSERT INTO rsvps(meeting_id, user_id, display_name, status, updated_at_ms)
+        VALUES(?, ?, ?, ?, ?)
+        ON CONFLICT(meeting_id, user_id) DO UPDATE SET
+          display_name = excluded.display_name,
+          status = excluded.status,
+          updated_at_ms = excluded.updated_at_ms
+      `).run(meeting.id, String(userId), displayName, status, now);
+      const update = this.db.prepare(`
+        UPDATE meetings SET card_revision = card_revision + 1
+        WHERE id = ? AND status = 'active' AND card_revision = ?
+      `).run(meeting.id, meeting.cardRevision);
+      if (update.changes !== 1) throw updateConflict();
+      this.queueMeetingCardUpdateInternal(meeting.id, meeting.cardRevision + 1, now);
+    });
     return this.listRsvps(meeting.id);
   }
 
@@ -579,8 +1817,21 @@ export class MeetingDatabase {
 
   claimDueDeliveries({ nowMs = Date.now(), maxLateMinutes = 10, leaseMs = 120_000, limit = 10 } = {}) {
     return this.transaction(() => {
+      this.completeEndedMeetingsInternal(Number(nowMs));
       this.db.prepare(`
-        UPDATE deliveries SET status = 'pending', lease_expires_at_ms = NULL
+        UPDATE deliveries
+        SET status = 'skipped', lease_expires_at_ms = NULL, claim_token = NULL,
+            last_error_code = 'schedule_superseded'
+        WHERE status IN ('pending', 'sending')
+          AND EXISTS (
+            SELECT 1 FROM meetings m
+            WHERE m.id = deliveries.meeting_id
+              AND (m.status != 'active' OR m.schedule_revision != deliveries.schedule_revision)
+          )
+      `).run();
+      this.db.prepare(`
+        UPDATE deliveries
+        SET status = 'pending', lease_expires_at_ms = NULL, claim_token = NULL
         WHERE status = 'sending' AND lease_expires_at_ms IS NOT NULL AND lease_expires_at_ms <= ?
       `).run(nowMs);
       const oldestAllowed = nowMs - maxLateMinutes * 60_000;
@@ -598,19 +1849,38 @@ export class MeetingDatabase {
           AND d.due_at_ms >= ?
           AND d.next_attempt_at_ms <= ?
           AND m.status = 'active'
+          AND d.schedule_revision = m.schedule_revision
         ORDER BY d.due_at_ms ASC
         LIMIT ?
       `).all(nowMs, oldestAllowed, nowMs, limit);
       const claim = this.db.prepare(`
         UPDATE deliveries
-        SET status = 'sending', attempts = attempts + 1, lease_expires_at_ms = ?
-        WHERE meeting_id = ? AND offset_minutes = ? AND status = 'pending'
+        SET status = 'sending', attempts = attempts + 1, lease_expires_at_ms = ?, claim_token = ?
+        WHERE meeting_id = ? AND schedule_revision = ? AND offset_minutes = ?
+          AND status = 'pending'
+          AND EXISTS (
+            SELECT 1 FROM meetings m
+            WHERE m.id = deliveries.meeting_id AND m.status = 'active'
+              AND m.schedule_revision = deliveries.schedule_revision
+          )
       `);
       const claimed = [];
       for (const row of rows) {
-        if (claim.run(nowMs + leaseMs, row.meeting_id, row.offset_minutes).changes === 1) {
+        const claimToken = crypto.randomUUID();
+        if (claim.run(
+          nowMs + leaseMs,
+          claimToken,
+          row.meeting_id,
+          row.schedule_revision,
+          row.offset_minutes,
+        ).changes === 1) {
           claimed.push({
-            ...mapDelivery({ ...row, status: "sending", attempts: Number(row.attempts) + 1 }),
+            ...mapDelivery({
+              ...row,
+              status: "sending",
+              attempts: Number(row.attempts) + 1,
+              claim_token: claimToken,
+            }),
             guildId: row.guild_id,
             channelId: row.channel_id,
             title: row.title,
@@ -624,26 +1894,110 @@ export class MeetingDatabase {
     });
   }
 
-  markDeliverySent(meetingId, offsetMinutes, { discordMessageId, sentAtMs = Date.now() }) {
-    this.db.prepare(`
-      UPDATE deliveries
-      SET status = 'sent', discord_message_id = ?, sent_at_ms = ?,
-          lease_expires_at_ms = NULL, last_error_code = NULL
-      WHERE meeting_id = ? AND offset_minutes = ? AND status = 'sending'
-    `).run(String(discordMessageId), sentAtMs, meetingId, offsetMinutes);
+  isDeliveryClaimCurrent(delivery) {
+    if (!delivery?.meetingId || delivery.scheduleRevision == null || !delivery.claimToken) return false;
+    return Boolean(this.db.prepare(`
+      SELECT 1
+      FROM deliveries d
+      JOIN meetings m ON m.id = d.meeting_id
+      WHERE d.meeting_id = ? AND d.schedule_revision = ? AND d.offset_minutes = ?
+        AND d.status = 'sending' AND d.claim_token = ?
+        AND m.status = 'active' AND m.schedule_revision = d.schedule_revision
+      LIMIT 1
+    `).get(
+      String(delivery.meetingId).toUpperCase(),
+      Number(delivery.scheduleRevision),
+      Number(delivery.offsetMinutes),
+      String(delivery.claimToken),
+    ));
   }
 
-  markDeliveryFailed(meetingId, offsetMinutes, { errorCode = "send_failed", nowMs = Date.now() } = {}) {
-    const row = this.db.prepare("SELECT attempts FROM deliveries WHERE meeting_id = ? AND offset_minutes = ?")
-      .get(meetingId, offsetMinutes);
+  markDeliverySent(meetingId, offsetMinutes, {
+    discordMessageId,
+    sentAtMs = Date.now(),
+    scheduleRevision = null,
+    claimToken = null,
+  }) {
+    const revision = scheduleRevision ?? this.getMeeting(meetingId)?.scheduleRevision;
+    if (revision == null) return false;
+    const result = this.db.prepare(`
+      UPDATE deliveries
+      SET status = 'sent', discord_message_id = ?, sent_at_ms = ?,
+          lease_expires_at_ms = NULL, claim_token = NULL, last_error_code = NULL
+      WHERE meeting_id = ? AND schedule_revision = ? AND offset_minutes = ?
+        AND status = 'sending' AND (? IS NULL OR claim_token = ?)
+    `).run(
+      String(discordMessageId),
+      sentAtMs,
+      meetingId,
+      revision,
+      offsetMinutes,
+      claimToken,
+      claimToken,
+    );
+    return result.changes === 1;
+  }
+
+  markDeliveryFailed(meetingId, offsetMinutes, {
+    errorCode = "send_failed",
+    nowMs = Date.now(),
+    scheduleRevision = null,
+    claimToken = null,
+  } = {}) {
+    const revision = scheduleRevision ?? this.getMeeting(meetingId)?.scheduleRevision;
+    if (revision == null) return false;
+    const row = this.db.prepare(`
+      SELECT attempts FROM deliveries
+      WHERE meeting_id = ? AND schedule_revision = ? AND offset_minutes = ?
+        AND status = 'sending' AND (? IS NULL OR claim_token = ?)
+    `).get(meetingId, revision, offsetMinutes, claimToken, claimToken);
+    if (!row) return false;
     const attempts = Number(row?.attempts || 1);
     const delayMs = Math.min(15 * 60_000, 15_000 * (2 ** Math.min(attempts - 1, 6)));
-    this.db.prepare(`
+    const result = this.db.prepare(`
       UPDATE deliveries
       SET status = 'pending', next_attempt_at_ms = ?, lease_expires_at_ms = NULL,
-          last_error_code = ?
-      WHERE meeting_id = ? AND offset_minutes = ? AND status = 'sending'
-    `).run(nowMs + delayMs, String(errorCode).slice(0, 80), meetingId, offsetMinutes);
+          claim_token = NULL, last_error_code = ?
+      WHERE meeting_id = ? AND schedule_revision = ? AND offset_minutes = ?
+        AND status = 'sending' AND (? IS NULL OR claim_token = ?)
+    `).run(
+      nowMs + delayMs,
+      String(errorCode).slice(0, 80),
+      meetingId,
+      revision,
+      offsetMinutes,
+      claimToken,
+      claimToken,
+    );
+    return result.changes === 1;
+  }
+
+  markDeliveryUncertain(meetingId, offsetMinutes, {
+    errorCode = "receipt_persist_failed",
+    discordMessageId = null,
+    nowMs = Date.now(),
+    scheduleRevision = null,
+    claimToken = null,
+  } = {}) {
+    const revision = scheduleRevision ?? this.getMeeting(meetingId)?.scheduleRevision;
+    if (revision == null) return false;
+    return this.db.prepare(`
+      UPDATE deliveries
+      SET status = 'skipped', lease_expires_at_ms = NULL, claim_token = NULL,
+          discord_message_id = COALESCE(?, discord_message_id),
+          sent_at_ms = COALESCE(sent_at_ms, ?), last_error_code = ?
+      WHERE meeting_id = ? AND schedule_revision = ? AND offset_minutes = ?
+        AND status = 'sending' AND (? IS NULL OR claim_token = ?)
+    `).run(
+      discordMessageId == null ? null : String(discordMessageId),
+      Number(nowMs),
+      String(errorCode).slice(0, 80),
+      meetingId,
+      revision,
+      offsetMinutes,
+      claimToken,
+      claimToken,
+    ).changes === 1;
   }
 
   getSnapshot() {
