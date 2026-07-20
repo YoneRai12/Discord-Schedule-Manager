@@ -78,6 +78,46 @@ test("AIが不足なしと答えてもURL有無はローカルで再判定する
   assert.deepEqual(result.missingFields, ["meetingUrl"]);
 });
 
+test("会議更新ではlegacy 7文字IDと新しい8文字IDの両方を保持する", () => {
+  for (const meetingId of ["ABC1234", "MEET0001"]) {
+    const result = validateInterpretation(validOutput({
+      action: "update",
+      meetingId,
+      title: null,
+      startsAt: null,
+      durationMinutes: null,
+      reminderMinutes: [],
+      providedFields: ["meetingUrl"],
+    }), {
+      hasMeetingUrl: true,
+      nowMs: Date.parse("2026-07-18T00:00:00Z"),
+    });
+
+    assert.equal(result.action, "update");
+    assert.equal(result.meetingId, meetingId);
+    assert.deepEqual(result.missingFields, []);
+  }
+});
+
+test("自然な更新依頼は会議IDなしでもローカル対象解決へ渡す", () => {
+  const result = validateInterpretation(validOutput({
+    action: "update",
+    meetingId: null,
+    title: null,
+    startsAt: null,
+    durationMinutes: null,
+    reminderMinutes: [],
+    providedFields: ["meetingUrl"],
+  }), {
+    hasMeetingUrl: true,
+    nowMs: Date.parse("2026-07-18T00:00:00Z"),
+  });
+
+  assert.equal(result.action, "update");
+  assert.equal(result.meetingId, null);
+  assert.deepEqual(result.missingFields, []);
+});
+
 test("AI出力にURLが混入した場合は結果全体を破棄する", () => {
   assert.throws(() => validateInterpretation(validOutput({
     clarification: "https://example.com を使ってください",

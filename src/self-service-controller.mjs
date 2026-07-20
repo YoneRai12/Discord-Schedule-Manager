@@ -1,5 +1,6 @@
 import { buildDirectConfirmationPayload } from "./discord-ui.mjs";
 import { parseDirectMessageRsvp } from "./dm-rsvp.mjs";
+import { extractMeetingId } from "./meeting-id.mjs";
 import { formatPersonalReminderMinutes, parsePersonalReminderRequest } from "./personal-reminders.mjs";
 import { safeDisplayText } from "./privacy.mjs";
 import { discordTimestamp } from "./time.mjs";
@@ -7,8 +8,7 @@ import { discordTimestamp } from "./time.mjs";
 const RSVP_LABELS = { attending: "参加", maybe: "未定", declined: "欠席" };
 
 function meetingIdFrom(text) {
-  return String(text ?? "").normalize("NFKC")
-    .match(/(?:^|[\s#])([A-Z0-9]{8})(?=$|[\s、。.!！?？:：のをへで])/iu)?.[1]?.toUpperCase() || null;
+  return extractMeetingId(text);
 }
 
 function authorDisplayName(author) {

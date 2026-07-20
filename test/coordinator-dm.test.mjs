@@ -95,7 +95,7 @@ test("自然言語登録でもURL・Discord ID・登録済み呼び名をAI入�
     member: { permissions: { has: () => true } },
     mentions: { users: new Map() },
     reply: async () => ({}),
-  }, "明日20時から運営定例。URL: https://meet.example.com/room\n参加者: メンバーA");
+  }, "明日20時から運営定例。URL: https://meet.google.com/example-room\n参加者: メンバーA");
 
   assert.equal(aiInput.hasMeetingUrl, true);
   assert.equal(aiInput.sanitizedText.includes("https://"), false);

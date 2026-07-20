@@ -69,9 +69,9 @@ export function buildMeetingCommand() {
       .setDescription("既存会議のURLを更新します")
       .addStringOption((option) => option
         .setName("id")
-        .setDescription("8文字の会議ID")
+        .setDescription("7〜8文字の会議ID")
         .setRequired(true)
-        .setMinLength(8)
+        .setMinLength(7)
         .setMaxLength(8))
       .addStringOption((option) => option
         .setName("url")
@@ -86,18 +86,18 @@ export function buildMeetingCommand() {
       .setDescription("会議の出欠状況を表示します")
       .addStringOption((option) => option
         .setName("id")
-        .setDescription("8文字の会議ID")
+        .setDescription("7〜8文字の会議ID")
         .setRequired(true)
-        .setMinLength(8)
+        .setMinLength(7)
         .setMaxLength(8)))
     .addSubcommand((command) => command
       .setName("cancel")
       .setDescription("会議を中止します")
       .addStringOption((option) => option
         .setName("id")
-        .setDescription("8文字の会議ID")
+        .setDescription("7〜8文字の会議ID")
         .setRequired(true)
-        .setMinLength(8)
+        .setMinLength(7)
         .setMaxLength(8)))
     .addSubcommand((command) => command
       .setName("member-add")
@@ -171,9 +171,9 @@ export function buildMeetingCommand() {
       .setDescription("既存会議の出席確認を個別DMで送ります")
       .addStringOption((option) => option
         .setName("id")
-        .setDescription("8文字の会議ID")
+        .setDescription("7〜8文字の会議ID")
         .setRequired(true)
-        .setMinLength(8)
+        .setMinLength(7)
         .setMaxLength(8))))
     .addSubcommand((command) => command
       .setName("my-reminders")

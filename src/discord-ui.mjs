@@ -101,9 +101,11 @@ export function buildMeetingPayload(meeting, rsvps, { everyoneOffsets = [0], inv
 export function buildDraftPayload(draft) {
   const isUpdate = draft.action === "update";
   const lines = [
-    `**操作:** ${isUpdate ? `会議 ${draft.meetingId} を更新` : "新しい会議を登録"}`,
+    `**操作:** ${isUpdate ? `「${safeDisplayText(draft.title, 80)}」を更新` : "新しい会議を登録"}`,
   ];
-  if (draft.title) lines.push(`**タイトル:** ${safeDisplayText(draft.title, 100)}`);
+  if (draft.title) {
+    lines.push(`**タイトル:** ${safeDisplayText(draft.title, 100)}${draft.autoTitle ? "（名前が無かったため自動設定）" : ""}`);
+  }
   if (draft.startsAtMs != null) lines.push(`**開始:** ${discordTimestamp(draft.startsAtMs, "F")}`);
   if (draft.endsAtMs != null) lines.push(`**終了予定:** ${discordTimestamp(draft.endsAtMs, "t")}`);
   if (draft.reminderMinutes) lines.push(`**通知:** ${draft.reminderMinutes.map(reminderLabel).join("、")}`);

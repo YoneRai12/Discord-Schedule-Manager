@@ -1,3 +1,5 @@
+import { extractMeetingId } from "./meeting-id.mjs";
+
 const RSVP_PATTERNS = [
   {
     status: "declined",
@@ -21,7 +23,7 @@ export function parseDirectMessageRsvp(rawText) {
     .trim();
   if (!text) return null;
 
-  const meetingId = text.match(/(?:^|[\s#])([A-Z0-9]{8})(?=$|[\s、。.!！?？:：のをへで])/iu)?.[1]?.toUpperCase() || null;
+  const meetingId = extractMeetingId(text);
   const status = RSVP_PATTERNS.find((item) => item.pattern.test(text))?.status || null;
   if (!status) return null;
   return { meetingId, status };

@@ -83,6 +83,7 @@ export function loadConfig({ requireSecrets = true } = {}) {
     maxLateMinutes: integer("MEETING_MAX_LATE_MINUTES", 10, { min: 0, max: 1_440 }),
     dataDir,
     databasePath: path.join(dataDir, "meetings.sqlite3"),
+    meetingAiProvider: choice("MEETING_AI_PROVIDER", "openai", ["openai", "codex_app_server"]),
     openaiApiKey: String(process.env.OPENAI_API_KEY ?? "").trim(),
     openaiModel: String(process.env.OPENAI_MEETING_MODEL || "gpt-5.6-terra").trim(),
     openaiReasoningEffort: choice(
@@ -91,6 +92,14 @@ export function loadConfig({ requireSecrets = true } = {}) {
       ["none", "low", "medium", "high", "xhigh", "max"],
     ),
     openaiMaxOutputTokens: integer("OPENAI_MAX_OUTPUT_TOKENS", 1_200, { min: 200, max: 8_000 }),
+    codexAppServerCommand: String(process.env.CODEX_APP_SERVER_COMMAND || "codex").trim(),
+    codexMeetingModel: String(process.env.CODEX_MEETING_MODEL || "gpt-5.3-codex-spark").trim(),
+    codexReasoningEffort: choice(
+      "CODEX_REASONING_EFFORT",
+      "medium",
+      ["low", "medium", "high", "xhigh"],
+    ),
+    codexAppServerTimeoutMs: integer("CODEX_APP_SERVER_TIMEOUT_MS", 60_000, { min: 5_000, max: 180_000 }),
     spreadsheetId: String(process.env.GOOGLE_SHEETS_SPREADSHEET_ID ?? "").trim(),
     googleServiceAccountFile: serviceAccountFile ? path.resolve(PROJECT_ROOT, serviceAccountFile) : "",
     syncMeetingUrlsToSheets: boolean("GOOGLE_SHEETS_SYNC_URLS", false),

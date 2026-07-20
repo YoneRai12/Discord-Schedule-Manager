@@ -25,6 +25,46 @@ test("会議作成・更新の自由文はAI会議解析へフォールスルー
   assert.equal(parseGuildNaturalCommand("明日20時から定例会を登録して"), null);
 });
 
+test("会議URL差し替えは7〜8文字IDや自然な指示をローカル操作として判定する", () => {
+  assert.deepEqual(
+    parseGuildNaturalCommand("https://calendar.app.google/example-token"),
+    { action: "meeting_url_update", meetingId: null, hasMeetingUrl: true },
+  );
+  assert.deepEqual(
+    parseGuildNaturalCommand("https://meet.google.com/example-room"),
+    { action: "meeting_url_update", meetingId: null, hasMeetingUrl: true },
+  );
+  assert.deepEqual(
+    parseGuildNaturalCommand("meeting url id:ABC1234 url:https://meet.google.com/example-room"),
+    { action: "meeting_url_update", meetingId: "ABC1234", hasMeetingUrl: true },
+  );
+  assert.deepEqual(
+    parseGuildNaturalCommand("MEET0001のURLを https://meet.google.com/example-room に差し替えて"),
+    { action: "meeting_url_update", meetingId: "MEET0001", hasMeetingUrl: true },
+  );
+  assert.deepEqual(
+    parseGuildNaturalCommand("このリンクにして https://meet.google.com/example-room"),
+    { action: "meeting_url_update", meetingId: null, hasMeetingUrl: true },
+  );
+  assert.equal(
+    parseGuildNaturalCommand("全体MTGのGoogleミートのリンク、これね https://meet.google.com/example-room"),
+    null,
+  );
+  assert.equal(
+    parseGuildNaturalCommand("全体MTGを新しく登録。Googleミートのリンク、これね https://meet.google.com/example-room"),
+    null,
+  );
+});
+
+test("日時・会議名・参加者・URLが混在する入力はURL更新へ横取りせずAI解析へ回す", () => {
+  assert.equal(parseGuildNaturalCommand(
+    "メンバーA メンバーB 7月21日19時 全体MTG https://meet.google.com/example-room",
+  ), null);
+  assert.equal(parseGuildNaturalCommand(
+    "https://meet.google.com/example-room メンバーC 来週火曜20時 定例会",
+  ), null);
+});
+
 test("くだけた聞き方でも使い方ヘルプとしてAIへ送らず判定する", () => {
   for (const text of [
     "どうやって使うの",
@@ -65,7 +105,11 @@ test("全Slashサブコマンドに通常チャンネル@メンションの自�
     needsClarification: false,
   });
 
-  // create と url は、URL等をローカル分離してから会議AI解析へフォールスルーする。
+  // create は会議AI解析へ、URL更新はURLとIDをローカル分離する経路へ進む。
   assert.equal(parseGuildNaturalCommand("明日20時に全体定例を作成、URLは省略せず指定"), null);
-  assert.equal(parseGuildNaturalCommand("MEET0001 のURLを変更して"), null);
+  assert.deepEqual(parseGuildNaturalCommand("MEET0001 のURLを変更して"), {
+    action: "meeting_url_update",
+    meetingId: "MEET0001",
+    hasMeetingUrl: false,
+  });
 });

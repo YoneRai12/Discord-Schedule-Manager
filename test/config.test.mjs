@@ -4,10 +4,14 @@ import { loadConfig } from "../src/config.mjs";
 
 const MODEL_ENV = "OPENAI_MEETING_MODEL";
 const REASONING_ENV = "OPENAI_REASONING_EFFORT";
+const PROVIDER_ENV = "MEETING_AI_PROVIDER";
+const CODEX_MODEL_ENV = "CODEX_MEETING_MODEL";
+const CODEX_REASONING_ENV = "CODEX_REASONING_EFFORT";
 
 function withOpenAiEnvironment(values, callback) {
   const previous = new Map(
-    [MODEL_ENV, REASONING_ENV].map((name) => [name, process.env[name]]),
+    [MODEL_ENV, REASONING_ENV, PROVIDER_ENV, CODEX_MODEL_ENV, CODEX_REASONING_ENV]
+      .map((name) => [name, process.env[name]]),
   );
   try {
     for (const [name, value] of Object.entries(values)) {
@@ -24,10 +28,24 @@ function withOpenAiEnvironment(values, callback) {
 }
 
 test("OpenAI会議解釈はGPT-5.6 Terra・reasoning mediumを既定値にする", () => {
-  withOpenAiEnvironment({ [MODEL_ENV]: null, [REASONING_ENV]: null }, () => {
+  withOpenAiEnvironment({ [MODEL_ENV]: null, [REASONING_ENV]: null, [PROVIDER_ENV]: null }, () => {
     const config = loadConfig({ requireSecrets: false });
+    assert.equal(config.meetingAiProvider, "openai");
     assert.equal(config.openaiModel, "gpt-5.6-terra");
     assert.equal(config.openaiReasoningEffort, "medium");
+  });
+});
+
+test("Codex App ServerはSpark・thinking mediumを設定で選べる", () => {
+  withOpenAiEnvironment({
+    [PROVIDER_ENV]: "codex_app_server",
+    [CODEX_MODEL_ENV]: null,
+    [CODEX_REASONING_ENV]: null,
+  }, () => {
+    const config = loadConfig({ requireSecrets: false });
+    assert.equal(config.meetingAiProvider, "codex_app_server");
+    assert.equal(config.codexMeetingModel, "gpt-5.3-codex-spark");
+    assert.equal(config.codexReasoningEffort, "medium");
   });
 });
 

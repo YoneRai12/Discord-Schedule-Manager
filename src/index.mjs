@@ -2,11 +2,13 @@ import "dotenv/config";
 import { Events } from "discord.js";
 import { loadConfig } from "./config.mjs";
 import { MeetingCoordinator } from "./coordinator.mjs";
+import { CodexAppServerProvider } from "./ai/codex-app-server-provider.mjs";
 import { MeetingDatabase } from "./database.mjs";
 import { createDiscordClient } from "./discord-client.mjs";
 import { DiscordDirectMessenger } from "./discord-direct-messenger.mjs";
 import { buildDirectInvitePayload, buildPersonalReminderPayload } from "./discord-ui.mjs";
 import { MeetingInterpreter } from "./interpreter.mjs";
+import { meetingMessageText } from "./message-routing.mjs";
 import { PersonalReminderScheduler } from "./personal-reminder-scheduler.mjs";
 import { MeetingScheduler } from "./scheduler.mjs";
 import { GoogleSheetsSync } from "./sheets-sync.mjs";
@@ -15,10 +17,19 @@ import { MeetingWebSync } from "./web-sync.mjs";
 const config = loadConfig();
 const client = createDiscordClient();
 const store = new MeetingDatabase(config.databasePath);
+const codexProvider = config.meetingAiProvider === "codex_app_server"
+  ? new CodexAppServerProvider({
+    command: config.codexAppServerCommand,
+    model: config.codexMeetingModel,
+    reasoningEffort: config.codexReasoningEffort,
+    timeoutMs: config.codexAppServerTimeoutMs,
+  })
+  : null;
 const interpreter = new MeetingInterpreter({
-  apiKey: config.openaiApiKey,
-  model: config.openaiModel,
-  reasoningEffort: config.openaiReasoningEffort,
+  apiKey: config.meetingAiProvider === "openai" ? config.openaiApiKey : "",
+  provider: codexProvider,
+  model: codexProvider ? config.codexMeetingModel : config.openaiModel,
+  reasoningEffort: codexProvider ? config.codexReasoningEffort : config.openaiReasoningEffort,
   maxOutputTokens: config.openaiMaxOutputTokens,
   timeZone: config.timeZone,
   defaultDurationMinutes: config.defaultDurationMinutes,
@@ -88,7 +99,23 @@ client.once(Events.ClientReady, async (readyClient) => {
     scheduler.start();
     personalReminderScheduler.start();
     webSync.start();
-    console.log(`[ready] ${readyClient.user.tag} guild=${guild.id} sheets=${sheetsSync.configured ? "on" : "off"} web=${webSync.configured ? "on" : "off"} ai=${interpreter.configured ? "on" : "off"}`);
+    console.log(`[ready] ${readyClient.user.tag} guild=${guild.id} sheets=${sheetsSync.configured ? "on" : "off"} web=${webSync.configured ? "on" : "off"} ai=${interpreter.configured ? config.meetingAiProvider : "off"}`);
+    if (codexProvider) {
+      void interpreter.initialize().then(() => {
+        console.log(`[ai] codex app-server ready model=${config.codexMeetingModel} effort=${config.codexReasoningEffort}`);
+      }).catch((error) => {
+        const code = String(error?.code || error?.name || "unknown").slice(0, 80);
+        console.warn(`[ai] codex app-server unavailable code=${code}`);
+      });
+    }
+    void coordinator.repairActiveInvitationUrls().then((urlRepair) => {
+      if (urlRepair.repaired || urlRepair.failed || urlRepair.skippedByDeadline) {
+        console.log(`[meeting-url] invitation repair repaired=${urlRepair.repaired} failed=${urlRepair.failed} skipped=${urlRepair.skippedByDeadline}`);
+      }
+    }).catch((error) => {
+      const code = String(error?.code || error?.status || error?.name || "unknown").slice(0, 80);
+      console.warn(`[meeting-url] invitation repair aborted code=${code}`);
+    });
   } catch (error) {
     const code = String(error?.code || error?.status || error?.name || "unknown").slice(0, 80);
     console.error(`[startup] 初期化失敗 code=${code}`);
@@ -109,9 +136,13 @@ client.on(Events.MessageCreate, async (message) => {
     return;
   }
   if (message.guildId !== config.guildId) return;
-  if (!message.mentions.has(client.user)) return;
-  const mentionPattern = new RegExp(`<@!?${client.user.id}>`, "gu");
-  const rawText = message.content.replace(mentionPattern, " ").trim();
+  const rawText = meetingMessageText({
+    message,
+    botUserId: client.user.id,
+    configuredGuildId: config.guildId,
+    store,
+  });
+  if (rawText == null) return;
   try {
     await coordinator.handleMention(message, rawText);
   } catch (error) {
@@ -149,6 +180,7 @@ async function shutdown(exitCode = 0) {
   scheduler.stop();
   personalReminderScheduler.stop();
   webSync.close();
+  interpreter.close();
   sheetsSync.close();
   if (sheetsInterval) clearInterval(sheetsInterval);
   try {

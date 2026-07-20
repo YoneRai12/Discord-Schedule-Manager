@@ -32,6 +32,20 @@ test("複数URLはローカル配列へ退避し本文には残さない", () =>
   assert.equal(result.sanitizedText.includes("conference.example.com"), false);
 });
 
+test("全角化されたURL・Discord識別子・メールも正規化後にAI本文から除去する", () => {
+  const fullwidthDiscordId = [...DISCORD_ID]
+    .map((digit) => String.fromCharCode(digit.charCodeAt(0) + 0xfee0))
+    .join("");
+  const result = extractAndRedactSensitiveText(
+    `ｈｔｔｐｓ：／／ｍｅｅｔ．ｇｏｏｇｌｅ．ｃｏｍ／ａｂｃ－ｄｅｆ ＜＠${fullwidthDiscordId}＞ ｔｅｓｔ＠ｅｘａｍｐｌｅ．ｃｏｍ`,
+  );
+  assert.equal(result.urls.length, 1);
+  assert.equal(result.sanitizedText.includes("meet.google.com"), false);
+  assert.equal(result.sanitizedText.includes(DISCORD_ID), false);
+  assert.equal(result.sanitizedText.includes("test@example.com"), false);
+  assert.doesNotThrow(() => assertSafeForAi(result.sanitizedText));
+});
+
 test("https以外や認証情報入りURLを拒否する", () => {
   assert.throws(() => normalizeMeetingUrl("http://meet.example.com/room"), /https/u);
   assert.throws(() => normalizeMeetingUrl("https://user:pass@example.com/room"), /認証情報/u);

@@ -1,5 +1,25 @@
-function meetingIdFrom(text) {
-  return text.match(/(?:^|[\s#])([A-Z0-9]{8})(?=$|[\s、。.!！?？:：のをへで])/iu)?.[1]?.toUpperCase() || null;
+import { extractMeetingId } from "./meeting-id.mjs";
+
+function hasUrlLike(text) {
+  return /(?:https?:\/\/|www\.)\S+/iu.test(text);
+}
+
+function isBareUrl(text) {
+  const urls = String(text).match(/(?:https?:\/\/|www\.)\S+/giu) || [];
+  if (urls.length !== 1) return false;
+  const remainder = String(text)
+    .replace(urls[0], "")
+    .replace(/[\s「」『』【】()（）,，、。!！?？~〜]+/gu, "")
+    .trim();
+  return !remainder || /^(?:これ|こちら|こっち)(?:です|ね)?$/u.test(remainder);
+}
+
+function isMeetingUrlUpdate(text) {
+  if (/(?:新しい|新規|新しく).*(?:会議|予定|作成|登録|追加)|(?:会議|予定).*(?:作成|登録|追加|作って)/u.test(text)) return false;
+  return /\bmeeting\s+url\b/iu.test(text)
+    || /(?:会議)?(?:URL|リンク).*(?:変更|更新|差し替え|差し換え|変えて|直して)/iu.test(text)
+    || /(?:変更|更新|差し替え|差し換え|変えて|直して).*(?:会議)?(?:URL|リンク)/iu.test(text)
+    || /この\s*(?:URL|リンク)\s*(?:に|へ)?\s*(?:して|変更|差し替え|差し換え)/iu.test(text);
 }
 
 function capturedAlias(text, patterns) {
@@ -30,9 +50,12 @@ export function parseGuildNaturalCommand(rawText) {
     .replace(/\s+/gu, " ")
     .trim();
   if (!text) return { action: "help" };
-  const meetingId = meetingIdFrom(text);
+  const meetingId = extractMeetingId(text);
 
   if (isHelpIntent(text)) return { action: "help" };
+  if (isBareUrl(text) || isMeetingUrlUpdate(text)) {
+    return { action: "meeting_url_update", meetingId, hasMeetingUrl: hasUrlLike(text) };
+  }
   if (/自分の(?:個別)?通知設定|個人通知設定|マイ通知/u.test(text) && /(?:見せて|確認|表示|どうなって)/u.test(text)) {
     return { action: "my_reminders_show" };
   }

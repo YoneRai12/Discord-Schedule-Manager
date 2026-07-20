@@ -32,11 +32,11 @@ export function normalizeMeetingUrl(value) {
 
 export function containsUrlLike(text) {
   URL_CANDIDATE_RE.lastIndex = 0;
-  return URL_CANDIDATE_RE.test(String(text ?? ""));
+  return URL_CANDIDATE_RE.test(String(text ?? "").normalize("NFKC"));
 }
 
 export function assertSafeForAi(text) {
-  const value = String(text ?? "");
+  const value = String(text ?? "").normalize("NFKC");
   if (containsUrlLike(value)) throw new Error("AI送信前の本文にURLが残っています");
   if (DISCORD_MENTION_RE.test(value) || DISCORD_ID_RE.test(value)) {
     DISCORD_MENTION_RE.lastIndex = 0;
@@ -45,11 +45,17 @@ export function assertSafeForAi(text) {
   }
   DISCORD_MENTION_RE.lastIndex = 0;
   DISCORD_ID_RE.lastIndex = 0;
+  EMAIL_RE.lastIndex = 0;
+  if (EMAIL_RE.test(value)) {
+    EMAIL_RE.lastIndex = 0;
+    throw new Error("AI送信前の本文にメールアドレスが残っています");
+  }
+  EMAIL_RE.lastIndex = 0;
 }
 
 export function extractAndRedactSensitiveText(rawText) {
   const urls = [];
-  let sanitizedText = String(rawText ?? "").replace(URL_CANDIDATE_RE, (candidate) => {
+  let sanitizedText = String(rawText ?? "").normalize("NFKC").replace(URL_CANDIDATE_RE, (candidate) => {
     const { url, trailing } = splitTrailingPunctuation(candidate);
     try {
       urls.push(normalizeMeetingUrl(url));

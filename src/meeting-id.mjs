@@ -1,0 +1,55 @@
+import crypto from "node:crypto";
+
+// 0/O, 1/I/L を除き、Discord上で読み違えにくい文字だけを新規IDに使う。
+export const MEETING_ID_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+export const MEETING_ID_LENGTH = 8;
+export const LEGACY_MEETING_ID_MIN_LENGTH = 7;
+const STANDALONE_ID_STOPWORDS = new Set(["CALENDAR", "DISCORD", "MEETING", "REGISTER", "REMINDER"]);
+
+export function normalizeMeetingId(value, { required = true } = {}) {
+  const id = String(value ?? "").normalize("NFKC").trim().toUpperCase().replace(/^#/, "");
+  if (/^[A-Z0-9]{7,8}$/u.test(id)) return id;
+  if (!required) return null;
+  throw new Error("会議IDは7〜8文字で指定してください");
+}
+
+export function extractMeetingId(rawText) {
+  const text = String(rawText ?? "").normalize("NFKC");
+  const labelled = text.match(/(?<![A-Z0-9])(?:meeting\s*)?id\s*[:：=#]?\s*([A-Z0-9]{7,8})(?=$|[\s、。.!！?？:：のをへで])/iu);
+  if (labelled) return normalizeMeetingId(labelled[1], { required: false });
+  // ラベルなしはBotが表示する大文字表記だけを受け、英単語の誤認を避ける。
+  const standalone = text.match(/(?:^|[\s#])([A-Z0-9]{7,8})(?=$|[\s、。.!！?？:：のをへで])/u);
+  if (!standalone || STANDALONE_ID_STOPWORDS.has(standalone[1])) return null;
+  return normalizeMeetingId(standalone[1], { required: false });
+}
+
+export function redactMeetingId(rawText, meetingId = extractMeetingId(rawText)) {
+  const text = String(rawText ?? "").normalize("NFKC");
+  const id = normalizeMeetingId(meetingId, { required: false });
+  if (!id) return text;
+  const pattern = new RegExp(`(^|[^A-Z0-9])${id}(?=$|[^A-Z0-9])`, "giu");
+  return text.replace(pattern, (_whole, prefix) => `${prefix}[MEETING_ID]`);
+}
+
+function randomMeetingId(randomBytes = crypto.randomBytes) {
+  const output = [];
+  while (output.length < MEETING_ID_LENGTH) {
+    const bytes = randomBytes(MEETING_ID_LENGTH - output.length + 4);
+    for (const byte of bytes) {
+      // Rejection sampling avoids modulo bias because the alphabet is not a power of two.
+      const usableRange = Math.floor(256 / MEETING_ID_ALPHABET.length) * MEETING_ID_ALPHABET.length;
+      if (byte >= usableRange) continue;
+      output.push(MEETING_ID_ALPHABET[byte % MEETING_ID_ALPHABET.length]);
+      if (output.length === MEETING_ID_LENGTH) break;
+    }
+  }
+  return output.join("");
+}
+
+export function generateMeetingId({ exists = () => false, randomBytes = crypto.randomBytes, maxAttempts = 32 } = {}) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const id = randomMeetingId(randomBytes);
+    if (!exists(id)) return id;
+  }
+  throw new Error("会議IDを生成できませんでした");
+}

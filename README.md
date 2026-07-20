@@ -23,7 +23,7 @@ Discordだけで会議の登録、参加者へのDM、出欠集計、個人別�
 
 ## すぐに試す
 
-必要なものはNode.js 24以上と、新規Discord Application / Botです。自然言語で会議を作成・更新する場合だけOpenAI APIキーを使います。
+必要なものはNode.js 24以上と、新規Discord Application / Botです。自然言語で会議を作成・更新する場合は、OpenAI API（既定）または実験的なCodex App Serverを選びます。
 
 ```powershell
 git clone https://github.com/OWNER/YoteiKanriDiscordBOT.git
@@ -32,15 +32,26 @@ npm.cmd install
 Copy-Item -LiteralPath ".env.example" -Destination ".env"
 ```
 
-`.env`へ最低限次の3項目を設定します。値をREADME、Issue、コミットへ貼らないでください。
+OpenAI APIを使う場合、`.env`へ次を設定します。値をREADME、Issue、コミットへ貼らないでください。
 
 ```env
 DISCORD_BOT_TOKEN=
 DISCORD_GUILD_ID=
+MEETING_AI_PROVIDER=openai
 OPENAI_API_KEY=
 OPENAI_MEETING_MODEL=gpt-5.6-terra
 OPENAI_REASONING_EFFORT=medium
 ```
+
+ChatGPT ProのCodex SparkをこのPCだけで試す場合は、Codex CLIへChatGPTログインしたうえで次へ切り替えられます。App Serverは外部ポートを開かずstdioだけを使い、要求を直列化し、一時thread・read-only・承認なしで動かします。Bot専用の一時`CODEX_HOME`と空の作業フォルダーを作り、ChatGPT認証と対象モデル1件の検査済みカタログ情報だけを移します。普段のCodex設定・MCP・plugins・skills・memoriesは引き継がず、shell・web検索・アプリ・フック・サブエージェントも無効化します。子プロセスへDiscord、Sheets、OpenAI APIの秘密環境変数は継承しません。一時認証フォルダーは終了時に削除し、Windowsで一時的にロックされた場合も再試行します。
+
+```env
+MEETING_AI_PROVIDER=codex_app_server
+CODEX_MEETING_MODEL=gpt-5.3-codex-spark
+CODEX_REASONING_EFFORT=medium
+```
+
+SparkはChatGPT Pro限定のCoding向けresearch previewで、利用上限があります。常駐BOTでの可用性が保証されたAPIではないため、安定運用では`openai`を推奨します。またApp Serverはローカル窓口ですが推論文はOpenAIへ送信されます。このBotはどちらを選んでもURL・実名対応・Discord ID・会議IDを送信前に除去します。
 
 起動します。
 
@@ -93,13 +104,26 @@ Discord Developer Portalで専用Applicationを作成し、Botを追加します
 
 ## 会議を登録する
 
+会議名・日時・固定メンバー・URLは、順番をそろえたり定型文にしたりする必要はありません。登録済みの呼び名やDiscordメンションはローカルで参加者へ変換し、残りの文章からAIが会議名と日時を整理します。
+
 ```text
-@予定管理 来週月曜20時30分から全体定例を1時間。
-URL: https://meet.example.com/team
-30分前と開始時にチャンネル通知して
+@予定管理 メンバーAとメンバーB 30分前 全体定例
+https://calendar.app.google/招待用トークン 来週月曜20時30分 1時間
 ```
 
-黄色い確認画面で日時、URLが登録済みであること、個別DMの相手を確認して「登録する」を押します。
+Googleカレンダーの招待URLを送った場合は、Botが動くPCからGoogleへ直接アクセスし、ページ内のGoogle Meet URLをbest-effortで自動取得します。このページ内容やURLをOpenAIへは送りません。Google側の表示形式やログイン状態によって取得できない場合は、直接のMeet URLを貼ってください。直接のMeet・Zoom・Teams・Whereby・Jitsiなど、HTTPSの会議URLも使えます。直接URLはBotからアクセスせず、そのまま保存します。
+
+足りない必須項目があれば「開始日時が足りません」のように項目名を返します。会議名だけ無い場合は`会議 7/21 19:00`のような仮名を付け、黄色い確認画面で自動設定と明示します。日時、URLが登録済みであること、個別DMの相手を確認して「登録する」を押します。
+
+作成後にURLだけ直す場合、チャンネル内の開催予定が1件だけなら、`@予定管理`の後へURLだけ貼っても認識します。通常チャンネルでは誤作動を避けるため、会議カードへの返信でもBotの直接メンションが必要です。
+
+```text
+@予定管理 全体定例のリンクはこれ https://meet.google.com/会議コード
+```
+
+```text
+@予定管理 https://calendar.app.google/招待用トークン
+```
 
 別テンプレートを使う場合:
 
@@ -122,7 +146,7 @@ AIを使わず項目を直接入力する場合は`/meeting create`を使いま�
 | Slash Command | 通常チャンネルの例 | 利用者 |
 |---|---|---|
 | `create` | `来週月曜20:30から定例、URLは…` | 管理者 |
-| `url` | `MEET0001のURLを…へ変更` | 管理者 |
+| `url` | `@予定管理 URL`、複数候補なら会議カードへBotをメンションして返信 | 管理者 |
 | `list` | `今後の会議を見せて` | 全員 |
 | `status` | `MEET0001の出欠状況` | 全員 |
 | `cancel` | `MEET0001を中止して` | 管理者 |
@@ -160,19 +184,21 @@ AIを使わず項目を直接入力する場合は`/meeting create`を使いま�
 今後は毎回1時間前と10分前に通知して
 ```
 
-会議が複数ある場合は`MEET0001 参加`のように会議IDを付けます。DMだけでなく、通常チャンネルで`@予定管理 MEET0001の会議に参加します`と回答することもできます。公開チャンネルの確認返信には会議URLを再掲しません。
+会議が複数ある場合は`MEET0001 参加`のようにDMへ表示された会議IDを付けます。新しいIDは8文字で、修正前に作成された7文字IDもそのまま使えます。DMだけでなく、通常チャンネルで`@予定管理 MEET0001の会議に参加します`と回答することもできます。公開チャンネルの確認返信には会議URLを再掲しません。
 
 ## プライバシー設計
 
 自然言語の便利さを残しながら、識別情報とURLをAI入力から分離します。
 
 1. Discordメッセージをローカルで受信
-2. URL、Discordメンション、Discord ID、メールアドレス、登録済み呼び名、テンプレート名を抽出または伏せ字化
-3. URLや識別子が残っていないことを再検査
-4. 伏せ字本文と「URLがあるか」の真偽値だけをOpenAI Responses APIへ送信
-5. `store: false`を明示し、会議名・日時・通知時刻だけをJSON Schemaで受け取る
-6. AI出力にURLが含まれた場合は結果全体を破棄
-7. ローカルに退避したURLと結果を、管理者の確認後にSQLiteで結合
+2. URL、Discordメンション、Discord ID、会議ID、メールアドレス、登録済み呼び名、テンプレート名を抽出または伏せ字化
+3. Googleカレンダーの招待URLなら、許可したGoogleの2ホストだけをローカル取得して直接会議URLを抽出
+4. URLや識別子が残っていないことを再検査
+5. 伏せ字本文と「URLがあるか」の真偽値だけを、選択したAIプロバイダーからOpenAIへ送信
+6. OpenAI API経路は`store: false`を明示。Codex App Server経路は一時threadを使い、処理後に削除
+7. 会議名・日時・通知時刻だけをJSON Schemaで受け取る
+8. AI出力にURLが含まれた場合は結果全体を破棄
+9. ローカルに退避したURLと結果を、管理者の確認後にSQLiteで結合
 
 | 情報 | OpenAIへ送信 | 保存先 |
 |---|---:|---|
@@ -184,13 +210,17 @@ AIを使わず項目を直接入力する場合は`/meeting create`を使いま�
 | 出欠結果 | しない | SQLite、Discord、任意でSheets |
 | 伏せ字化後の会議名・日時・通知表現 | 自然言語作成・更新時のみ | API処理対象 |
 
-OpenAI APIの入出力は、組織またはプロジェクトがデータ共有へ明示的にオプトインしない限り、既定ではモデル学習に使われません。共有を有効にした場合は、その入出力が評価・学習に利用される場合があります。
+招待URLの自動取得はOpenAI APIではなく、BotのPCからGoogleカレンダーへの通常のHTTPS通信です。取得先は`calendar.app.google`と`calendar.google.com`に限定し、転送回数・応答サイズ・待ち時間を制限します。招待ページ本文は保存せず、抽出した直接会議URLだけをSQLiteへ保存します。これは非公開ページのHTMLを安全側に解析するbest-effort機能であり、Google Calendar APIの認証済み`hangoutLink`取得を保証するものではありません。
 
-`store:false`はResponses APIのResponseオブジェクト保存を無効にしますが、不正利用監視ログまで無効にするものではなく、Zero Data Retentionの保証でもありません。通常の不正利用監視ログにはプロンプトや応答が含まれる場合があり、既定では最大30日保持されます。ZDR / Modified Abuse Monitoringは対象顧客がOpenAIの承認を受ける別制度です。
+OpenAI APIの入出力は、組織またはプロジェクトがデータ共有へ明示的にオプトインしない限り、既定ではモデル学習に使われません。ただし、共有トラフィックや無料トークン特典を有効にしたAPIプロジェクトでは、共有した入出力が評価・学習に利用される場合があります。`store:false`を指定しても、このデータ共有設定をOFFにはできません。
+
+`store:false`はOpenAI API経路でResponses APIのResponseオブジェクト保存を無効にしますが、不正利用監視ログまで無効にするものではなく、Zero Data Retentionの保証でもありません。Codex App Server経路にはこのAPIフィールドはなく、一時threadの削除とChatGPT側のデータコントロールを使います。通常のAPI不正利用監視ログにはプロンプトや応答が含まれる場合があり、既定では最大30日保持されます。ZDR / Modified Abuse Monitoringは対象顧客がOpenAIの承認を受ける別制度です。
 
 `gpt-5.6-terra`は通常はAPI従量課金です。OpenAIの共有トラフィック特典へ登録済みの対象組織では無料トークン対象ですが、対象プロジェクトでの共有有効化、正のAPI残高、日次上限内であることが必要です。上限超過分は通常料金になります。最新条件はOpenAI公式の[データ共有特典](https://help.openai.com/en/articles/10306912-sharing-feedback-evaluation-and-fine-tuning-data-and-api-inputs-and-outputs-with-openai)と[API料金表](https://developers.openai.com/api/docs/pricing)を確認してください。
 
-そのため、このBotはデータ共有設定に頼らず、URLやDiscord識別子をAIへ送らない構成にしています。会議名そのものも外部APIへ出せない場合は、AIを使わない`/meeting create`と`/meeting url`を使ってください。詳細はOpenAI公式の[データ管理ガイド](https://developers.openai.com/api/docs/guides/your-data)、[Responses APIの保存説明](https://developers.openai.com/api/docs/guides/conversation-state)、[APIデータ利用方針](https://help.openai.com/en/articles/5722486-api-data-usage-policies)を確認してください。
+ChatGPTサブスクリプション認証を使うCodex App Server側は、APIプロジェクトの共有設定とは別にChatGPTのデータコントロールが適用されます。「すべての人のためにモデルを改善する」をOFFにしている場合でも推論文はOpenAIへ送られるため、Bot側の伏せ字化は同じように行います。
+
+そのため、このBotはデータ共有設定に頼らず、URLやDiscord識別子をAIへ送らない構成にしています。会議名そのものもOpenAIへ出せない場合は、AIを使わない`/meeting create`と`/meeting url`を使ってください。詳細はOpenAI公式の[データ管理ガイド](https://developers.openai.com/api/docs/guides/your-data)、[Responses APIの保存説明](https://developers.openai.com/api/docs/guides/conversation-state)、[APIデータ利用方針](https://help.openai.com/en/articles/5722486-api-data-usage-policies)を確認してください。
 
 ## Google Sheets連携
 

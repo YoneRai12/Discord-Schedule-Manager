@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { normalizeMeetingId } from "./meeting-id.mjs";
 import { assertSafeForAi, containsUrlLike, safeDisplayText } from "./privacy.mjs";
 import { normalizeReminderMinutes, parseJstDateTime } from "./time.mjs";
 
@@ -50,10 +51,16 @@ export const MEETING_EXTRACTION_SCHEMA = {
 const SYSTEM_PROMPT = `
 あなたはDiscord会議管理Botの入力整形器です。ユーザーの日本語を会議作成または更新の構造化データへ変換します。
 
+入力規則:
+- 会議名、日時、通知、操作語は順不同で、句読点なし・単語の羅列・くだけた日本語でも意味から整理してください。
+- 参加者名、Discordメンション、会議ID、URLはBotが先にローカル分離し、プレースホルダーへ置換する場合があります。
+- 明確な会議名がないとき、参加者名や日時を会議名として捏造せず title=null にしてください。Botが確認可能な仮名を付けます。
+
 安全上の絶対条件:
 - URLそのものは入力されません。[URL_REDACTED] と hasMeetingUrl だけを参照してください。
 - URLを生成、推測、復元、出力しないでください。
 - DiscordのユーザーID、サーバーID、チャンネルIDを要求・生成しないでください。
+- [MEMBER_ALIAS]、[MEMBERS_REDACTED]、[MEETING_ID] の実値を推測・復元しないでください。
 
 日時規則:
 - 基準日時とタイムゾーンは入力JSONにあります。
@@ -64,11 +71,12 @@ const SYSTEM_PROMPT = `
 
 action規則:
 - 新しい会議を登録する依頼は create。
-- 表示された8文字の会議IDを指定して内容やURLを変える依頼は update。
+- 既存の会議について、内容やURLを変える依頼は update。会議IDがなくても「さっきの会議」「全体MTGはこっち」のような表現から更新意図を判定します。
+- 会議IDが入力にない場合は推測せず meetingId=null にしてください。対象会議はBotが返信先・会議名・ローカル保存情報から安全に決めます。
 - 会議操作でない、意図が曖昧、または作成か更新か判別できない場合は unknown。
 - providedFields はユーザーが明示的に指定・変更した項目だけ。URLがある場合は meetingUrl を含めます。
 - create の不足候補は title, startsAt, meetingUrl。
-- update の不足候補は meetingId, requestedChanges。
+- update の不足候補は requestedChanges。meetingIdの不足はBotがローカルで解決するため、不足項目にしません。
 - clarification は不足や矛盾を一文で尋ねる場合だけ設定します。
 `.trim();
 
@@ -80,11 +88,6 @@ function parseResponseText(response) {
     }
   }
   return "";
-}
-
-function normalizeMeetingId(value) {
-  const id = String(value ?? "").trim().toUpperCase().replace(/^#/, "");
-  return /^[A-Z0-9]{8}$/u.test(id) ? id : null;
 }
 
 export function validateInterpretation(
@@ -122,7 +125,7 @@ export function validateInterpretation(
     ? raw.durationMinutes
     : defaultDurationMinutes;
   const reminderMinutes = normalizeReminderMinutes(raw.reminderMinutes, defaultReminderMinutes);
-  const meetingId = normalizeMeetingId(raw.meetingId);
+  const meetingId = normalizeMeetingId(raw.meetingId, { required: false });
   const missingFields = [];
 
   if (action === "create") {
@@ -130,7 +133,6 @@ export function validateInterpretation(
     if (startsAtMs == null) missingFields.push("startsAt");
     if (!hasMeetingUrl) missingFields.push("meetingUrl");
   } else if (action === "update") {
-    if (!meetingId) missingFields.push("meetingId");
     const updateFields = [...providedFields].filter((field) => (
       field === "meetingUrl"
       || (field === "title" && title)
@@ -165,8 +167,10 @@ export class MeetingInterpreter {
     defaultDurationMinutes = 60,
     defaultReminderMinutes = [30, 0],
     client = null,
+    provider = null,
   }) {
     this.client = client || (apiKey ? new OpenAI({ apiKey }) : null);
+    this.provider = provider;
     this.model = model;
     this.reasoningEffort = reasoningEffort;
     this.maxOutputTokens = maxOutputTokens;
@@ -176,11 +180,19 @@ export class MeetingInterpreter {
   }
 
   get configured() {
-    return Boolean(this.client);
+    return Boolean(this.provider?.configured || this.client);
+  }
+
+  async initialize() {
+    await this.provider?.initialize?.();
+  }
+
+  close() {
+    this.provider?.close?.();
   }
 
   async interpret({ sanitizedText, hasMeetingUrl, nowMs = Date.now() }) {
-    if (!this.client) throw new Error("OPENAI_API_KEY が設定されていません");
+    if (!this.configured) throw new Error("会議AIプロバイダーが設定されていません");
     assertSafeForAi(sanitizedText);
     const userPayload = {
       messageText: sanitizedText,
@@ -189,25 +201,37 @@ export class MeetingInterpreter {
       timeZone: this.timeZone,
       defaultReminderMinutes: this.defaultReminderMinutes,
     };
-    const response = await this.client.responses.create({
-      model: this.model,
-      reasoning: { effort: this.reasoningEffort },
-      store: false,
-      max_output_tokens: this.maxOutputTokens,
-      input: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: JSON.stringify(userPayload) },
-      ],
-      text: {
-        format: {
-          type: "json_schema",
-          name: "meeting_extraction",
-          strict: true,
-          schema: MEETING_EXTRACTION_SCHEMA,
+    let outputText;
+    if (this.provider) {
+      outputText = String(await this.provider.generateStructured({
+        systemPrompt: SYSTEM_PROMPT,
+        userPayload,
+        outputSchema: MEETING_EXTRACTION_SCHEMA,
+        model: this.model,
+        reasoningEffort: this.reasoningEffort,
+        maxOutputTokens: this.maxOutputTokens,
+      })).trim();
+    } else {
+      const response = await this.client.responses.create({
+        model: this.model,
+        reasoning: { effort: this.reasoningEffort },
+        store: false,
+        max_output_tokens: this.maxOutputTokens,
+        input: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: JSON.stringify(userPayload) },
+        ],
+        text: {
+          format: {
+            type: "json_schema",
+            name: "meeting_extraction",
+            strict: true,
+            schema: MEETING_EXTRACTION_SCHEMA,
+          },
         },
-      },
-    });
-    const outputText = parseResponseText(response).trim();
+      });
+      outputText = parseResponseText(response).trim();
+    }
     if (!outputText) throw new Error("AIから構造化結果が返りませんでした");
     let parsed;
     try {

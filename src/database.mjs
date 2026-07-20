@@ -1,8 +1,8 @@
-import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { normalizeMemberAlias } from "./participants.mjs";
+import { generateMeetingId, normalizeMeetingId } from "./meeting-id.mjs";
 import { AttendanceTemplateRepository } from "./storage/attendance-template-repository.mjs";
 import { migrateFeatureSchema } from "./storage/feature-schema.mjs";
 import { PersonalReminderRepository } from "./storage/personal-reminder-repository.mjs";
@@ -208,16 +208,12 @@ export class MeetingDatabase {
   }
 
   generateMeetingId() {
-    for (let attempt = 0; attempt < 20; attempt += 1) {
-      const id = crypto.randomBytes(5).toString("base64url").replace(/[-_]/gu, "A").toUpperCase().slice(0, 8);
-      if (!this.getMeeting(id)) return id;
-    }
-    throw new Error("会議IDを生成できませんでした");
+    return generateMeetingId({ exists: (id) => Boolean(this.getMeeting(id)) });
   }
 
   createMeeting(input) {
     const now = Date.now();
-    const id = input.id || this.generateMeetingId();
+    const id = input.id ? normalizeMeetingId(input.id) : this.generateMeetingId();
     const reminders = normalizeReminderMinutes(input.reminderMinutes);
     this.transaction(() => {
       this.db.prepare(`
@@ -270,6 +266,8 @@ export class MeetingDatabase {
       meetingUrl: patch.meetingUrl ?? current.meetingUrl,
       reminderMinutes: normalizeReminderMinutes(patch.reminderMinutes ?? current.reminderMinutes),
     };
+    const startsAtChanged = next.startsAtMs !== current.startsAtMs;
+    const remindersChanged = JSON.stringify(next.reminderMinutes) !== JSON.stringify(current.reminderMinutes);
     this.transaction(() => {
       this.db.prepare(`
         UPDATE meetings
@@ -285,20 +283,34 @@ export class MeetingDatabase {
         Date.now(),
         id,
       );
-      this.replacePendingDeliveries(id, next.startsAtMs, next.reminderMinutes, everyoneOffsets);
+      if (startsAtChanged || remindersChanged) {
+        this.replacePendingDeliveries(id, next.startsAtMs, next.reminderMinutes, everyoneOffsets);
+      }
     });
-    for (const invitee of this.listMeetingInvitees(id)) {
-      const personal = this.personalReminders.getMeetingReminders(id, invitee.userId);
-      if (!personal) continue;
-      this.personalReminders.replaceMeetingReminders({
-        meetingId: id,
-        userId: invitee.userId,
-        startsAtMs: next.startsAtMs,
-        minutes: personal.minutes,
-        source: personal.source,
-      });
+    if (startsAtChanged) {
+      for (const invitee of this.listMeetingInvitees(id)) {
+        const personal = this.personalReminders.getMeetingReminders(id, invitee.userId);
+        if (!personal) continue;
+        this.personalReminders.replaceMeetingReminders({
+          meetingId: id,
+          userId: invitee.userId,
+          startsAtMs: next.startsAtMs,
+          minutes: personal.minutes,
+          source: personal.source,
+        });
+      }
     }
     return this.getMeeting(id);
+  }
+
+  updateMeetingUrl(id, meetingUrl) {
+    const normalizedId = normalizeMeetingId(id);
+    const current = this.getMeeting(normalizedId);
+    if (!current) throw new Error("会議が見つかりません");
+    if (current.status !== "active") throw new Error("終了または中止済みの会議は更新できません");
+    this.db.prepare("UPDATE meetings SET meeting_url = ?, updated_at_ms = ? WHERE id = ?")
+      .run(String(meetingUrl), Date.now(), normalizedId);
+    return this.getMeeting(normalizedId);
   }
 
   setMessageId(id, messageId) {
@@ -323,12 +335,45 @@ export class MeetingDatabase {
     return mapMeeting(this.db.prepare("SELECT * FROM meetings WHERE id = ?").get(String(id).toUpperCase()));
   }
 
+  getMeetingByMessageId(guildId, channelId, messageId) {
+    if (!messageId) return null;
+    const row = channelId
+      ? this.db.prepare(`
+          SELECT * FROM meetings
+          WHERE guild_id = ? AND channel_id = ? AND message_id = ?
+          LIMIT 1
+        `).get(String(guildId), String(channelId), String(messageId))
+      : this.db.prepare(`
+          SELECT * FROM meetings
+          WHERE guild_id = ? AND message_id = ?
+          LIMIT 1
+        `).get(String(guildId), String(messageId));
+    return mapMeeting(row);
+  }
+
   listUpcoming(guildId, { limit = 20, nowMs = Date.now() } = {}) {
     return this.db.prepare(`
       SELECT * FROM meetings
       WHERE guild_id = ? AND status = 'active' AND ends_at_ms >= ?
       ORDER BY starts_at_ms ASC LIMIT ?
     `).all(String(guildId), nowMs, limit).map(mapMeeting);
+  }
+
+  listActiveMeetingsByChannel(guildId, channelId, { limit = 20, nowMs = Date.now() } = {}) {
+    return this.db.prepare(`
+      SELECT * FROM meetings
+      WHERE guild_id = ? AND channel_id = ? AND status = 'active' AND ends_at_ms >= ?
+      ORDER BY starts_at_ms ASC, created_at_ms DESC LIMIT ?
+    `).all(String(guildId), String(channelId), nowMs, limit).map(mapMeeting);
+  }
+
+  listRecentActiveMeetingsByCreator(guildId, channelId, createdById, { limit = 5, nowMs = Date.now() } = {}) {
+    return this.db.prepare(`
+      SELECT * FROM meetings
+      WHERE guild_id = ? AND channel_id = ? AND created_by_id = ?
+        AND status = 'active' AND ends_at_ms >= ?
+      ORDER BY created_at_ms DESC, updated_at_ms DESC LIMIT ?
+    `).all(String(guildId), String(channelId), String(createdById), nowMs, limit).map(mapMeeting);
   }
 
   setMemberAlias(guildId, { alias, userId, displayName, createdById }) {

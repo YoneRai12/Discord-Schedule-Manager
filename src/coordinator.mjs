@@ -11,8 +11,12 @@ import {
 import { buildMeetingCommand } from "./commands.mjs";
 import { buildDirectConfirmationPayload, buildDraftPayload, buildMeetingPayload } from "./discord-ui.mjs";
 import { parseGuildNaturalCommand } from "./local-command-router.mjs";
+import { extractMeetingId, normalizeMeetingId, redactMeetingId } from "./meeting-id.mjs";
+import { MeetingTargetResolver } from "./meeting-target-resolver.mjs";
+import { resolveMeetingUrl } from "./meeting-url-resolver.mjs";
 import { resolveParticipantSnapshot } from "./participant-resolution.mjs";
 import {
+  extractKnownMemberAliases,
   extractParticipantDirective,
   parseMemberAliasList,
   redactKnownMemberAliases,
@@ -41,15 +45,43 @@ const MISSING_LABELS = {
 };
 const RSVP_LABELS = { attending: "参加", maybe: "未定", declined: "欠席" };
 const MAX_MEETING_INVITEES = 20;
+const CALENDAR_INVITATION_HOSTS = new Set(["calendar.app.google", "calendar.google.com"]);
 
 function shortErrorCode(error) {
   return String(error?.code || error?.status || error?.name || "unknown").slice(0, 80);
 }
 
-function normalizeMeetingId(value) {
-  const id = String(value ?? "").trim().toUpperCase().replace(/^#/, "");
-  if (!/^[A-Z0-9]{8}$/u.test(id)) throw new Error("会議IDは8文字で指定してください");
-  return id;
+function urlHostname(value) {
+  try {
+    return new URL(value).hostname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function isCalendarInvitationUrl(value) {
+  return CALENDAR_INVITATION_HOSTS.has(urlHostname(value));
+}
+
+function chooseOneMeetingUrl(values) {
+  const candidates = [...new Set(values.filter(Boolean))];
+  if (candidates.length > 1) {
+    throw new Error("会議URLが複数あり、1つに決められませんでした。使う会議URLを1つだけ送ってください");
+  }
+  return candidates[0] || null;
+}
+
+function automaticMeetingTitle(startsAtMs, timeZone = "Asia/Tokyo") {
+  const parts = new Intl.DateTimeFormat("ja-JP", {
+    timeZone,
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(startsAtMs));
+  const value = (type) => parts.find((part) => part.type === type)?.value || "";
+  return `会議 ${value("month")}/${value("day")} ${value("hour")}:${value("minute")}`;
 }
 
 function displayName(subject) {
@@ -77,15 +109,26 @@ function discordUserDisplayName(user, member = null) {
 }
 
 export class MeetingCoordinator {
-  constructor({ client, store, interpreter, sheetsSync, config, directMessenger = null, logger = console }) {
+  constructor({
+    client,
+    store,
+    interpreter,
+    sheetsSync,
+    config,
+    directMessenger = null,
+    meetingUrlResolver = resolveMeetingUrl,
+    logger = console,
+  }) {
     this.client = client;
     this.store = store;
     this.interpreter = interpreter;
     this.sheetsSync = sheetsSync;
     this.config = config;
     this.directMessenger = directMessenger;
+    this.meetingUrlResolver = meetingUrlResolver;
     this.logger = logger;
     this.drafts = new Map();
+    this.meetingTargets = new MeetingTargetResolver({ store });
     this.selfService = new SelfServiceController({
       store,
       guildId: config.guildId,
@@ -132,6 +175,99 @@ export class MeetingCoordinator {
     const draft = { ...value, draftId, expiresAtMs: Date.now() + 10 * 60_000 };
     this.drafts.set(draftId, draft);
     return draft;
+  }
+
+  async resolveSubmittedMeetingUrl(rawUrls) {
+    const normalized = [...new Set((rawUrls || []).map((value) => normalizeMeetingUrl(value)))];
+    if (!normalized.length) throw new Error("会議URLを1つ送ってください");
+
+    const resolved = [];
+    for (const value of normalized) {
+      resolved.push(normalizeMeetingUrl(await this.meetingUrlResolver(value)));
+    }
+    return chooseOneMeetingUrl(resolved);
+  }
+
+  meetingTargetCandidatesText(result) {
+    const candidates = result?.candidates || [];
+    return [
+      "更新する会議を1つに絞れませんでした。次のどれかの会議カードへ返信して、同じ内容を送ってください。",
+      ...candidates.map((meeting) => `• **${safeDisplayText(meeting.title, 70)}** — ${discordTimestamp(meeting.startsAtMs, "F")}`),
+    ].join("\n");
+  }
+
+  async createNaturalUrlUpdateDraft(message, rawText, replyText) {
+    let extracted;
+    try {
+      extracted = extractAndRedactSensitiveText(rawText);
+    } catch {
+      throw new Error("URLを安全に読み取れませんでした。会議URLを1つだけ送ってください");
+    }
+    if (!extracted.urls.length) throw new Error("新しい会議URLまたはGoogleカレンダーの招待URLを送ってください");
+
+    const target = this.meetingTargets.resolve({
+      guildId: message.guildId,
+      channelId: message.channelId,
+      authorId: message.author.id,
+      rawText,
+      replyMessageId: message.reference?.messageId || null,
+    });
+    if (target.status === "ambiguous") {
+      await replyText(this.meetingTargetCandidatesText(target));
+      return;
+    }
+    if (target.status !== "resolved") {
+      await replyText("更新する会議を見つけられませんでした。会議カードへ返信するか、会議名を含めてもう一度送ってください。");
+      return;
+    }
+
+    const meetingUrl = await this.resolveSubmittedMeetingUrl(extracted.urls);
+    const meeting = target.meeting;
+    const draft = this.createDraft({
+      action: "update",
+      meetingId: meeting.id,
+      guildId: meeting.guildId,
+      channelId: meeting.channelId,
+      creatorId: message.author.id,
+      creatorName: displayName(message),
+      title: meeting.title,
+      startsAtMs: meeting.startsAtMs,
+      endsAtMs: meeting.endsAtMs,
+      reminderMinutes: meeting.reminderMinutes,
+      meetingUrl,
+      urlOnly: true,
+    });
+    const preview = await message.reply({
+      ...buildDraftPayload(draft),
+      allowedMentions: { parse: [], repliedUser: false },
+    });
+    draft.previewMessageId = preview.id;
+  }
+
+  async repairActiveInvitationUrls({ limit = 10, maxDurationMs = 45_000 } = {}) {
+    let repaired = 0;
+    let failed = 0;
+    let skippedByDeadline = 0;
+    const deadline = Date.now() + Math.max(1_000, Number(maxDurationMs) || 45_000);
+    const meetings = this.store.listUpcoming(this.config.guildId, { limit });
+    for (const meeting of meetings) {
+      if (!isCalendarInvitationUrl(meeting.meetingUrl)) continue;
+      if (Date.now() >= deadline) {
+        skippedByDeadline += 1;
+        continue;
+      }
+      try {
+        const directUrl = await this.resolveSubmittedMeetingUrl([meeting.meetingUrl]);
+        this.store.updateMeetingUrl(meeting.id, directUrl);
+        repaired += 1;
+        await this.refreshMeetingCard(this.store.getMeeting(meeting.id)).catch(() => {});
+      } catch (error) {
+        failed += 1;
+        this.logger.warn(`[meeting-url] 招待URLの自動修復失敗 code=${shortErrorCode(error)}`);
+      }
+    }
+    if (repaired) this.sheetsSync?.requestSync();
+    return { repaired, failed, skippedByDeadline };
   }
 
   resolveInvitees({ guildId, aliases = [], users = [] }) {
@@ -213,13 +349,21 @@ export class MeetingCoordinator {
     const templateReference = extractTemplateReference(rawText);
     const directive = extractParticipantDirective(templateReference.cleanedText);
     const registered = this.store.listMemberAliases(message.guildId);
+    const detectedAliases = extractKnownMemberAliases(
+      templateReference.cleanedText,
+      registered.map((member) => member.alias),
+    );
     const users = [...message.mentions.users.values()]
       .filter((user) => user.id !== this.client.user?.id);
     return {
       cleanedText: directive.cleanedText,
       knownAliases: registered.map((member) => member.alias),
-      explicitInvitees: this.resolveInvitees({ guildId: message.guildId, aliases: directive.aliases, users }),
-      explicitParticipantsFound: Boolean(directive.found || users.length),
+      explicitInvitees: this.resolveInvitees({
+        guildId: message.guildId,
+        aliases: [...new Set([...directive.aliases, ...detectedAliases])],
+        users,
+      }),
+      explicitParticipantsFound: Boolean(directive.found || detectedAliases.length || users.length),
       templateName: templateReference.templateName,
       disableInvites: directive.disableInvites,
     };
@@ -275,7 +419,7 @@ export class MeetingCoordinator {
 
     if (!(await this.requireManager(message, replyText))) return;
     if (!this.interpreter.configured) {
-      await replyText("自然言語での会議作成・更新には `OPENAI_API_KEY` が必要です。設定までは `/meeting create` で登録できます。テンプレートや出欠はAIなしで利用できます。");
+      await replyText("自然言語での会議作成・更新には会議AIプロバイダーの設定が必要です。設定までは `/meeting create` で登録できます。テンプレートや出欠はAIなしで利用できます。");
       return;
     }
 
@@ -291,13 +435,13 @@ export class MeetingCoordinator {
     try {
       extracted = extractAndRedactSensitiveText(participantInput.cleanedText);
       extracted.sanitizedText = redactKnownMemberAliases(extracted.sanitizedText, participantInput.knownAliases);
+      extracted.sanitizedText = redactMeetingId(
+        extracted.sanitizedText,
+        extractMeetingId(participantInput.cleanedText),
+      );
       assertSafeForAi(extracted.sanitizedText);
     } catch {
       await replyText("URLを安全に分離できなかったため処理を止めました。URLと会議内容を分けてもう一度送ってください。");
-      return;
-    }
-    if (extracted.urls.length > 1) {
-      await replyText("会議URLが複数あります。誤登録を防ぐため、登録するURLを1つだけにしてもう一度送ってください。");
       return;
     }
     if (!extracted.sanitizedText) {
@@ -305,14 +449,24 @@ export class MeetingCoordinator {
       return;
     }
 
+    let meetingUrl = null;
+    if (extracted.urls.length) {
+      try {
+        meetingUrl = await this.resolveSubmittedMeetingUrl(extracted.urls);
+      } catch (error) {
+        await replyText(`会議URLを確認できませんでした: ${safeDisplayText(error.message, 220)}`);
+        return;
+      }
+    }
+
     let interpretation;
     try {
       interpretation = await this.interpreter.interpret({
         sanitizedText: extracted.sanitizedText,
-        hasMeetingUrl: extracted.urls.length === 1,
+        hasMeetingUrl: Boolean(meetingUrl),
       });
     } catch (error) {
-      this.logger.error(`[openai] 会議入力の整形に失敗 code=${shortErrorCode(error)}`);
+      this.logger.error(`[ai] 会議入力の整形に失敗 code=${shortErrorCode(error)}`);
       await replyText("会議内容のAI整形に失敗しました。URLはAIへ送信されていません。少し待つか `/meeting create` を使ってください。");
       return;
     }
@@ -321,14 +475,43 @@ export class MeetingCoordinator {
       await replyText(interpretation.clarification || `会議登録として解釈できませんでした。\n例: ${this.client.user} 来週月曜20:30から定例会議、URLは…`);
       return;
     }
+    if (interpretation.action === "create" && !interpretation.title && interpretation.startsAtMs != null) {
+      interpretation = {
+        ...interpretation,
+        title: automaticMeetingTitle(interpretation.startsAtMs, this.config.timeZone),
+        autoTitle: true,
+        missingFields: interpretation.missingFields.filter((field) => field !== "title"),
+      };
+    }
+    if (interpretation.action === "update" && !interpretation.meetingId) {
+      const target = this.meetingTargets.resolve({
+        guildId: message.guildId,
+        channelId: message.channelId,
+        authorId: message.author.id,
+        rawText,
+        replyMessageId: message.reference?.messageId || null,
+      });
+      if (target.status === "ambiguous") {
+        await replyText(this.meetingTargetCandidatesText(target));
+        return;
+      }
+      if (target.status !== "resolved") {
+        await replyText("更新する会議を見つけられませんでした。会議カードへ返信するか、会議名を含めてもう一度送ってください。");
+        return;
+      }
+      interpretation = {
+        ...interpretation,
+        meetingId: target.meeting.id,
+        missingFields: interpretation.missingFields.filter((field) => field !== "meetingId"),
+      };
+    }
     if (interpretation.missingFields.length) {
       const fields = interpretation.missingFields.map((field) => MISSING_LABELS[field] || field).join("、");
-      await replyText(`${interpretation.clarification ? `${interpretation.clarification}\n` : ""}不足項目: **${fields}**\n日時・会議名・URLを含めてもう一度送ってください。`);
+      await replyText(`足りない項目: **${fields}**\n元の内容に足りない内容を足して、まとめてもう一度送ってください。`);
       return;
     }
 
     try {
-      const meetingUrl = extracted.urls[0] ? normalizeMeetingUrl(extracted.urls[0]) : null;
       const participantSnapshot = this.resolveParticipantSelection({
         guildId: message.guildId,
         explicitInvitees: participantInput.explicitInvitees,
@@ -344,6 +527,7 @@ export class MeetingCoordinator {
           durationMinutes: interpretation.durationMinutes,
           reminderMinutes: interpretation.reminderMinutes,
           meetingUrl,
+          autoTitle: Boolean(interpretation.autoTitle),
           guildId: message.guildId,
           channelId: message.channelId,
           creatorId: message.author.id,
@@ -430,6 +614,10 @@ export class MeetingCoordinator {
 
   async handleNaturalManagerCommand(message, rawText, command, replyText) {
     try {
+      if (command.action === "meeting_url_update") {
+        await this.createNaturalUrlUpdateDraft(message, rawText, replyText);
+        return;
+      }
       if (command.action === "meeting_cancel") {
         const current = this.store.getMeeting(command.meetingId);
         if (!current || current.guildId !== message.guildId || current.status !== "active") {
@@ -548,7 +736,7 @@ export class MeetingCoordinator {
     }
   }
 
-  buildCreateDraft({ title, startsAtMs, durationMinutes, reminderMinutes, meetingUrl, guildId, channelId, creatorId, creatorName, invitees = [], participantSource = "none", templateName = null }) {
+  buildCreateDraft({ title, startsAtMs, durationMinutes, reminderMinutes, meetingUrl, guildId, channelId, creatorId, creatorName, invitees = [], participantSource = "none", templateName = null, autoTitle = false }) {
     if (!title || startsAtMs == null || !meetingUrl) throw new Error("会議名・開始日時・URLが必要です");
     const duration = durationMinutes || this.config.defaultDurationMinutes;
     return this.createDraft({
@@ -565,6 +753,7 @@ export class MeetingCoordinator {
       invitees,
       participantSource,
       templateName,
+      autoTitle,
     });
   }
 
@@ -591,6 +780,11 @@ export class MeetingCoordinator {
       invitees,
       participantSource,
       templateName,
+      urlOnly: fields.size === 1
+        && fields.has("meetingUrl")
+        && invitees.length === 0
+        && participantSource === "none"
+        && !templateName,
     });
   }
 
@@ -694,13 +888,15 @@ export class MeetingCoordinator {
   }
 
   async confirmUpdate(interaction, draft) {
-    const meeting = this.store.updateMeeting(draft.meetingId, {
-      title: draft.title,
-      startsAtMs: draft.startsAtMs,
-      endsAtMs: draft.endsAtMs,
-      meetingUrl: draft.meetingUrl,
-      reminderMinutes: draft.reminderMinutes,
-    }, { everyoneOffsets: this.config.everyoneOffsets });
+    const meeting = draft.urlOnly
+      ? this.store.updateMeetingUrl(draft.meetingId, draft.meetingUrl)
+      : this.store.updateMeeting(draft.meetingId, {
+        title: draft.title,
+        startsAtMs: draft.startsAtMs,
+        endsAtMs: draft.endsAtMs,
+        meetingUrl: draft.meetingUrl,
+        reminderMinutes: draft.reminderMinutes,
+      }, { everyoneOffsets: this.config.everyoneOffsets });
     const inviteBatch = draft.invitees?.length
       ? this.store.prepareMeetingInvitees(meeting.id, draft.invitees, draft.creatorId, {
         defaultReminderMinutes: this.config.personalDefaultReminders || [],
@@ -708,7 +904,7 @@ export class MeetingCoordinator {
       : { prepared: [], alreadySent: [] };
     await this.refreshMeetingCard(meeting);
     await interaction.editReply({
-      content: `✅ 会議 **${meeting.id}** を更新しました。`,
+      content: `✅ **${safeDisplayText(meeting.title, 100)}** の予定を更新しました。`,
       embeds: [],
       components: [],
       allowedMentions: { parse: [] },
@@ -905,6 +1101,14 @@ export class MeetingCoordinator {
   }
 
   async commandCreate(interaction) {
+    const rawUrl = interaction.options.getString("url", true);
+    let resolvingInvitation = false;
+    try {
+      resolvingInvitation = isCalendarInvitationUrl(normalizeMeetingUrl(rawUrl));
+    } catch {
+      // 入力エラーは下の共通エラー返信で案内する。
+    }
+    if (resolvingInvitation) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const start = parseJstDateTime(interaction.options.getString("start", true));
       if (start < Date.now() - 5 * 60_000) throw new Error("開始日時は現在より後にしてください");
@@ -922,7 +1126,7 @@ export class MeetingCoordinator {
         startsAtMs: start,
         durationMinutes: duration,
         reminderMinutes: reminders,
-        meetingUrl: normalizeMeetingUrl(interaction.options.getString("url", true)),
+        meetingUrl: await this.resolveSubmittedMeetingUrl([rawUrl]),
         guildId: interaction.guildId,
         channelId: interaction.channelId,
         creatorId: interaction.user.id,
@@ -931,13 +1135,28 @@ export class MeetingCoordinator {
         participantSource: participants.source,
         templateName: participants.templateName,
       });
-      await interaction.reply(buildDraftPayload(draft));
+      if (resolvingInvitation) {
+        await interaction.editReply({ content: "招待URLから会議URLを確認しました。確認画面をチャンネルへ表示します。" });
+        await interaction.followUp(buildDraftPayload(draft));
+      } else {
+        await interaction.reply(buildDraftPayload(draft));
+      }
     } catch (error) {
-      await interaction.reply({ content: safeDisplayText(error.message, 240), flags: MessageFlags.Ephemeral });
+      const payload = { content: safeDisplayText(error.message, 240), flags: MessageFlags.Ephemeral };
+      if (resolvingInvitation) await interaction.editReply({ content: payload.content });
+      else await interaction.reply(payload);
     }
   }
 
   async commandUrl(interaction) {
+    const rawUrl = interaction.options.getString("url", true);
+    let resolvingInvitation = false;
+    try {
+      resolvingInvitation = isCalendarInvitationUrl(normalizeMeetingUrl(rawUrl));
+    } catch {
+      // 入力エラーは下の共通エラー返信で案内する。
+    }
+    if (resolvingInvitation) await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     try {
       const id = normalizeMeetingId(interaction.options.getString("id", true));
       const meeting = this.store.getMeeting(id);
@@ -953,11 +1172,19 @@ export class MeetingCoordinator {
         startsAtMs: meeting.startsAtMs,
         endsAtMs: meeting.endsAtMs,
         reminderMinutes: meeting.reminderMinutes,
-        meetingUrl: normalizeMeetingUrl(interaction.options.getString("url", true)),
+        meetingUrl: await this.resolveSubmittedMeetingUrl([rawUrl]),
+        urlOnly: true,
       });
-      await interaction.reply(buildDraftPayload(draft));
+      if (resolvingInvitation) {
+        await interaction.editReply({ content: "招待URLから会議URLを確認しました。確認画面をチャンネルへ表示します。" });
+        await interaction.followUp(buildDraftPayload(draft));
+      } else {
+        await interaction.reply(buildDraftPayload(draft));
+      }
     } catch (error) {
-      await interaction.reply({ content: safeDisplayText(error.message, 240), flags: MessageFlags.Ephemeral });
+      const payload = { content: safeDisplayText(error.message, 240), flags: MessageFlags.Ephemeral };
+      if (resolvingInvitation) await interaction.editReply({ content: payload.content });
+      else await interaction.reply(payload);
     }
   }
 
@@ -1207,11 +1434,12 @@ export class MeetingCoordinator {
       "**会議Botのかんたん使い方**",
       "1. 初回だけ: `/meeting member-add` または通常チャンネルでBotをメンションし、Discordメンバーへ「メンバーA」などの呼び名を登録します。",
       `2. 固定メンバー: ${mention} テンプレート「全体定例」として参加者: メンバーA、メンバーB を保存`,
-      `3. 会議登録: ${mention} 来週月曜20:30から全体定例、URLは…（参加者を省略すると既定テンプレートを使用）`,
-      "4. 黄色い確認画面で日時・URL登録済み・DM送信先を確認し、「登録する」を押します。",
-      "5. 招待された人はボタンまたはDMで「参加します」「未定です」「欠席します」「1時間前と10分前に通知して」と返信できます。",
+      `3. 会議登録: ${mention} 来週月曜20:30から全体定例、URLは…（Googleカレンダーの招待URLでもMeet URLを自動取得）`,
+      `4. URLを直す: 会議カードへ ${mention} とURLを付けて返信します。会議が1件だけなら \`${mention} URL\` だけでも認識します。`,
+      "5. 黄色い確認画面で日時・URL登録済み・DM送信先を確認し、「登録する」を押します。",
+      "6. 招待された人はボタンまたはDMで「参加します」「未定です」「欠席します」「1時間前と10分前に通知して」と返信できます。",
       "`/meeting` の全操作は、通常チャンネルでBotをメンションして自然な日本語でも実行できます。",
-      "例: `会議一覧を見せて` / `MEET0001の出欠状況` / `MEET0001を中止して` / `自分の通知設定を見せて`",
+      "例: `会議一覧を見せて` / `全体定例のリンクはこれ URL` / `MEET0001の出欠状況` / `自分の通知設定を見せて`",
       "※会議URL・Discord ID・登録した呼び名・テンプレート名・DM本文/回答はGPTへ送りません。本人操作はローカルで処理します。",
     ].join("\n");
   }

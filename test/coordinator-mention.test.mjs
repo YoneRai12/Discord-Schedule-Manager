@@ -79,7 +79,7 @@ test("通常チャンネルの自然言語会議作成は既定テンプレー�
   const replies = [];
   await bot.handleMention(
     message({ replies }),
-    "明日20時から全体定例を登録。URL: https://example.com/meeting",
+    "明日20時から全体定例を登録。URL: https://meet.google.com/example-meeting",
   );
 
   assert.equal(aiInputs.length, 1);
@@ -92,7 +92,7 @@ test("通常チャンネルの自然言語会議作成は既定テンプレー�
   aiInputs.length = 0;
   await bot.handleMention(
     message({ replies }),
-    "明日21時から別の会議。参加者テンプレート: 全体定例 URL: https://example.com/other",
+    "明日21時から別の会議。参加者テンプレート: 全体定例 URL: https://meet.google.com/other-meeting",
   );
   assert.equal(aiInputs.length, 1);
   assert.equal(aiInputs[0].sanitizedText.includes("全体定例"), false);

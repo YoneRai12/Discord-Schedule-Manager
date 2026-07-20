@@ -109,6 +109,69 @@ test("URLだけを更新しても送信済み通知を再生成しない", (t) =
   assert.equal(snapshot.deliveries[0].status, "sent");
 });
 
+test("同じ日時と通知時刻の更新は個別DM・出欠・配送状態を一切作り直さない", (t) => {
+  const store = withDatabase(t);
+  const startsAtMs = Date.now() + 2 * 60 * 60_000;
+  const meeting = store.createMeeting(meetingInput({
+    startsAtMs,
+    endsAtMs: startsAtMs + 60 * 60_000,
+    reminderMinutes: [30, 0],
+  }));
+  store.prepareMeetingInvitees(meeting.id, [{
+    userId: MEMBER_A_ID,
+    displayName: "メンバーA",
+  }], ADMIN_ID, { defaultReminderMinutes: [60, 10] });
+  store.markInviteeDelivery(meeting.id, MEMBER_A_ID, {
+    status: "sent",
+    dmMessageId: "invite-message",
+  });
+  store.upsertRsvp(meeting.id, {
+    userId: MEMBER_A_ID,
+    displayName: "メンバーA",
+    status: "attending",
+  });
+  store.db.prepare(`
+    UPDATE deliveries
+    SET status = 'sending', attempts = 2, next_attempt_at_ms = 1234,
+        lease_expires_at_ms = 5678, last_error_code = 'retry-test'
+    WHERE meeting_id = ? AND offset_minutes = 30
+  `).run(meeting.id);
+  store.db.prepare(`
+    UPDATE personal_deliveries
+    SET status = 'sending', attempts = 3, next_attempt_at_ms = 4321,
+        lease_expires_at_ms = 8765, last_error_code = 'dm-retry-test'
+    WHERE meeting_id = ? AND user_id = ? AND offset_minutes = 60
+  `).run(meeting.id, MEMBER_A_ID);
+
+  const readRows = (table, orderBy) => store.db.prepare(
+    `SELECT * FROM ${table} WHERE meeting_id = ? ORDER BY ${orderBy}`,
+  ).all(meeting.id);
+  const before = {
+    deliveries: readRows("deliveries", "offset_minutes"),
+    personalDeliveries: readRows("personal_deliveries", "user_id, offset_minutes"),
+    invitees: readRows("meeting_invitees", "user_id"),
+    reminders: readRows("meeting_invitee_reminders", "user_id"),
+    rsvps: readRows("rsvps", "user_id"),
+  };
+
+  store.updateMeeting(meeting.id, {
+    title: "運営定例（URL更新）",
+    startsAtMs: meeting.startsAtMs,
+    endsAtMs: meeting.endsAtMs,
+    meetingUrl: "https://video.example.org/rooms/updated",
+    reminderMinutes: [...meeting.reminderMinutes],
+  });
+
+  assert.deepEqual({
+    deliveries: readRows("deliveries", "offset_minutes"),
+    personalDeliveries: readRows("personal_deliveries", "user_id, offset_minutes"),
+    invitees: readRows("meeting_invitees", "user_id"),
+    reminders: readRows("meeting_invitee_reminders", "user_id"),
+    rsvps: readRows("rsvps", "user_id"),
+  }, before);
+  assert.equal(store.getMeeting(meeting.id).meetingUrl, "https://video.example.org/rooms/updated");
+});
+
 test("呼び名とDiscordユーザーの対応をサーバー内だけで管理する", (t) => {
   const store = withDatabase(t);
   const saved = store.setMemberAlias(GUILD_ID, {
