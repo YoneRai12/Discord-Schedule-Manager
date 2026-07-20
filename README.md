@@ -1,4 +1,4 @@
-# 予定管理DiscordBOT
+# Discord Schedule Manager
 
 Discordだけで会議の登録、参加者へのDM、出欠集計、個人別リマインド、開始時の`@everyone`通知を管理する公開テンプレートです。
 
@@ -26,8 +26,8 @@ Discordだけで会議の登録、参加者へのDM、出欠集計、個人別�
 必要なものはNode.js 24以上と、新規Discord Application / Botです。自然言語で会議を作成・更新する場合は、OpenAI API（既定）または実験的なCodex App Serverを選びます。
 
 ```powershell
-git clone https://github.com/OWNER/YoteiKanriDiscordBOT.git
-Set-Location -LiteralPath "YoteiKanriDiscordBOT"
+git clone https://github.com/OWNER/Discord-Schedule-Manager.git
+Set-Location -LiteralPath "Discord-Schedule-Manager"
 npm.cmd install
 Copy-Item -LiteralPath ".env.example" -Destination ".env"
 ```

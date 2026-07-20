@@ -1,5 +1,5 @@
 {
-  "name": "discord-meeting-manager-bot",
+  "name": "discord-schedule-manager",
   "version": "0.1.0",
   "private": true,
   "description": "自然言語、参加者テンプレート、個人別通知、出欠集計、Google Sheets同期に対応した予定管理Discord Bot",

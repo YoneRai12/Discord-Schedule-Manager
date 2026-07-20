@@ -1,4 +1,4 @@
-# 予定管理DiscordBOT かんたん使い方
+# Discord Schedule Manager かんたん使い方
 
 このBotは、会議の「いつ・何の会議・URL・誰が来る・いつ知らせる」をDiscordだけでまとめます。難しい操作はありません。
 
