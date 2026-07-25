@@ -7,7 +7,7 @@ param(
     [string]$TaskName = "DiscordMeetingManagerBot",
 
     [ValidateSet("Logon", "Both")]
-    [string]$TriggerMode = "Both",
+    [string]$TriggerMode = "Logon",
 
     [switch]$Replace,
     [switch]$ConfirmRemoval
@@ -57,6 +57,12 @@ function Resolve-AccountSid([string]$AccountName) {
     }
 }
 
+function Test-IsAdministrator {
+    $Identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $Principal = [Security.Principal.WindowsPrincipal]::new($Identity)
+    return $Principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
 if ($Action -eq "Verify") {
     $Existing = Get-ExistingTask
     if (-not $Existing) {
@@ -64,20 +70,36 @@ if ($Action -eq "Verify") {
         exit 2
     }
     $TaskInfo = Get-ScheduledTaskInfo -TaskName $TaskName -TaskPath $TaskPath
-    $TaskAction = @($Existing.Actions)[0]
+    $TaskActions = @($Existing.Actions)
+    $TaskAction = $TaskActions | Select-Object -First 1
     $TriggerNames = Get-TriggerNames $Existing
     $ExpectedTriggers = if ($TriggerMode -eq "Both") { @("Logon", "Startup") } else { @("Logon") }
     $Problems = [Collections.Generic.List[string]]::new()
-    if ([IO.Path]::GetFullPath($TaskAction.Execute) -ne [IO.Path]::GetFullPath($PowerShellExe)) {
-        $Problems.Add("executable_mismatch")
+    if ($TaskActions.Count -ne 1) { $Problems.Add("action_count_mismatch") }
+    if ($TaskAction) {
+        if ([IO.Path]::GetFullPath($TaskAction.Execute) -ne [IO.Path]::GetFullPath($PowerShellExe)) {
+            $Problems.Add("executable_mismatch")
+        }
+        if ($TaskAction.Arguments -ne $ExpectedArguments) { $Problems.Add("arguments_mismatch") }
+        if ($TaskAction.WorkingDirectory -ne $ProjectRoot) { $Problems.Add("working_directory_mismatch") }
     }
-    if ($TaskAction.Arguments -ne $ExpectedArguments) { $Problems.Add("arguments_mismatch") }
-    if ($TaskAction.WorkingDirectory -ne $ProjectRoot) { $Problems.Add("working_directory_mismatch") }
     foreach ($ExpectedTrigger in $ExpectedTriggers) {
         if ($TriggerNames -notcontains $ExpectedTrigger) { $Problems.Add("missing_$($ExpectedTrigger.ToLowerInvariant())_trigger") }
     }
+    foreach ($TriggerName in $TriggerNames) {
+        if ($ExpectedTriggers -notcontains $TriggerName) { $Problems.Add("unexpected_$($TriggerName.ToLowerInvariant())_trigger") }
+    }
     $TaskUserSid = Resolve-AccountSid $Existing.Principal.UserId
     if (-not $TaskUserSid -or $TaskUserSid -ne $CurrentUserSid) { $Problems.Add("user_mismatch") }
+    if ([string]$Existing.Principal.LogonType -ne "Interactive") { $Problems.Add("logon_type_mismatch") }
+    if ([string]$Existing.Principal.RunLevel -ne "Limited") { $Problems.Add("run_level_mismatch") }
+    if ([int]$Existing.Settings.RestartCount -ne 999) { $Problems.Add("restart_count_mismatch") }
+    if ([string]$Existing.Settings.RestartInterval -ne "PT1M") { $Problems.Add("restart_interval_mismatch") }
+    if ([string]$Existing.Settings.MultipleInstances -ne "IgnoreNew") { $Problems.Add("multiple_instances_mismatch") }
+    if ([string]$Existing.Settings.ExecutionTimeLimit -ne "PT0S") { $Problems.Add("execution_time_limit_mismatch") }
+    if (-not [bool]$Existing.Settings.StartWhenAvailable) { $Problems.Add("start_when_available_mismatch") }
+    if ([bool]$Existing.Settings.DisallowStartIfOnBatteries) { $Problems.Add("battery_start_mismatch") }
+    if ([bool]$Existing.Settings.StopIfGoingOnBatteries) { $Problems.Add("battery_stop_mismatch") }
     if ($Problems.Count -gt 0) {
         Write-Output "MISMATCH task=$TaskPath$TaskName problems=$($Problems -join ',')"
         exit 3
@@ -104,6 +126,9 @@ $Existing = Get-ExistingTask
 if ($Existing -and -not $Replace) {
     throw "同名タスクが既にあります。内容を確認し、置換する場合だけ -Replace を付けてください。"
 }
+if ($TriggerMode -eq "Both" -and -not (Test-IsAdministrator)) {
+    throw "TriggerMode Both（PC起動時トリガーを含む）の登録には管理者権限が必要です。通常は既定のLogonを使用してください。"
+}
 
 $ScheduledAction = New-ScheduledTaskAction `
     -Execute $PowerShellExe `
@@ -116,10 +141,12 @@ if ($TriggerMode -eq "Both") {
 }
 $Settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
-    -RestartCount 3 `
+    -RestartCount 999 `
     -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
-    -MultipleInstances IgnoreNew
+    -MultipleInstances IgnoreNew `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries
 $Principal = New-ScheduledTaskPrincipal `
     -UserId $CurrentUser `
     -LogonType Interactive `
@@ -138,7 +165,9 @@ try {
     if ($Existing) { $RegisterParameters.Force = $true }
     Register-ScheduledTask @RegisterParameters | Out-Null
 } catch {
-    throw "タスクを登録できませんでした。code=$($_.Exception.GetType().Name)"
+    $ExceptionCode = $_.Exception.GetType().Name
+    $ExceptionHResult = "0x{0:X8}" -f ($_.Exception.HResult -band 0xFFFFFFFFL)
+    throw "タスクを登録できませんでした。code=$ExceptionCode hresult=$ExceptionHResult"
 }
 
 Write-Output "REGISTERED task=$TaskPath$TaskName triggers=$TriggerMode user=$CurrentUser"
