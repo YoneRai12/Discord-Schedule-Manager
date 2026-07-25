@@ -7,10 +7,20 @@ const REASONING_ENV = "OPENAI_REASONING_EFFORT";
 const PROVIDER_ENV = "MEETING_AI_PROVIDER";
 const CODEX_MODEL_ENV = "CODEX_MEETING_MODEL";
 const CODEX_REASONING_ENV = "CODEX_REASONING_EFFORT";
+const ATTENDEE_MENTION_ENV = "MEETING_ATTENDEE_MENTION_OFFSETS_MINUTES";
+const LEGACY_EVERYONE_ENV = "MEETING_EVERYONE_OFFSETS_MINUTES";
 
 function withOpenAiEnvironment(values, callback) {
   const previous = new Map(
-    [MODEL_ENV, REASONING_ENV, PROVIDER_ENV, CODEX_MODEL_ENV, CODEX_REASONING_ENV]
+    [
+      MODEL_ENV,
+      REASONING_ENV,
+      PROVIDER_ENV,
+      CODEX_MODEL_ENV,
+      CODEX_REASONING_ENV,
+      ATTENDEE_MENTION_ENV,
+      LEGACY_EVERYONE_ENV,
+    ]
       .map((name) => [name, process.env[name]]),
   );
   try {
@@ -46,6 +56,21 @@ test("Codex App ServerはSpark・thinking mediumを設定で選べる", () => {
     assert.equal(config.meetingAiProvider, "codex_app_server");
     assert.equal(config.codexMeetingModel, "gpt-5.3-codex-spark");
     assert.equal(config.codexReasoningEffort, "medium");
+  });
+});
+
+test("参加者メンション時刻は新設定を優先し旧設定からも安全に移行できる", () => {
+  withOpenAiEnvironment({
+    [ATTENDEE_MENTION_ENV]: "10,0",
+    [LEGACY_EVERYONE_ENV]: "30",
+  }, () => {
+    assert.deepEqual(loadConfig({ requireSecrets: false }).attendeeMentionOffsets, [10, 0]);
+  });
+  withOpenAiEnvironment({
+    [ATTENDEE_MENTION_ENV]: null,
+    [LEGACY_EVERYONE_ENV]: "30,0",
+  }, () => {
+    assert.deepEqual(loadConfig({ requireSecrets: false }).attendeeMentionOffsets, [30, 0]);
   });
 });
 

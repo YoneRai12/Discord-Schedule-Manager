@@ -30,6 +30,13 @@ test("会議カードに個別招待の未回答者だけを表示する", () =>
   assert.equal(unanswered.value, "メンバーB");
 });
 
+test("会議カードは全体メンションではなく参加者メンションの時刻を表示する", () => {
+  const payload = buildMeetingPayload(meeting, [], { attendeeMentionOffsets: [0] });
+  const embed = payload.embeds[0].toJSON();
+  assert.match(embed.description, /開始時（参加者をメンション）/u);
+  assert.doesNotMatch(embed.description, /@everyone/u);
+});
+
 test("個別DMには出欠ボタン・会議URL・ローカル回答の説明を付ける", () => {
   const payload = buildDirectInvitePayload(meeting);
   const embed = payload.embeds[0].toJSON();

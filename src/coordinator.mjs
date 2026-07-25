@@ -155,6 +155,7 @@ export class MeetingCoordinator {
     this.interpreter = interpreter;
     this.sheetsSync = sheetsSync;
     this.config = config;
+    this.attendeeMentionOffsets = config.attendeeMentionOffsets ?? config.everyoneOffsets ?? [0];
     this.directMessenger = directMessenger;
     this.directInviteUpdateScheduler = directInviteUpdateScheduler;
     this.meetingCardUpdateScheduler = meetingCardUpdateScheduler;
@@ -481,6 +482,10 @@ export class MeetingCoordinator {
     }
 
     const localCommand = parseGuildNaturalCommand(rawText, { knownMeetingIds });
+    if (localCommand?.action === "template_help") {
+      await replyText(this.templateHelpText());
+      return;
+    }
     if (localCommand?.action === "help") {
       await replyText(this.helpText());
       return;
@@ -998,9 +1003,6 @@ export class MeetingCoordinator {
     if (!permissions || !permissions.has(required)) {
       throw new Error("Botにチャンネル表示・送信・埋め込み権限が必要です");
     }
-    if (this.config.everyoneOffsets.length && !permissions.has(PermissionFlagsBits.MentionEveryone)) {
-      throw new Error("自動通知にはBotの「@everyone、@here、すべてのロールにメンション」権限が必要です");
-    }
     if (draft.invitees?.length && !this.directMessenger?.sendMeetingInvite) {
       throw new Error("個別DM送信モジュールが初期化されていません");
     }
@@ -1019,7 +1021,7 @@ export class MeetingCoordinator {
         timeZone: this.config.timeZone,
         meetingUrl: draft.meetingUrl,
         reminderMinutes: draft.reminderMinutes,
-        everyoneOffsets: this.config.everyoneOffsets,
+        attendeeMentionOffsets: this.attendeeMentionOffsets,
         messageId: interaction.message.id,
       });
       inviteBatch = draft.invitees?.length
@@ -1031,7 +1033,7 @@ export class MeetingCoordinator {
       await interaction.editReply({
         content: null,
         ...buildMeetingPayload(saved, [], {
-          everyoneOffsets: this.config.everyoneOffsets,
+          attendeeMentionOffsets: this.attendeeMentionOffsets,
           invitees: this.store.listMeetingInvitees(meeting.id),
         }),
       });
@@ -1077,7 +1079,7 @@ export class MeetingCoordinator {
         })
         : this.store.updateMeetingIfUnchanged(draft.meetingId, patch, {
           expectedUpdatedAtMs: draft.baseUpdatedAtMs,
-          everyoneOffsets: this.config.everyoneOffsets,
+          attendeeMentionOffsets: this.attendeeMentionOffsets,
         });
     } catch (error) {
       if (error?.code === "meeting_update_conflict") {
@@ -1248,7 +1250,7 @@ export class MeetingCoordinator {
     const channel = await this.client.channels.fetch(meeting.channelId);
     if (!channel?.isTextBased?.()) throw new Error("会議カードのチャンネルが見つかりません");
     const payload = buildMeetingPayload(meeting, this.store.listRsvps(meeting.id), {
-      everyoneOffsets: this.config.everyoneOffsets,
+      attendeeMentionOffsets: this.attendeeMentionOffsets,
       invitees: this.store.listMeetingInvitees(meeting.id),
     });
     if (meeting.messageId) {
@@ -1731,6 +1733,21 @@ export class MeetingCoordinator {
       "`/meeting` の全操作は、通常チャンネルでBotをメンションして自然な日本語でも実行できます。",
       "例: `会議一覧を見せて` / `全体定例のリンクはこれ URL` / `MEET0001の出欠状況` / `自分の通知設定を見せて`",
       "※会議URL・Discord ID・登録した呼び名・テンプレート名・DM本文/回答はGPTへ送りません。本人操作はローカルで処理します。",
+    ].join("\n");
+  }
+
+  templateHelpText() {
+    const mention = this.client.user ? `<@${this.client.user.id}>` : "@Bot";
+    return [
+      "**参加者テンプレートの作り方**",
+      "1. 最初に、各Discordメンバーへ「メンバーA」などの呼び名を登録します。",
+      `例: \`${mention} @対象メンバー を メンバーA として登録して\``,
+      "2. 呼び名を並べて、好きなテンプレート名で保存します。",
+      `例: \`${mention} テンプレート「全体定例」として 参加者: メンバーA、メンバーB を保存\``,
+      "3. 毎回そのメンバーを使うなら既定にします。",
+      `例: \`${mention} テンプレート「全体定例」を既定にして\``,
+      `確認: \`${mention} テンプレート一覧を見せて\``,
+      "※呼び名とDiscord IDの対応はローカルだけに保存し、AIへ送りません。",
     ].join("\n");
   }
 }

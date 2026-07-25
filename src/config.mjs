@@ -65,7 +65,11 @@ export function loadConfig({ requireSecrets = true } = {}) {
     process.env.MEETING_PERSONAL_DEFAULT_REMINDERS_MINUTES || "60,10",
     { min: 0, max: 10_080, maxItems: 6 },
   );
-  const everyoneOffsets = parseIntegerList(process.env.MEETING_EVERYONE_OFFSETS_MINUTES || "0");
+  const attendeeMentionOffsets = parseIntegerList(
+    process.env.MEETING_ATTENDEE_MENTION_OFFSETS_MINUTES
+      || process.env.MEETING_EVERYONE_OFFSETS_MINUTES
+      || "0",
+  );
   const dataDir = path.resolve(PROJECT_ROOT, process.env.MEETING_DATA_DIR || "data");
   const serviceAccountFile = String(process.env.GOOGLE_SERVICE_ACCOUNT_FILE ?? "").trim();
 
@@ -78,7 +82,7 @@ export function loadConfig({ requireSecrets = true } = {}) {
     defaultDurationMinutes: integer("MEETING_DEFAULT_DURATION_MINUTES", 60, { min: 5, max: 1_440 }),
     defaultReminders,
     personalDefaultReminders,
-    everyoneOffsets,
+    attendeeMentionOffsets,
     schedulerIntervalSeconds: integer("MEETING_SCHEDULER_INTERVAL_SECONDS", 15, { min: 5, max: 300 }),
     maxLateMinutes: integer("MEETING_MAX_LATE_MINUTES", 10, { min: 0, max: 1_440 }),
     dataDir,

@@ -4,6 +4,7 @@ import {
   ButtonStyle,
   EmbedBuilder,
 } from "discord.js";
+import { buildAttendeeMention } from "./attendee-mentions.mjs";
 import { discordTimestamp, reminderLabel } from "./time.mjs";
 import { formatPersonalReminderMinutes } from "./personal-reminders.mjs";
 import { safeDisplayText } from "./privacy.mjs";
@@ -23,10 +24,10 @@ function formatNames(rsvps, status) {
   return joined.length > 900 ? `${joined.slice(0, 897)}…` : joined;
 }
 
-function reminderText(meeting, everyoneOffsets = [0]) {
-  const everyone = new Set(everyoneOffsets.map(Number));
+function reminderText(meeting, attendeeMentionOffsets = [0]) {
+  const attendeeMentions = new Set(attendeeMentionOffsets.map(Number));
   return meeting.reminderMinutes
-    .map((minutes) => `${reminderLabel(minutes)}${everyone.has(minutes) ? "（@everyone）" : ""}`)
+    .map((minutes) => `${reminderLabel(minutes)}${attendeeMentions.has(minutes) ? "（参加者をメンション）" : ""}`)
     .join("、") || "なし";
 }
 
@@ -74,7 +75,9 @@ function buildRsvpRow(meeting, { includeUrl = true } = {}) {
   return row;
 }
 
-export function buildMeetingPayload(meeting, rsvps, { everyoneOffsets = [0], invitees = [] } = {}) {
+export function buildMeetingPayload(meeting, rsvps, options = {}) {
+  const attendeeMentionOffsets = options.attendeeMentionOffsets ?? options.everyoneOffsets ?? [0];
+  const invitees = options.invitees ?? [];
   const cancelled = meeting.status === "cancelled";
   const completed = meeting.status === "completed";
   const embed = new EmbedBuilder()
@@ -83,7 +86,7 @@ export function buildMeetingPayload(meeting, rsvps, { everyoneOffsets = [0], inv
     .setDescription([
       `**開始:** ${discordTimestamp(meeting.startsAtMs, "F")}（${discordTimestamp(meeting.startsAtMs, "R")}）`,
       `**終了予定:** ${discordTimestamp(meeting.endsAtMs, "t")}`,
-      `**通知:** ${reminderText(meeting, everyoneOffsets)}`,
+      `**通知:** ${reminderText(meeting, attendeeMentionOffsets)}`,
     ].join("\n"))
     .addFields(
       { name: STATUS_LABELS.attending, value: formatNames(rsvps, "attending") },
@@ -238,7 +241,9 @@ export function buildNotificationPayload(delivery, rsvps) {
     declined: rsvps.filter((item) => item.status === "declined").length,
   };
   const timing = delivery.offsetMinutes === 0 ? "開始時刻です" : `開始${reminderLabel(delivery.offsetMinutes)}です`;
-  const prefix = delivery.mentionEveryone ? "@everyone\n" : "";
+  const mentionEnabled = delivery.mentionAttendees ?? delivery.mentionEveryone ?? false;
+  const attendeeMention = buildAttendeeMention(rsvps, { enabled: mentionEnabled });
+  const prefix = attendeeMention.content ? `${attendeeMention.content}\n` : "";
   return {
     content: `${prefix}📢 **${safeDisplayText(delivery.title, 100)}** — ${timing}\n${delivery.meetingUrl}`,
     embeds: [
@@ -250,6 +255,6 @@ export function buildNotificationPayload(delivery, rsvps) {
           `会議ID: ${delivery.meetingId}`,
         ].join("\n")),
     ],
-    allowedMentions: delivery.mentionEveryone ? { parse: ["everyone"] } : { parse: [] },
+    allowedMentions: attendeeMention.allowedMentions,
   };
 }

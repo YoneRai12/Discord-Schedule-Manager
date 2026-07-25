@@ -44,9 +44,19 @@ const HELP_PATTERNS = Object.freeze([
   /(?:できること|出来ること|機能)(?:を)?(?:教えて|見せて|説明して|知りたい)/u,
 ]);
 
+const TEMPLATE_HELP_PATTERNS = Object.freeze([
+  /(?:参加者|出席者)?テンプレ(?:ート)?(?:って|は|を)?\s*(?:どう|どー)(?:やって)?(?:作る|つくる|作れば|つくれば|登録する|保存する)(?:の|には|といい|のがいい|んですか|のですか|いいですか)?/u,
+  /(?:参加者|出席者)?テンプレ(?:ート)?(?:の|を)?\s*(?:作り方|つくり方|作る方法|つくる方法|登録(?:する)?方法|保存(?:する)?方法)(?:を|が)?(?:教えて|知りたい|見せて|説明して)?/u,
+]);
+
 export function isHelpIntent(text) {
   const normalized = String(text ?? "").normalize("NFKC").trim();
   return HELP_PATTERNS.some((pattern) => pattern.test(normalized));
+}
+
+export function isTemplateHelpIntent(text) {
+  const normalized = String(text ?? "").normalize("NFKC").trim();
+  return TEMPLATE_HELP_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
 export function parseGuildNaturalCommand(rawText, { knownMeetingIds = [] } = {}) {
@@ -59,6 +69,7 @@ export function parseGuildNaturalCommand(rawText, { knownMeetingIds = [] } = {})
   const meetingId = extractMeetingId(text, { knownIds: knownMeetingIds });
 
   const meetingComposition = looksLikeMeetingComposition(text);
+  if (!meetingComposition && isTemplateHelpIntent(text)) return { action: "template_help" };
   if (!meetingComposition && isHelpIntent(text)) return { action: "help" };
   if (isBareUrl(text) || isMeetingUrlUpdate(text)) {
     return { action: "meeting_url_update", meetingId, hasMeetingUrl: hasUrlLike(text) };

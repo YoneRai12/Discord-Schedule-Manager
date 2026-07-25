@@ -381,3 +381,42 @@ test("会議カード表示に失敗した作成はactiveのまま残さない",
   assert.equal(store.listUpcoming(GUILD_ID).length, 0);
   assert.equal(store.getSnapshot().meetings[0].status, "cancelled");
 });
+
+test("全体メンション権限がなくても参加者メンション方式の会議を作成できる", async (t) => {
+  const store = fixture(t);
+  const bot = makeBot(store);
+  const startsAtMs = Date.now() + 60 * 60_000;
+  let mentionEveryonePermissionChecks = 0;
+  let rendered = null;
+
+  await bot.confirmCreate({
+    channel: {
+      permissionsFor: () => ({
+        has: (permission) => {
+          if (permission === PermissionFlagsBits.MentionEveryone) {
+            mentionEveryonePermissionChecks += 1;
+            return false;
+          }
+          return true;
+        },
+      }),
+    },
+    message: { id: "preview-message" },
+    editReply: async (payload) => { rendered = payload; },
+  }, {
+    guildId: GUILD_ID,
+    channelId: PUBLIC_CHANNEL,
+    creatorId: "admin",
+    creatorName: "管理者",
+    title: "参加者だけ通知する会議",
+    startsAtMs,
+    endsAtMs: startsAtMs + 60 * 60_000,
+    meetingUrl: "https://meet.google.com/example-room",
+    reminderMinutes: [30, 0],
+    invitees: [],
+  });
+
+  assert.equal(mentionEveryonePermissionChecks, 0);
+  assert.ok(rendered);
+  assert.equal(store.listUpcoming(GUILD_ID).length, 1);
+});
