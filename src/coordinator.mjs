@@ -155,6 +155,7 @@ export class MeetingCoordinator {
     this.interpreter = interpreter;
     this.sheetsSync = sheetsSync;
     this.config = config;
+    this.attendeeMentionOffsets = config.attendeeMentionOffsets ?? config.everyoneOffsets ?? [0];
     this.directMessenger = directMessenger;
     this.directInviteUpdateScheduler = directInviteUpdateScheduler;
     this.meetingCardUpdateScheduler = meetingCardUpdateScheduler;
@@ -998,9 +999,6 @@ export class MeetingCoordinator {
     if (!permissions || !permissions.has(required)) {
       throw new Error("Botにチャンネル表示・送信・埋め込み権限が必要です");
     }
-    if (this.config.everyoneOffsets.length && !permissions.has(PermissionFlagsBits.MentionEveryone)) {
-      throw new Error("自動通知にはBotの「@everyone、@here、すべてのロールにメンション」権限が必要です");
-    }
     if (draft.invitees?.length && !this.directMessenger?.sendMeetingInvite) {
       throw new Error("個別DM送信モジュールが初期化されていません");
     }
@@ -1019,7 +1017,7 @@ export class MeetingCoordinator {
         timeZone: this.config.timeZone,
         meetingUrl: draft.meetingUrl,
         reminderMinutes: draft.reminderMinutes,
-        everyoneOffsets: this.config.everyoneOffsets,
+        attendeeMentionOffsets: this.attendeeMentionOffsets,
         messageId: interaction.message.id,
       });
       inviteBatch = draft.invitees?.length
@@ -1031,7 +1029,7 @@ export class MeetingCoordinator {
       await interaction.editReply({
         content: null,
         ...buildMeetingPayload(saved, [], {
-          everyoneOffsets: this.config.everyoneOffsets,
+          attendeeMentionOffsets: this.attendeeMentionOffsets,
           invitees: this.store.listMeetingInvitees(meeting.id),
         }),
       });
@@ -1077,7 +1075,7 @@ export class MeetingCoordinator {
         })
         : this.store.updateMeetingIfUnchanged(draft.meetingId, patch, {
           expectedUpdatedAtMs: draft.baseUpdatedAtMs,
-          everyoneOffsets: this.config.everyoneOffsets,
+          attendeeMentionOffsets: this.attendeeMentionOffsets,
         });
     } catch (error) {
       if (error?.code === "meeting_update_conflict") {
@@ -1248,7 +1246,7 @@ export class MeetingCoordinator {
     const channel = await this.client.channels.fetch(meeting.channelId);
     if (!channel?.isTextBased?.()) throw new Error("会議カードのチャンネルが見つかりません");
     const payload = buildMeetingPayload(meeting, this.store.listRsvps(meeting.id), {
-      everyoneOffsets: this.config.everyoneOffsets,
+      attendeeMentionOffsets: this.attendeeMentionOffsets,
       invitees: this.store.listMeetingInvitees(meeting.id),
     });
     if (meeting.messageId) {
