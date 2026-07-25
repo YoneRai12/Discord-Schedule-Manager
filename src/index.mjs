@@ -63,7 +63,7 @@ const directInviteUpdateScheduler = new DirectInviteUpdateScheduler({
 const meetingCardUpdateScheduler = new MeetingCardUpdateScheduler({
   store,
   client,
-  everyoneOffsets: config.everyoneOffsets,
+  attendeeMentionOffsets: config.attendeeMentionOffsets,
   intervalSeconds: config.schedulerIntervalSeconds,
 });
 const coordinator = new MeetingCoordinator({

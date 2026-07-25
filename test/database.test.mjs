@@ -25,7 +25,7 @@ function withDatabase(t) {
 }
 
 function meetingInput(overrides = {}) {
-  const startsAtMs = Date.parse("2026-07-20T11:30:00Z");
+  const startsAtMs = Date.now() + 60 * 60_000;
   return {
     id: "ABCD1234",
     guildId: GUILD_ID,
@@ -102,7 +102,7 @@ test("通知をトランザクションでclaimし二重送信を防ぐ", (t) =>
   const second = store.claimDueDeliveries({ nowMs, maxLateMinutes: 10 });
   assert.equal(first.length, 1);
   assert.equal(second.length, 0);
-  assert.equal(first[0].mentionEveryone, true);
+  assert.equal(first[0].mentionAttendees, true);
 
   store.markDeliverySent(first[0].meetingId, first[0].offsetMinutes, { discordMessageId: "777" });
   assert.equal(store.claimDueDeliveries({ nowMs: nowMs + 1_000, maxLateMinutes: 10 }).length, 0);

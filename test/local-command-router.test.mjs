@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { parseTemplateManagementMessage } from "../src/attendance-templates.mjs";
 import { buildMeetingCommand } from "../src/commands.mjs";
-import { isHelpIntent, parseGuildNaturalCommand } from "../src/local-command-router.mjs";
+import {
+  isHelpIntent,
+  isTemplateHelpIntent,
+  parseGuildNaturalCommand,
+} from "../src/local-command-router.mjs";
 import { parsePersonalReminderRequest } from "../src/personal-reminders.mjs";
 
 test("Slash Command相当の通常チャンネル@メンション操作をローカル判定する", () => {
@@ -91,6 +95,18 @@ test("くだけた聞き方でも使い方ヘルプとしてAIへ送らず判定
   }
   assert.equal(isHelpIntent("明日20時から定例会を登録して"), false);
   assert.equal(parseGuildNaturalCommand("明日20時から定例会を登録して"), null);
+});
+
+test("テンプレートの作り方を聞かれたら会議作成ではなく専用ヘルプへ振り分ける", () => {
+  for (const text of [
+    "テンプレどうやって作る？",
+    "参加者テンプレートの作り方を教えて",
+    "テンプレートを登録する方法が知りたい",
+  ]) {
+    assert.equal(isTemplateHelpIntent(text), true, text);
+    assert.deepEqual(parseGuildNaturalCommand(text), { action: "template_help" }, text);
+  }
+  assert.equal(isTemplateHelpIntent("テンプレート「全体定例」を既定にして"), false);
 });
 
 test("全Slashサブコマンドに通常チャンネル@メンションの自然言語経路がある", () => {

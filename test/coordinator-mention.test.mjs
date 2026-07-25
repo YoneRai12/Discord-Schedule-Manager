@@ -61,6 +61,27 @@ function coordinator(store, interpreter) {
   });
 }
 
+test("テンプレの作り方はAIへ送らず具体的な保存例を返す", async (t) => {
+  const store = fixture(t);
+  let aiCalls = 0;
+  const bot = coordinator(store, {
+    configured: true,
+    interpret: async () => { aiCalls += 1; },
+  });
+  const replies = [];
+
+  await bot.handleMention(
+    message({ authorId: "member-example", manager: false, replies }),
+    "テンプレどうやって作る？",
+  );
+
+  assert.equal(aiCalls, 0);
+  assert.match(replies[0].content, /参加者テンプレートの作り方/u);
+  assert.match(replies[0].content, /テンプレート「全体定例」として/u);
+  assert.match(replies[0].content, /既定にして/u);
+  assert.deepEqual(replies[0].allowedMentions, { parse: [], repliedUser: false });
+});
+
 test("通常チャンネルの自然言語会議作成は既定テンプレートを使い、URLとテンプレート名をAIへ送らない", async (t) => {
   const store = fixture(t);
   store.attendanceTemplates.saveTemplate(GUILD_ID, {

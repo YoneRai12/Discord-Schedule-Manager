@@ -74,7 +74,9 @@ function mapDelivery(row) {
     meetingId: row.meeting_id,
     offsetMinutes: Number(row.offset_minutes),
     dueAtMs: Number(row.due_at_ms),
-    mentionEveryone: Boolean(row.mention_everyone),
+    // 既存DBを移行なしで使えるよう、SQLiteの旧カラム名は維持する。
+    // trueは現在「参加者だけをメンションする時刻」を意味する。
+    mentionAttendees: Boolean(row.mention_everyone),
     status: row.status,
     scheduleRevision: Number(row.schedule_revision || 0),
     attempts: Number(row.attempts),
@@ -420,7 +422,8 @@ export class MeetingDatabase {
         now,
         now,
       );
-      this.replacePendingDeliveries(id, Number(input.startsAtMs), reminders, input.everyoneOffsets || [0], {
+      const attendeeMentionOffsets = input.attendeeMentionOffsets ?? input.everyoneOffsets ?? [0];
+      this.replacePendingDeliveries(id, Number(input.startsAtMs), reminders, attendeeMentionOffsets, {
         scheduleRevision: 0,
       });
       if (messageId) this.queueMeetingCardUpdateInternal(id, 0, now);
@@ -428,7 +431,13 @@ export class MeetingDatabase {
     return this.getMeeting(id);
   }
 
-  replacePendingDeliveries(meetingId, startsAtMs, reminders, everyoneOffsets, { scheduleRevision = null } = {}) {
+  replacePendingDeliveries(
+    meetingId,
+    startsAtMs,
+    reminders,
+    attendeeMentionOffsets,
+    { scheduleRevision = null } = {},
+  ) {
     const revision = scheduleRevision ?? this.getMeeting(meetingId)?.scheduleRevision ?? 0;
     const offsets = normalizeReminderMinutes(reminders);
     const desired = new Set(offsets);
@@ -466,25 +475,38 @@ export class MeetingDatabase {
         claim_token = CASE WHEN deliveries.status = 'sending' THEN deliveries.claim_token ELSE NULL END,
         last_error_code = CASE WHEN deliveries.status IN ('sent', 'sending') THEN deliveries.last_error_code ELSE NULL END
     `);
-    const everyoneSet = new Set(everyoneOffsets.map(Number));
+    const attendeeMentionSet = new Set(attendeeMentionOffsets.map(Number));
     for (const offset of offsets) {
-      statement.run(meetingId, revision, offset, startsAtMs - offset * 60_000, everyoneSet.has(offset) ? 1 : 0);
+      statement.run(
+        meetingId,
+        revision,
+        offset,
+        startsAtMs - offset * 60_000,
+        attendeeMentionSet.has(offset) ? 1 : 0,
+      );
     }
   }
 
-  updateMeeting(id, patch, { everyoneOffsets = [0] } = {}) {
-    return this.updateMeetingInternal(id, patch, { everyoneOffsets });
+  updateMeeting(id, patch, options = {}) {
+    const attendeeMentionOffsets = options.attendeeMentionOffsets ?? options.everyoneOffsets ?? [0];
+    return this.updateMeetingInternal(id, patch, { attendeeMentionOffsets });
   }
 
-  updateMeetingIfUnchanged(id, patch, { expectedUpdatedAtMs, everyoneOffsets = [0] } = {}) {
+  updateMeetingIfUnchanged(id, patch, options = {}) {
+    const { expectedUpdatedAtMs } = options;
+    const attendeeMentionOffsets = options.attendeeMentionOffsets ?? options.everyoneOffsets ?? [0];
     if (!Number.isSafeInteger(Number(expectedUpdatedAtMs))) throw updateConflict();
     return this.updateMeetingInternal(id, patch, {
-      everyoneOffsets,
+      attendeeMentionOffsets,
       expectedUpdatedAtMs: Number(expectedUpdatedAtMs),
     });
   }
 
-  updateMeetingInternal(id, patch, { everyoneOffsets = [0], expectedUpdatedAtMs = null } = {}) {
+  updateMeetingInternal(
+    id,
+    patch,
+    { attendeeMentionOffsets = [0], expectedUpdatedAtMs = null } = {},
+  ) {
     const current = this.getMeeting(id);
     if (!current) throw new Error("会議が見つかりません");
     if (current.status !== "active") throw new Error("終了または中止済みの会議は更新できません");
@@ -529,7 +551,7 @@ export class MeetingDatabase {
         `).run(id, nextRevision);
       }
       if (startsAtChanged || remindersChanged) {
-        this.replacePendingDeliveries(id, next.startsAtMs, next.reminderMinutes, everyoneOffsets, {
+        this.replacePendingDeliveries(id, next.startsAtMs, next.reminderMinutes, attendeeMentionOffsets, {
           scheduleRevision: nextRevision,
         });
       }

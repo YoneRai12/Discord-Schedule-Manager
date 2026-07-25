@@ -2,14 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { MeetingScheduler } from "../src/scheduler.mjs";
 
-test("開始時通知だけ@everyoneを明示許可して送信済みにする", async () => {
+test("開始時通知は参加を押した人だけ明示許可して送信済みにする", async () => {
   const sentPayloads = [];
   const marked = [];
+  const discordId = (suffix) => `${"1".repeat(17)}${suffix}`;
+  const attendingA = discordId("1");
+  const attendingB = discordId("2");
+  const maybe = discordId("3");
+  const declined = discordId("4");
   const delivery = {
     meetingId: "ABCD1234",
     channelId: "channel-example",
     offsetMinutes: 0,
-    mentionEveryone: true,
+    mentionAttendees: true,
     title: "運営定例",
     startsAtMs: Date.now(),
     endsAtMs: Date.now() + 60_000,
@@ -18,7 +23,12 @@ test("開始時通知だけ@everyoneを明示許可して送信済みにする",
   const store = {
     claimDueDeliveries: () => [delivery],
     isDeliveryClaimCurrent: () => true,
-    listRsvps: () => [{ status: "attending" }, { status: "declined" }],
+    listRsvps: () => [
+      { userId: attendingA, status: "attending" },
+      { userId: maybe, status: "maybe" },
+      { userId: declined, status: "declined" },
+      { userId: attendingB, status: "attending" },
+    ],
     markDeliverySent: (...args) => {
       marked.push(args);
       return true;
@@ -40,8 +50,13 @@ test("開始時通知だけ@everyoneを明示許可して送信済みにする",
   await scheduler.tick();
 
   assert.equal(sentPayloads.length, 1);
-  assert.match(sentPayloads[0].content, /^@everyone/u);
-  assert.deepEqual(sentPayloads[0].allowedMentions, { parse: ["everyone"] });
+  assert.match(sentPayloads[0].content, new RegExp(`^<@${attendingA}> <@${attendingB}>\\n`, "u"));
+  assert.doesNotMatch(sentPayloads[0].content, /@everyone/u);
+  assert.doesNotMatch(sentPayloads[0].content, new RegExp(`${maybe}|${declined}`, "u"));
+  assert.deepEqual(sentPayloads[0].allowedMentions, {
+    parse: [],
+    users: [attendingA, attendingB],
+  });
   assert.equal(marked.length, 1);
 });
 

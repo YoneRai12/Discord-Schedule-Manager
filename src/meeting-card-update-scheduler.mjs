@@ -47,7 +47,8 @@ export class MeetingCardUpdateScheduler {
   constructor({
     store,
     client,
-    everyoneOffsets = [0],
+    attendeeMentionOffsets = null,
+    everyoneOffsets = null,
     intervalSeconds = 15,
     leaseMs = 120_000,
     batchSize = 25,
@@ -58,7 +59,7 @@ export class MeetingCardUpdateScheduler {
     if (!client?.channels?.fetch) throw new TypeError("client.channels.fetch is required");
     this.store = requireStore(store);
     this.client = client;
-    this.everyoneOffsets = everyoneOffsets;
+    this.attendeeMentionOffsets = attendeeMentionOffsets ?? everyoneOffsets ?? [0];
     this.intervalMs = Math.max(1, Number(intervalSeconds)) * 1_000;
     this.leaseMs = Math.max(1_000, Number(leaseMs));
     this.batchSize = Math.max(1, Math.min(100, Number(batchSize)));
@@ -141,7 +142,7 @@ export class MeetingCardUpdateScheduler {
       }
       const message = await channel.messages.fetch(card.meeting.messageId);
       const payload = buildMeetingPayload(card.meeting, card.rsvps, {
-        everyoneOffsets: this.everyoneOffsets,
+        attendeeMentionOffsets: this.attendeeMentionOffsets,
         invitees: card.invitees,
       });
       if (!this.store.isMeetingCardUpdateClaimCurrent(claim)) return "stale";
@@ -238,7 +239,7 @@ export class MeetingCardUpdateScheduler {
         });
       }
       const payload = buildMeetingPayload(latest.meeting, latest.rsvps, {
-        everyoneOffsets: this.everyoneOffsets,
+        attendeeMentionOffsets: this.attendeeMentionOffsets,
         invitees: latest.invitees,
       });
       if (!this.store.isMeetingCardUpdateClaimCurrent(claim)) return "stale";
