@@ -30,7 +30,7 @@ const checks = [
   ["private_key_pem", /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----/u],
   ["google_service_account_email", /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.iam\.gserviceaccount\.com/iu],
   ["oauth_client_secret", /"client_secret"\s*:\s*"[^"\r\n]{8,}"/u],
-  ["nonempty_secret_assignment", /^(?:DISCORD_BOT_TOKEN|OPENAI_API_KEY|MEETING_WEB_SYNC_SECRET|MEETING_WEB_AUTH_TOKEN|GOOGLE_SERVICE_ACCOUNT_FILE|GOOGLE_PRIVATE_KEY)[ \t]*=[ \t]*\S+/mu],
+  ["nonempty_secret_assignment", /^(?:DISCORD_BOT_TOKEN|OPENAI_API_KEY|MEETING_WEB_SYNC_SECRET|MEETING_WEB_AUTH_TOKEN|MEETING_VOICE_ARCHIVE_KEY|GOOGLE_SERVICE_ACCOUNT_FILE|GOOGLE_PRIVATE_KEY)[ \t]*=[ \t]*\S+/mu],
 ];
 for (const [name, pattern] of checks) {
   if (pattern.test(publicText)) failures.push(name);

@@ -1,0 +1,206 @@
+import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
+import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { finished } from "node:stream/promises";
+import test from "node:test";
+import {
+  VOICE_ARCHIVE_RETENTION_MS,
+  VoiceSessionArchive,
+} from "../src/voice/voice-session-archive.mjs";
+import { WavSegmentWriter } from "../src/voice/wav-segment-writer.mjs";
+
+function key() {
+  return randomBytes(32).toString("base64");
+}
+
+function testSnowflake(prefix) {
+  return `${prefix}${"234567890"}${"12345678"}`;
+}
+
+async function allFileBytes(root) {
+  const output = [];
+  async function visit(current) {
+    for (const entry of await readdir(current, { withFileTypes: true })) {
+      const target = path.join(current, entry.name);
+      if (entry.isDirectory()) await visit(target);
+      else if (entry.isFile()) output.push(await readFile(target));
+    }
+  }
+  await visit(root);
+  return Buffer.concat(output);
+}
+
+test("session private metadata, segments, transcript, and analysis remain encrypted", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-archive-"));
+  const archiveKey = key();
+  const started = Date.parse("2026-08-01T00:00:00.000Z");
+  const archive = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey, now: () => started });
+  await archive.initialize();
+  const session = await archive.createSession({
+    sessionId: "session_safe_1",
+    guildId: testSnowflake(1),
+    voiceChannelId: testSnowflake(2),
+    outputChannelId: testSnowflake(3),
+    requestedById: testSnowflake(4),
+    title: "PRIVATE_MEETING_TITLE",
+    consents: { [testSnowflake(5)]: true },
+    noticeMessageId: testSnowflake(7),
+    requiredUserIds: [testSnowflake(8)],
+    consentedUserIds: [testSnowflake(9)],
+    policyRevision: "voice-policy-v1",
+    startedAtMs: started + 100,
+    state: "recording",
+  });
+  assert.equal(session.expiresAt, "2026-08-02T00:00:00.000Z");
+  assert.equal(session.createdAtMs, started);
+  assert.equal(session.expiresAtMs, started + VOICE_ARCHIVE_RETENTION_MS);
+  assert.deepEqual(session.requiredUserIds, [testSnowflake(8)]);
+  const consented = await archive.updateSession("session_safe_1", {
+    consent: {
+      userId: testSnowflake(9),
+      decision: "allow",
+      decidedAtMs: started + 50,
+      policyRevision: "voice-policy-v1",
+    },
+  });
+  assert.equal(consented.consents.length, 1);
+
+  const { segmentId, tempPath } = await archive.createSegment("session_safe_1", {
+    speakerId: testSnowflake(6),
+    speakerName: "PRIVATE_SPEAKER_NAME",
+    startedAtMs: 125,
+  });
+  const writer = new WavSegmentWriter({ filePath: tempPath });
+  writer.end(Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]));
+  await finished(writer);
+  await archive.finalizeSegment("session_safe_1", segmentId, { endedAtMs: 250 });
+  await assert.rejects(stat(tempPath), (error) => error?.code === "ENOENT");
+
+  const segments = await archive.listSegments("session_safe_1");
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0].speakerName, "PRIVATE_SPEAKER_NAME");
+  assert.equal(segments[0].state, "finalized");
+  const workspace = await archive.materializeTranscriptionInput("session_safe_1");
+  const manifest = JSON.parse(await readFile(workspace.manifestPath, "utf8"));
+  assert.equal(manifest.sessionStartedAtMs, started);
+  assert.equal(manifest.segments[0].speakerName, "PRIVATE_SPEAKER_NAME");
+  assert.deepEqual(
+    (await readFile(manifest.segments[0].wavPath)).subarray(44),
+    Buffer.from([1, 2, 3, 4, 5, 6, 7, 8]),
+  );
+  await archive.cleanupTranscriptionInput(workspace.workspaceId);
+  await assert.rejects(stat(workspace.workspaceDir), (error) => error?.code === "ENOENT");
+  await archive.writeTranscript("session_safe_1", { text: "PRIVATE_TRANSCRIPT_BODY" });
+  await archive.writeAnalysis("session_safe_1", { summary: "PRIVATE_ANALYSIS_BODY" });
+  assert.deepEqual(await archive.readTranscript("session_safe_1"), { text: "PRIVATE_TRANSCRIPT_BODY" });
+  assert.deepEqual(await archive.readAnalysis("session_safe_1"), { summary: "PRIVATE_ANALYSIS_BODY" });
+
+  const plaintextIndex = JSON.parse(await readFile(path.join(root, "index.json"), "utf8"));
+  assert.deepEqual(Object.keys(plaintextIndex.sessions[0]).sort(), [
+    "createdAt",
+    "expiresAt",
+    "failureCode",
+    "sessionId",
+    "state",
+  ]);
+  const disk = (await allFileBytes(root)).toString("utf8");
+  for (const secret of [
+    testSnowflake(1),
+    testSnowflake(7),
+    testSnowflake(8),
+    "PRIVATE_MEETING_TITLE",
+    "PRIVATE_SPEAKER_NAME",
+    "PRIVATE_TRANSCRIPT_BODY",
+    "PRIVATE_ANALYSIS_BODY",
+  ]) {
+    assert.equal(disk.includes(secret), false, secret);
+  }
+
+  await archive.close();
+  const reopened = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey, now: () => started });
+  await reopened.initialize();
+  assert.equal((await reopened.getSession("session_safe_1")).title, "PRIVATE_MEETING_TITLE");
+  await reopened.close();
+});
+
+test("expiry stays fixed at session start plus 24 hours and purge removes expired data", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-expiry-"));
+  let now = Date.parse("2026-08-01T02:00:00.000Z");
+  const archive = new VoiceSessionArchive({ rootDir: root, encryptionKey: key(), now: () => now });
+  await archive.initialize();
+  const created = await archive.createSession({ sessionId: "ttl_session", title: "secret" });
+  now += 23 * 60 * 60 * 1_000;
+  const updated = await archive.updateSession("ttl_session", { state: "processing", title: "changed" });
+  assert.equal(updated.expiresAt, created.expiresAt);
+  await assert.rejects(
+    archive.updateSession("ttl_session", { expiresAtMs: now + 99 * VOICE_ARCHIVE_RETENTION_MS }),
+    (error) => error?.code === "IMMUTABLE_SESSION_FIELD",
+  );
+  assert.equal((await archive.purgeExpired()).purged, 0);
+  now += 60 * 60 * 1_000;
+  assert.deepEqual(await archive.purgeExpired(), { purged: 1, failures: 0 });
+  assert.equal(await archive.getSession("ttl_session"), null);
+  assert.throws(
+    () => new VoiceSessionArchive({ rootDir: root, encryptionKey: key(), retentionMs: VOICE_ARCHIVE_RETENTION_MS + 1 }),
+    (error) => error?.code === "INVALID_RETENTION",
+  );
+  await archive.close();
+});
+
+test("unsafe IDs and symlink or junction replacements are rejected fail-closed", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-path-"));
+  let now = Date.parse("2026-08-01T04:00:00.000Z");
+  const archive = new VoiceSessionArchive({ rootDir: root, encryptionKey: key(), now: () => now });
+  await archive.initialize();
+  await assert.rejects(
+    archive.createSession({ sessionId: "..\\escape", title: "secret" }),
+    (error) => error?.code === "UNSAFE_PATH",
+  );
+  await archive.createSession({ sessionId: "linked_session", title: "secret" });
+  const sessionDir = path.join(root, "sessions", "linked_session");
+  const outside = await mkdtemp(path.join(os.tmpdir(), "voice-outside-"));
+  await rm(sessionDir, { recursive: true, force: true });
+  try {
+    await symlink(outside, sessionDir, process.platform === "win32" ? "junction" : "dir");
+  } catch (error) {
+    if (["EPERM", "EACCES", "ENOTSUP"].includes(error?.code)) {
+      t.skip("symlink creation is unavailable on this host");
+      await archive.close();
+      return;
+    }
+    throw error;
+  }
+  await assert.rejects(archive.getSession("linked_session"), (error) => error?.code === "UNSAFE_PATH");
+  now += VOICE_ARCHIVE_RETENTION_MS;
+  await assert.rejects(archive.purgeExpired(), (error) => error?.code === "PURGE_DELETE_FAILED");
+  const index = JSON.parse(await readFile(path.join(root, "index.json"), "utf8"));
+  assert.equal(index.sessions[0].failureCode, "PURGE_DELETE_FAILED");
+  await archive.close();
+});
+
+test("initialize removes stale plaintext parts without extending expiry", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-stale-"));
+  const archiveKey = key();
+  const now = Date.parse("2026-08-01T05:00:00.000Z");
+  const first = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey, now: () => now });
+  await first.initialize();
+  const created = await first.createSession({ sessionId: "stale_session", title: "secret" });
+  const segment = await first.createSegment("stale_session", {
+    speakerId: "1",
+    speakerName: "private",
+    startedAtMs: 0,
+  });
+  await writeFile(segment.tempPath, Buffer.from("plaintext-crash-remnant"));
+  await first.close();
+
+  const second = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey, now: () => now + 1_000 });
+  await second.initialize();
+  await assert.rejects(stat(segment.tempPath), (error) => error?.code === "ENOENT");
+  const recovered = await second.getSession("stale_session");
+  assert.equal(recovered.expiresAt, created.expiresAt);
+  assert.equal(recovered.failureCode, "STALE_PART_REMOVED");
+  assert.equal(recovered.segments[0].state, "discarded_after_restart");
+  await second.close();
+});

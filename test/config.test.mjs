@@ -9,6 +9,16 @@ const CODEX_MODEL_ENV = "CODEX_MEETING_MODEL";
 const CODEX_REASONING_ENV = "CODEX_REASONING_EFFORT";
 const ATTENDEE_MENTION_ENV = "MEETING_ATTENDEE_MENTION_OFFSETS_MINUTES";
 const LEGACY_EVERYONE_ENV = "MEETING_EVERYONE_OFFSETS_MINUTES";
+const VOICE_ENV_NAMES = [
+  "MEETING_VOICE_ENABLED",
+  "MEETING_VOICE_OUTPUT_CHANNEL_ID",
+  "MEETING_VOICE_RETENTION_HOURS",
+  "MEETING_VOICE_ARCHIVE_KEY",
+  "MEETING_VOICE_ARCHIVE_DIR",
+  "MEETING_VOICE_AI_SUMMARY_ENABLED",
+  "MEETING_VOICE_FACT_CHECK_ENABLED",
+  "MEETING_VOICE_STT_DEVICE",
+];
 
 function withOpenAiEnvironment(values, callback) {
   const previous = new Map(
@@ -20,6 +30,7 @@ function withOpenAiEnvironment(values, callback) {
       CODEX_REASONING_ENV,
       ATTENDEE_MENTION_ENV,
       LEGACY_EVERYONE_ENV,
+      ...VOICE_ENV_NAMES,
     ]
       .map((name) => [name, process.env[name]]),
   );
@@ -43,6 +54,37 @@ test("OpenAI会議解釈はGPT-5.6 Terra・reasoning mediumを既定値にする
     assert.equal(config.meetingAiProvider, "openai");
     assert.equal(config.openaiModel, "gpt-5.6-terra");
     assert.equal(config.openaiReasoningEffort, "medium");
+  });
+});
+
+test("VC文字起こしは既定OFFで、保存期間は24時間に固定する", () => {
+  withOpenAiEnvironment(Object.fromEntries(VOICE_ENV_NAMES.map((name) => [name, null])), () => {
+    const config = loadConfig({ requireSecrets: false });
+    assert.equal(config.meetingVoiceEnabled, false);
+    assert.equal(config.meetingVoiceRetentionHours, 24);
+    assert.equal(config.meetingVoiceAiSummaryEnabled, false);
+  });
+  withOpenAiEnvironment({ MEETING_VOICE_RETENTION_HOURS: "48" }, () => {
+    assert.throws(() => loadConfig({ requireSecrets: false }), /MEETING_VOICE_RETENTION_HOURS/u);
+  });
+});
+
+test("VC文字起こし有効時は専用チャンネルと32バイト暗号鍵を必須にする", () => {
+  const key = Buffer.alloc(32, 7).toString("base64");
+  withOpenAiEnvironment({
+    MEETING_VOICE_ENABLED: "true",
+    MEETING_VOICE_OUTPUT_CHANNEL_ID: "1234567890" + "12345678",
+    MEETING_VOICE_ARCHIVE_KEY: key,
+    MEETING_VOICE_STT_DEVICE: "auto",
+  }, () => {
+    assert.equal(loadConfig({ requireSecrets: false }).meetingVoiceEnabled, true);
+  });
+  withOpenAiEnvironment({
+    MEETING_VOICE_ENABLED: "true",
+    MEETING_VOICE_OUTPUT_CHANNEL_ID: null,
+    MEETING_VOICE_ARCHIVE_KEY: key,
+  }, () => {
+    assert.throws(() => loadConfig({ requireSecrets: false }), /MEETING_VOICE_OUTPUT_CHANNEL_ID/u);
   });
 });
 

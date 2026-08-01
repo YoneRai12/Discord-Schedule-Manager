@@ -183,6 +183,40 @@ export function buildMeetingCommand() {
         .setDescription("例: 1時間前と10分前 / 通知なし")
         .setMaxLength(100)))
     .addSubcommand((command) => command
+      .setName("voice-start")
+      .setDescription("今いるVCで、全員同意後にローカル文字起こしを開始します")
+      .addStringOption((option) => option
+        .setName("title")
+        .setDescription("会議名（省略時は日時から自動作成）")
+        .setMaxLength(100)))
+    .addSubcommand((command) => command
+      .setName("voice-stop")
+      .setDescription("VC文字起こしを停止して議事録を作成します"))
+    .addSubcommand((command) => command
+      .setName("voice-status")
+      .setDescription("VC文字起こしの同意・録音状態を確認します"))
+    .addSubcommand((command) => command
+      .setName("voice-privacy")
+      .setDescription("VC文字起こしの保存期間とAI送信範囲を確認します"))
+    .addSubcommand((command) => command
+      .setName("voice-reprocess")
+      .setDescription("24時間以内のバックアップから議事録を再作成します")
+      .addStringOption((option) => option
+        .setName("session_id")
+        .setDescription("10文字のVCセッションID")
+        .setRequired(true)
+        .setMinLength(10)
+        .setMaxLength(10)))
+    .addSubcommand((command) => command
+      .setName("voice-delete")
+      .setDescription("24時間を待たずにローカルバックアップを削除します")
+      .addStringOption((option) => option
+        .setName("session_id")
+        .setDescription("10文字のVCセッションID")
+        .setRequired(true)
+        .setMinLength(10)
+        .setMaxLength(10)))
+    .addSubcommand((command) => command
       .setName("help")
       .setDescription("会議Botの使い方を表示します"));
 }
