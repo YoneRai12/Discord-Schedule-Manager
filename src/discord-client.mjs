@@ -11,6 +11,7 @@ export const MEETING_GATEWAY_INTENTS = Object.freeze([
   GatewayIntentBits.Guilds,
   GatewayIntentBits.GuildMessages,
   GatewayIntentBits.DirectMessages,
+  GatewayIntentBits.GuildVoiceStates,
 ]);
 
 export const MEETING_PARTIALS = Object.freeze([Partials.Channel]);

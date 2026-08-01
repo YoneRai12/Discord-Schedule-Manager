@@ -115,8 +115,17 @@ test("全Slashサブコマンドに通常チャンネル@メンションの自�
     "create", "url", "list", "status", "cancel",
     "member-add", "member-list", "member-remove",
     "template-save", "template-list", "template-show", "template-default", "template-remove",
-    "invite", "my-reminders", "help",
+    "invite", "my-reminders",
+    "voice-start", "voice-stop", "voice-status", "voice-privacy", "voice-reprocess", "voice-delete",
+    "help",
   ]);
+
+  assert.deepEqual(parseGuildNaturalCommand("VCの文字起こしを開始して"), { action: "voice_start", title: null });
+  assert.deepEqual(parseGuildNaturalCommand("VCの録音を止めて"), { action: "voice_stop" });
+  assert.deepEqual(parseGuildNaturalCommand("VC文字起こしの状態を見せて"), { action: "voice_status" });
+  assert.deepEqual(parseGuildNaturalCommand("VC録音のプライバシーを教えて"), { action: "voice_privacy" });
+  assert.deepEqual(parseGuildNaturalCommand("A1B2C3D4E5 を再処理して"), { action: "voice_reprocess", sessionId: "A1B2C3D4E5" });
+  assert.deepEqual(parseGuildNaturalCommand("A1B2C3D4E5 を削除して"), { action: "voice_delete", sessionId: "A1B2C3D4E5" });
 
   assert.deepEqual(parseGuildNaturalCommand("使い方"), { action: "help" });
   assert.deepEqual(parseTemplateManagementMessage("テンプレート「全体定例」として参加者: メンバーA、メンバーB を保存"), { action: "save", name: "全体定例" });

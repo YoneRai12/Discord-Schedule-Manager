@@ -59,6 +59,19 @@ function snowflakeList(name) {
   return values;
 }
 
+function snowflake(name) {
+  const value = String(process.env[name] ?? "").trim();
+  if (value && !/^\d{16,20}$/.test(value)) {
+    throw new Error(`${name} にはDiscordのIDを指定してください`);
+  }
+  return value;
+}
+
+function isPathInside(parent, candidate) {
+  const relative = path.relative(parent, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
 export function loadConfig({ requireSecrets = true } = {}) {
   const defaultReminders = parseIntegerList(process.env.MEETING_DEFAULT_REMINDERS_MINUTES || "30,0");
   const personalDefaultReminders = parseIntegerList(
@@ -72,6 +85,40 @@ export function loadConfig({ requireSecrets = true } = {}) {
   );
   const dataDir = path.resolve(PROJECT_ROOT, process.env.MEETING_DATA_DIR || "data");
   const serviceAccountFile = String(process.env.GOOGLE_SERVICE_ACCOUNT_FILE ?? "").trim();
+  const meetingVoiceEnabled = boolean("MEETING_VOICE_ENABLED", false);
+  const meetingVoiceRetentionHours = integer("MEETING_VOICE_RETENTION_HOURS", 24, { min: 24, max: 24 });
+  const meetingVoiceArchiveRoot = path.resolve(
+    dataDir,
+    String(process.env.MEETING_VOICE_ARCHIVE_DIR || "voice-sessions").trim(),
+  );
+  const meetingVoiceArchiveKey = String(process.env.MEETING_VOICE_ARCHIVE_KEY ?? "").trim();
+  const meetingVoiceOutputChannelId = snowflake("MEETING_VOICE_OUTPUT_CHANNEL_ID");
+  if (!isPathInside(dataDir, meetingVoiceArchiveRoot)) {
+    throw new Error("MEETING_VOICE_ARCHIVE_DIR はMEETING_DATA_DIRの中にしてください");
+  }
+  if (meetingVoiceEnabled && !meetingVoiceOutputChannelId) {
+    throw new Error("MEETING_VOICE_OUTPUT_CHANNEL_ID が設定されていません");
+  }
+  if (meetingVoiceEnabled) {
+    let key;
+    try {
+      key = Buffer.from(meetingVoiceArchiveKey, "base64");
+    } catch {
+      key = null;
+    }
+    if (!key || key.length !== 32 || key.toString("base64") !== meetingVoiceArchiveKey) {
+      throw new Error("MEETING_VOICE_ARCHIVE_KEY は32バイトのBase64鍵にしてください");
+    }
+  }
+  const meetingVoiceAiSummaryEnabled = boolean("MEETING_VOICE_AI_SUMMARY_ENABLED", false);
+  const meetingVoiceFactCheckEnabled = boolean("MEETING_VOICE_FACT_CHECK_ENABLED", false);
+  if (meetingVoiceFactCheckEnabled && !meetingVoiceAiSummaryEnabled) {
+    throw new Error("MEETING_VOICE_FACT_CHECK_ENABLED にはMEETING_VOICE_AI_SUMMARY_ENABLED=trueが必要です");
+  }
+  const meetingAiProvider = choice("MEETING_AI_PROVIDER", "openai", ["openai", "codex_app_server"]);
+  if (meetingVoiceAiSummaryEnabled && meetingAiProvider !== "codex_app_server") {
+    throw new Error("VC要約を有効にする場合はMEETING_AI_PROVIDER=codex_app_serverにしてください");
+  }
 
   return {
     projectRoot: PROJECT_ROOT,
@@ -87,7 +134,7 @@ export function loadConfig({ requireSecrets = true } = {}) {
     maxLateMinutes: integer("MEETING_MAX_LATE_MINUTES", 10, { min: 0, max: 1_440 }),
     dataDir,
     databasePath: path.join(dataDir, "meetings.sqlite3"),
-    meetingAiProvider: choice("MEETING_AI_PROVIDER", "openai", ["openai", "codex_app_server"]),
+    meetingAiProvider,
     openaiApiKey: String(process.env.OPENAI_API_KEY ?? "").trim(),
     openaiModel: String(process.env.OPENAI_MEETING_MODEL || "gpt-5.6-terra").trim(),
     openaiReasoningEffort: choice(
@@ -114,5 +161,18 @@ export function loadConfig({ requireSecrets = true } = {}) {
     webSyncIntervalSeconds: integer("MEETING_WEB_SYNC_INTERVAL_SECONDS", 60, { min: 15, max: 3_600 }),
     webSyncTimeoutMs: integer("MEETING_WEB_SYNC_TIMEOUT_MS", 8_000, { min: 250, max: 60_000 }),
     webSyncMaxRetries: integer("MEETING_WEB_SYNC_MAX_RETRIES", 2, { min: 0, max: 5 }),
+    meetingVoiceEnabled,
+    meetingVoiceOutputChannelId,
+    meetingVoiceRetentionHours,
+    meetingVoiceArchiveRoot,
+    meetingVoiceArchiveKey,
+    meetingVoiceMaxSessionMinutes: integer("MEETING_VOICE_MAX_SESSION_MINUTES", 240, { min: 5, max: 480 }),
+    meetingVoiceNoticeIntervalMinutes: integer("MEETING_VOICE_NOTICE_INTERVAL_MINUTES", 30, { min: 5, max: 60 }),
+    meetingVoiceMaxParticipants: integer("MEETING_VOICE_MAX_PARTICIPANTS", 20, { min: 1, max: 25 }),
+    meetingVoicePythonCommand: String(process.env.MEETING_VOICE_PYTHON_COMMAND || "python").trim(),
+    meetingVoiceSttModel: String(process.env.MEETING_VOICE_STT_MODEL || "large-v3").trim(),
+    meetingVoiceSttDevice: choice("MEETING_VOICE_STT_DEVICE", "auto", ["auto", "cuda", "cpu"]),
+    meetingVoiceAiSummaryEnabled,
+    meetingVoiceFactCheckEnabled,
   };
 }

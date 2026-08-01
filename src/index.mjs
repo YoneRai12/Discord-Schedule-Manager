@@ -1,4 +1,5 @@
 import "dotenv/config";
+import path from "node:path";
 import { Events } from "discord.js";
 import { loadConfig } from "./config.mjs";
 import { MeetingCoordinator } from "./coordinator.mjs";
@@ -15,6 +16,12 @@ import { PersonalReminderScheduler } from "./personal-reminder-scheduler.mjs";
 import { MeetingScheduler } from "./scheduler.mjs";
 import { GoogleSheetsSync } from "./sheets-sync.mjs";
 import { MeetingWebSync } from "./web-sync.mjs";
+import { DiscordVoiceReceiver } from "./voice/discord-voice-receiver.mjs";
+import { LocalTranscriber } from "./voice/local-transcriber.mjs";
+import { VoiceMeetingController } from "./voice/voice-meeting-controller.mjs";
+import { VoiceMinutesAnalyzer } from "./voice/voice-minutes-analyzer.mjs";
+import { VoiceSessionArchive } from "./voice/voice-session-archive.mjs";
+import { VoiceSummaryPublisher } from "./voice/voice-summary-publisher.mjs";
 import {
   initializeOptionalSheets,
   stopSchedulerAndDrain,
@@ -23,7 +30,7 @@ import {
 const config = loadConfig();
 const client = createDiscordClient();
 const store = new MeetingDatabase(config.databasePath);
-const codexProvider = config.meetingAiProvider === "codex_app_server"
+const codexProvider = (config.meetingAiProvider === "codex_app_server" || config.meetingVoiceAiSummaryEnabled)
   ? new CodexAppServerProvider({
     command: config.codexAppServerCommand,
     model: config.codexMeetingModel,
@@ -66,7 +73,59 @@ const meetingCardUpdateScheduler = new MeetingCardUpdateScheduler({
   attendeeMentionOffsets: config.attendeeMentionOffsets,
   intervalSeconds: config.schedulerIntervalSeconds,
 });
-const coordinator = new MeetingCoordinator({
+const voiceArchive = config.meetingVoiceEnabled
+  ? new VoiceSessionArchive({
+    rootDir: config.meetingVoiceArchiveRoot,
+    encryptionKey: config.meetingVoiceArchiveKey,
+    retentionMs: config.meetingVoiceRetentionHours * 60 * 60_000,
+    logger: console,
+  })
+  : null;
+const voiceReceiver = voiceArchive ? new DiscordVoiceReceiver({ archive: voiceArchive }) : null;
+const voiceTranscriber = voiceArchive
+  ? new LocalTranscriber({
+    archive: voiceArchive,
+    pythonCommand: config.meetingVoicePythonCommand,
+    scriptPath: path.join(config.projectRoot, "scripts", "transcribe_voice_session.py"),
+    model: config.meetingVoiceSttModel,
+    device: config.meetingVoiceSttDevice,
+  })
+  : null;
+const voiceAnalyzer = config.meetingVoiceEnabled && config.meetingVoiceAiSummaryEnabled
+  ? new VoiceMinutesAnalyzer({
+    provider: codexProvider,
+    summaryEnabled: true,
+    factCheckEnabled: config.meetingVoiceFactCheckEnabled,
+  })
+  : null;
+const voicePublisher = config.meetingVoiceEnabled
+  ? new VoiceSummaryPublisher({
+    client,
+    guildId: config.guildId,
+    outputChannelId: config.meetingVoiceOutputChannelId,
+  })
+  : null;
+let coordinator;
+const voiceMeetingController = config.meetingVoiceEnabled
+  ? new VoiceMeetingController({
+    client,
+    guildId: config.guildId,
+    outputChannelId: config.meetingVoiceOutputChannelId,
+    archive: voiceArchive,
+    receiver: voiceReceiver,
+    transcriber: voiceTranscriber,
+    analyzer: voiceAnalyzer,
+    publisher: voicePublisher,
+    enabled: true,
+    summaryEnabled: config.meetingVoiceAiSummaryEnabled,
+    factCheckEnabled: config.meetingVoiceFactCheckEnabled,
+    maxSessionMinutes: config.meetingVoiceMaxSessionMinutes,
+    noticeIntervalMinutes: config.meetingVoiceNoticeIntervalMinutes,
+    maxParticipants: config.meetingVoiceMaxParticipants,
+    canManage: (subject) => coordinator?.canManage(subject) === true,
+  })
+  : null;
+coordinator = new MeetingCoordinator({
   client,
   store,
   interpreter,
@@ -75,6 +134,7 @@ const coordinator = new MeetingCoordinator({
   directMessenger,
   directInviteUpdateScheduler,
   meetingCardUpdateScheduler,
+  voiceMeetingController,
 });
 const scheduler = new MeetingScheduler({
   client,
@@ -107,6 +167,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     const guild = await readyClient.guilds.fetch(config.guildId);
     store.bindTenant({ guildId: guild.id, botUserId: readyClient.user.id });
     await coordinator.registerCommands();
+    await voiceMeetingController?.initialize();
     const sheetsStartup = await initializeOptionalSheets({
       sheetsSync,
       intervalMs: config.sheetsSyncIntervalSeconds * 1_000,
@@ -188,6 +249,14 @@ client.on(Events.InteractionCreate, async (interaction) => {
   }
 });
 
+client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+  if (!voiceMeetingController) return;
+  void voiceMeetingController.handleVoiceStateUpdate(oldState, newState).catch((error) => {
+    const code = String(error?.code || error?.status || error?.name || "unknown").slice(0, 80);
+    console.error(`[voice] state update failed code=${code}`);
+  });
+});
+
 client.on(Events.Error, (error) => {
   const code = String(error?.code || error?.name || "unknown").slice(0, 80);
   console.error(`[discord] client error code=${code}`);
@@ -208,6 +277,7 @@ async function shutdown(exitCode = 0) {
       stopSchedulerAndDrain(directInviteUpdateScheduler, { timeoutMs: 10_000, label: "direct-invite-update-scheduler" }),
       stopSchedulerAndDrain(meetingCardUpdateScheduler, { timeoutMs: 10_000, label: "meeting-card-update-scheduler" }),
     ]);
+    await voiceMeetingController?.close?.();
     await codexProvider?.close?.();
     try {
       client.destroy();

@@ -68,6 +68,30 @@ export function parseGuildNaturalCommand(rawText, { knownMeetingIds = [] } = {})
   if (!text) return { action: "help" };
   const meetingId = extractMeetingId(text, { knownIds: knownMeetingIds });
 
+  const voiceSessionId = text.match(/(?:^|\s)([A-F0-9]{10})(?=\s|$)/iu)?.[1]?.toUpperCase() || null;
+  if (/(?:VC|ボイス|音声).*(?:プライバシー|保存期間|データの扱い)|(?:プライバシー|保存期間).*(?:VC|ボイス|音声)/iu.test(text)) {
+    return { action: "voice_privacy" };
+  }
+  if (/(?:VC|ボイス|音声|文字起こし).*(?:状態|状況|同意.*確認)|(?:状態|状況).*(?:VC|ボイス|文字起こし)/iu.test(text)) {
+    return { action: "voice_status" };
+  }
+  if (voiceSessionId && /(?:再処理|再作成|やり直)/u.test(text)) {
+    return { action: "voice_reprocess", sessionId: voiceSessionId };
+  }
+  if (voiceSessionId && /(?:削除|消去|消して)/u.test(text)) {
+    return { action: "voice_delete", sessionId: voiceSessionId };
+  }
+  if (/(?:VC|ボイス|音声|文字起こし|録音).*(?:停止|終了|止め)|(?:停止|終了|止め).*(?:VC|ボイス|音声|文字起こし|録音)/iu.test(text)) {
+    return { action: "voice_stop" };
+  }
+  if (/(?:VC|ボイス|音声).*(?:文字起こし|議事録|録音).*(?:開始|始め|作って)|(?:文字起こし|議事録|録音).*(?:開始|始め).*(?:VC|ボイス|音声)?/iu.test(text)) {
+    const title = text
+      .replace(/(?:VC|ボイス(?:チャンネル)?|音声|文字起こし|議事録|録音|を|の|開始|始めて?|作って|して|ください|お願い)/giu, " ")
+      .replace(/\s+/gu, " ")
+      .trim();
+    return { action: "voice_start", title: title || null };
+  }
+
   const meetingComposition = looksLikeMeetingComposition(text);
   if (!meetingComposition && isTemplateHelpIntent(text)) return { action: "template_help" };
   if (!meetingComposition && isHelpIntent(text)) return { action: "help" };

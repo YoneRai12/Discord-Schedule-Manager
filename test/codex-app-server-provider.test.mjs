@@ -220,6 +220,36 @@ test("Codex子プロセスへBot・Sheets・OpenAIの秘密環境変数を継承
   });
 });
 
+test("allowWebSearch=trueの要求だけweb_search liveとnetworkを許可し、他ツールは無効のまま", async (t) => {
+  const paths = temporaryProviderPaths(t);
+  const fake = fakeAppServer();
+  const provider = new CodexAppServerProvider({
+    environment: { PATH: "safe", USERPROFILE: paths.root, CODEX_HOME: paths.sourceHome },
+    sandboxDir: paths.sandboxDir,
+    spawnImpl: () => fake.child,
+    logger: { warn() {}, error() {} },
+  });
+  t.after(() => provider.close());
+
+  await provider.generateStructured({
+    systemPrompt: "単一の公開claimを検証する",
+    userPayload: { claim: "Node.js 24は2025年に公開された。" },
+    outputSchema: { type: "object" },
+    allowWebSearch: true,
+  });
+
+  const thread = fake.messages.find((message) => message.method === "thread/start");
+  const turn = fake.messages.find((message) => message.method === "turn/start");
+  assert.equal(thread.params.config.web_search, "live");
+  assert.deepEqual(turn.params.sandboxPolicy, { type: "readOnly", networkAccess: true });
+  assert.deepEqual(thread.params.config.mcp_servers, {});
+  assert.equal(thread.params.config.features.apps, false);
+  assert.equal(thread.params.config.features.remote_plugin, false);
+  assert.equal(thread.params.config.features.shell_tool, false);
+  assert.equal(thread.params.config.features.unified_exec, false);
+  assert.match(thread.params.baseInstructions, /ウェブ検索以外のツール/u);
+});
+
 test("Codex turn失敗の診断は安全な型と状態だけを残し本文を保持しない", async (t) => {
   const paths = temporaryProviderPaths(t);
   const fake = fakeAppServer({

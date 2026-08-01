@@ -147,6 +147,7 @@ export class MeetingCoordinator {
     directMessenger = null,
     directInviteUpdateScheduler = null,
     meetingCardUpdateScheduler = null,
+    voiceMeetingController = null,
     meetingUrlResolver = resolveMeetingUrl,
     logger = console,
   }) {
@@ -159,6 +160,7 @@ export class MeetingCoordinator {
     this.directMessenger = directMessenger;
     this.directInviteUpdateScheduler = directInviteUpdateScheduler;
     this.meetingCardUpdateScheduler = meetingCardUpdateScheduler;
+    this.voiceMeetingController = voiceMeetingController;
     this.meetingUrlResolver = meetingUrlResolver;
     this.logger = logger;
     this.drafts = new Map();
@@ -482,6 +484,47 @@ export class MeetingCoordinator {
     }
 
     const localCommand = parseGuildNaturalCommand(rawText, { knownMeetingIds });
+    if (localCommand?.action === "voice_privacy") {
+      await replyText(this.voiceMeetingController?.privacyText() || "VC文字起こし機能はまだ設定されていません。");
+      return;
+    }
+    if (localCommand?.action === "voice_status") {
+      await replyText(this.voiceMeetingController?.statusText(message) || "VC文字起こし機能はまだ設定されていません。");
+      return;
+    }
+    if (localCommand?.action === "voice_stop") {
+      if (!this.voiceMeetingController) {
+        await replyText("VC文字起こし機能はまだ設定されていません。");
+        return;
+      }
+      const userId = String(message.author?.id || "");
+      const isParticipant = this.voiceMeetingController.session?.requiredUserIds?.has?.(userId);
+      if (!this.canManage(message) && !isParticipant) {
+        await replyText("現在のVC参加者または会議管理者だけが停止できます。");
+        return;
+      }
+      const result = await this.voiceMeetingController.stopSession({ reason: "manual", requestedById: userId });
+      await replyText(result.stopped ? `停止しました。セッション ${result.sessionId} の議事録を処理しています。` : "動作中のVC文字起こしはありません。");
+      return;
+    }
+    if (["voice_start", "voice_reprocess", "voice_delete"].includes(localCommand?.action)) {
+      if (!(await this.requireManager(message, replyText))) return;
+      if (!this.voiceMeetingController) {
+        await replyText("VC文字起こし機能はまだ設定されていません。");
+        return;
+      }
+      if (localCommand.action === "voice_start") {
+        const result = await this.voiceMeetingController.requestStart(message, { title: localCommand.title || "VCミーティング" });
+        await replyText(`専用チャンネルで参加者全員の同意を確認します。セッション: ${result.sessionId}`);
+      } else if (localCommand.action === "voice_reprocess") {
+        const result = await this.voiceMeetingController.reprocess(localCommand.sessionId);
+        await replyText(`セッション ${result.sessionId} の再処理を開始しました。`);
+      } else {
+        await this.voiceMeetingController.deleteSession(localCommand.sessionId);
+        await replyText(`セッション ${localCommand.sessionId} のローカルバックアップを削除しました。`);
+      }
+      return;
+    }
     if (localCommand?.action === "template_help") {
       await replyText(this.templateHelpText());
       return;
@@ -936,6 +979,11 @@ export class MeetingCoordinator {
       await this.handleCommand(interaction);
       return;
     }
+    if (interaction.isButton() && interaction.customId.startsWith("voice:")) {
+      if (!inConfiguredGuild || !this.voiceMeetingController) return;
+      await this.voiceMeetingController.handleButton(interaction);
+      return;
+    }
     if (!interaction.isButton() || !interaction.customId.startsWith("meeting:")) return;
     const parts = interaction.customId.split(":");
     if (parts[1] === "draft") {
@@ -1352,6 +1400,26 @@ export class MeetingCoordinator {
 
   async handleCommand(interaction) {
     const subcommand = interaction.options.getSubcommand();
+    if (subcommand === "voice-privacy") {
+      await interaction.reply({
+        content: this.voiceMeetingController?.privacyText() || "VC文字起こし機能はまだ設定されていません。",
+        flags: MessageFlags.Ephemeral,
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+    if (subcommand === "voice-status") {
+      await interaction.reply({
+        content: this.voiceMeetingController?.statusText(interaction) || "VC文字起こし機能はまだ設定されていません。",
+        flags: MessageFlags.Ephemeral,
+        allowedMentions: { parse: [] },
+      });
+      return;
+    }
+    if (subcommand === "voice-stop") {
+      await this.commandVoiceStop(interaction);
+      return;
+    }
     if (subcommand === "help") {
       await interaction.reply({ content: this.helpText(), flags: MessageFlags.Ephemeral });
       return;
@@ -1382,6 +1450,81 @@ export class MeetingCoordinator {
     else if (subcommand === "template-default") await this.commandTemplateDefault(interaction);
     else if (subcommand === "template-remove") await this.commandTemplateRemove(interaction);
     else if (subcommand === "invite") await this.commandInvite(interaction);
+    else if (subcommand === "voice-start") await this.commandVoiceStart(interaction);
+    else if (subcommand === "voice-reprocess") await this.commandVoiceReprocess(interaction);
+    else if (subcommand === "voice-delete") await this.commandVoiceDelete(interaction);
+  }
+
+  async commandVoiceStart(interaction) {
+    if (!this.voiceMeetingController) {
+      await interaction.reply({ content: "VC文字起こし機能はまだ設定されていません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    try {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const result = await this.voiceMeetingController.requestStart(interaction, {
+        title: interaction.options.getString("title") || "VCミーティング",
+      });
+      await interaction.editReply({
+        content: `専用チャンネルで参加者全員の同意を確認します。セッション: ${result.sessionId}`,
+        allowedMentions: { parse: [] },
+      });
+    } catch (error) {
+      const content = safeDisplayText(error.message, 240);
+      if (interaction.deferred) await interaction.editReply({ content, allowedMentions: { parse: [] } });
+      else await interaction.reply({ content, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+    }
+  }
+
+  async commandVoiceStop(interaction) {
+    if (!this.voiceMeetingController) {
+      await interaction.reply({ content: "VC文字起こし機能はまだ設定されていません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const userId = String(interaction.user.id);
+    const isParticipant = this.voiceMeetingController.session?.requiredUserIds?.has?.(userId);
+    if (!this.canManage(interaction) && !isParticipant) {
+      await interaction.reply({ content: "現在のVC参加者または会議管理者だけが停止できます。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    try {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+      const result = await this.voiceMeetingController.stopSession({ reason: "manual", requestedById: userId });
+      await interaction.editReply({
+        content: result.stopped ? `停止しました。セッション ${result.sessionId} の議事録を処理しています。` : "動作中のVC文字起こしはありません。",
+        allowedMentions: { parse: [] },
+      });
+    } catch (error) {
+      await interaction.editReply({ content: safeDisplayText(error.message, 240), allowedMentions: { parse: [] } });
+    }
+  }
+
+  async commandVoiceReprocess(interaction) {
+    if (!this.voiceMeetingController) {
+      await interaction.reply({ content: "VC文字起こし機能はまだ設定されていません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    try {
+      const id = interaction.options.getString("session_id", true).trim().toUpperCase();
+      const result = await this.voiceMeetingController.reprocess(id);
+      await interaction.reply({ content: `セッション ${result.sessionId} の再処理を開始しました。`, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+    } catch (error) {
+      await interaction.reply({ content: safeDisplayText(error.message, 240), flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+    }
+  }
+
+  async commandVoiceDelete(interaction) {
+    if (!this.voiceMeetingController) {
+      await interaction.reply({ content: "VC文字起こし機能はまだ設定されていません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    try {
+      const id = interaction.options.getString("session_id", true).trim().toUpperCase();
+      await this.voiceMeetingController.deleteSession(id);
+      await interaction.reply({ content: `セッション ${id} のローカルバックアップを削除しました。`, flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+    } catch (error) {
+      await interaction.reply({ content: safeDisplayText(error.message, 240), flags: MessageFlags.Ephemeral, allowedMentions: { parse: [] } });
+    }
   }
 
   async commandCreate(interaction) {

@@ -8,6 +8,7 @@ test("直接メンションだけを扱うためMessageContent intentを要求�
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildVoiceStates,
   ]);
   assert.deepEqual(MEETING_PARTIALS, [Partials.Channel]);
   assert.equal(MEETING_GATEWAY_INTENTS.includes(GatewayIntentBits.MessageContent), false);
