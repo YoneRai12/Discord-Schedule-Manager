@@ -417,7 +417,7 @@ export class MeetingDatabase {
         Number(input.startsAtMs),
         Number(input.endsAtMs),
         input.timeZone || "Asia/Tokyo",
-        input.meetingUrl,
+        String(input.meetingUrl ?? "").trim(),
         JSON.stringify(reminders),
         now,
         now,

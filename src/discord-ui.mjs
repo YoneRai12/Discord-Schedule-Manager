@@ -3,11 +3,15 @@ import {
   ButtonBuilder,
   ButtonStyle,
   EmbedBuilder,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
 } from "discord.js";
 import { buildAttendeeMention } from "./attendee-mentions.mjs";
 import { discordTimestamp, reminderLabel } from "./time.mjs";
 import { formatPersonalReminderMinutes } from "./personal-reminders.mjs";
 import { safeDisplayText } from "./privacy.mjs";
+import { meetingUrlStatusText, meetingVenueFromUrl } from "./meeting-venue.mjs";
 
 const STATUS_LABELS = {
   attending: "✅ 参加",
@@ -64,9 +68,10 @@ function buildRsvpRow(meeting, { includeUrl = true } = {}) {
       .setDisabled(inactive),
   );
   if (includeUrl && !inactive && meeting.meetingUrl) {
+    const venue = meetingVenueFromUrl(meeting.meetingUrl);
     row.addComponents(
       new ButtonBuilder()
-        .setLabel("会議URLを開く")
+        .setLabel(venue.type === "discord_voice" ? "Discord VCに参加" : "会議URLを開く")
         .setEmoji("🔗")
         .setStyle(ButtonStyle.Link)
         .setURL(meeting.meetingUrl),
@@ -86,6 +91,8 @@ export function buildMeetingPayload(meeting, rsvps, options = {}) {
     .setDescription([
       `**開始:** ${discordTimestamp(meeting.startsAtMs, "F")}（${discordTimestamp(meeting.startsAtMs, "R")}）`,
       `**終了予定:** ${discordTimestamp(meeting.endsAtMs, "t")}`,
+      `**開催場所:** ${meetingVenueFromUrl(meeting.meetingUrl).label}`,
+      `**会議URL:** ${meetingUrlStatusText(meeting.meetingUrl)}`,
       `**通知:** ${reminderText(meeting, attendeeMentionOffsets)}`,
     ].join("\n"))
     .addFields(
@@ -113,7 +120,10 @@ export function buildDraftPayload(draft) {
   if (draft.startsAtMs != null) lines.push(`**開始:** ${discordTimestamp(draft.startsAtMs, "F")}`);
   if (draft.endsAtMs != null) lines.push(`**終了予定:** ${discordTimestamp(draft.endsAtMs, "t")}`);
   if (draft.reminderMinutes) lines.push(`**通知:** ${draft.reminderMinutes.map(reminderLabel).join("、") || "なし"}`);
-  lines.push(`**会議URL:** ${draft.meetingUrl ? "登録済み（GPTへは未送信）" : "変更なし"}`);
+  lines.push(`**開催場所:** ${meetingVenueFromUrl(draft.meetingUrl).label}`);
+  lines.push(`**会議URL:** ${draft.meetingUrl
+    ? meetingUrlStatusText(draft.meetingUrl)
+    : isUpdate ? "変更なし" : meetingUrlStatusText("")}`);
   if (draft.templateName) {
     lines.push(`**参加者テンプレート:** ${safeDisplayText(draft.templateName, 40)}（会議用に${draft.invitees?.length || 0}人を確定）`);
   }
@@ -128,11 +138,33 @@ export function buildDraftPayload(draft) {
     .setTitle("この内容でよいですか？")
     .setDescription(lines.join("\n"))
     .setFooter({ text: "10分以内に登録または取消を押してください" });
-  const row = new ActionRowBuilder().addComponents(
-    new ButtonBuilder()
-      .setCustomId(`meeting:draft:${draft.draftId}:confirm`)
-      .setLabel(isUpdate ? "更新する" : "登録する")
-      .setStyle(ButtonStyle.Success),
+  const row = new ActionRowBuilder();
+  if (!isUpdate && !draft.meetingUrl) {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`meeting:draft:${draft.draftId}:venue-discord`)
+        .setLabel("今いるDiscord VC")
+        .setEmoji("🎙️")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`meeting:draft:${draft.draftId}:venue-external`)
+        .setLabel("Google Meet / 外部URL")
+        .setEmoji("🔗")
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`meeting:draft:${draft.draftId}:confirm-undecided`)
+        .setLabel("未定で登録")
+        .setStyle(ButtonStyle.Success),
+    );
+  } else {
+    row.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`meeting:draft:${draft.draftId}:confirm`)
+        .setLabel(isUpdate ? "更新する" : "登録する")
+        .setStyle(ButtonStyle.Success),
+    );
+  }
+  row.addComponents(
     new ButtonBuilder()
       .setCustomId(`meeting:draft:${draft.draftId}:cancel`)
       .setLabel("取り消す")
@@ -142,6 +174,21 @@ export function buildDraftPayload(draft) {
     row.addComponents(new ButtonBuilder().setLabel("URLを確認").setStyle(ButtonStyle.Link).setURL(draft.meetingUrl));
   }
   return { embeds: [embed], components: [row], allowedMentions: { parse: [] } };
+}
+
+export function buildMeetingUrlModal(draftId) {
+  return new ModalBuilder()
+    .setCustomId(`meeting:draft:${draftId}:external-url`)
+    .setTitle("Google Meet / 外部会議URL")
+    .addComponents(new ActionRowBuilder().addComponents(
+      new TextInputBuilder()
+        .setCustomId("meeting_url")
+        .setLabel("会議URLまたはGoogleカレンダー招待URL")
+        .setPlaceholder("https://meet.google.com/...")
+        .setStyle(TextInputStyle.Short)
+        .setRequired(true)
+        .setMaxLength(2_048),
+    ));
 }
 
 export function buildDirectInvitePayload(meeting, { personalReminderMinutes = [] } = {}) {
@@ -160,7 +207,12 @@ export function buildDirectInvitePayload(meeting, { personalReminderMinutes = []
       : [
       `**開始:** ${discordTimestamp(meeting.startsAtMs, "F")}（${discordTimestamp(meeting.startsAtMs, "R")}）`,
       `**終了予定:** ${discordTimestamp(meeting.endsAtMs, "t")}`,
-      "**会議URL:** 下の「会議URLを開く」ボタン",
+      `**開催場所:** ${meetingVenueFromUrl(meeting.meetingUrl).label}`,
+      meeting.meetingUrl
+        ? meetingVenueFromUrl(meeting.meetingUrl).type === "discord_voice"
+          ? "**参加先:** 下の「Discord VCに参加」ボタン"
+          : "**参加先:** 下の「会議URLを開く」ボタン"
+        : "**参加先:** 未定です。追加されたらこのDMを自動更新します。",
       `**あなたの個別通知:** ${formatPersonalReminderMinutes(personalReminderMinutes)}`,
       "下のボタンを押すか、このDMに「参加します」「未定です」「欠席します」のように返信してください。",
       "通知時刻は「1時間前と10分前に通知して」「今回は通知なし」のように返信すると変更できます。",
@@ -228,7 +280,10 @@ export function buildPersonalReminderPayload(delivery) {
     .setDescription([
       `**会議:** ${safeDisplayText(delivery.title, 100)}`,
       `**開始:** ${discordTimestamp(delivery.startsAtMs, "F")}（${discordTimestamp(delivery.startsAtMs, "R")}）`,
-      "**会議URL:** 下のボタンから開けます。",
+      `**開催場所:** ${meetingVenueFromUrl(delivery.meetingUrl).label}`,
+      delivery.meetingUrl
+        ? "**参加先:** 下のボタンから開けます。"
+        : "**参加先:** まだ未定です。決まり次第、会議カードとDMが更新されます。",
     ].join("\n"))
     .setFooter({ text: `会議ID: ${delivery.meetingId}` });
   return { embeds: [embed], components: [buildRsvpRow(meeting)], allowedMentions: { parse: [] } };
@@ -244,8 +299,11 @@ export function buildNotificationPayload(delivery, rsvps) {
   const mentionEnabled = delivery.mentionAttendees ?? delivery.mentionEveryone ?? false;
   const attendeeMention = buildAttendeeMention(rsvps, { enabled: mentionEnabled });
   const prefix = attendeeMention.content ? `${attendeeMention.content}\n` : "";
+  const destination = delivery.meetingUrl
+    ? delivery.meetingUrl
+    : "参加先はまだ未定です。会議カードの更新を確認してください。";
   return {
-    content: `${prefix}📢 **${safeDisplayText(delivery.title, 100)}** — ${timing}\n${delivery.meetingUrl}`,
+    content: `${prefix}📢 **${safeDisplayText(delivery.title, 100)}** — ${timing}\n${destination}`,
     embeds: [
       new EmbedBuilder()
         .setColor(0xed4245)
