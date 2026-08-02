@@ -108,5 +108,5 @@ test("URL未定の作成確認は開催方法をボタンで選べる", () => {
     meetingUrl: "",
   });
   const labels = payload.components[0].toJSON().components.map((button) => button.label);
-  assert.deepEqual(labels, ["今いるDiscord VC", "Google Meet / 外部URL", "未定で登録", "取り消す"]);
+  assert.deepEqual(labels, ["Discord VCを選ぶ", "Google Meet / 外部URL", "未定で登録", "取り消す"]);
 });

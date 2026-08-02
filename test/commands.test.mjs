@@ -18,8 +18,10 @@ test("会議作成はURL未定を許可しDiscord VCを選択できる", () => {
   const create = json.options.find((option) => option.name === "create");
   const url = create?.options?.find((option) => option.name === "url");
   const voiceChannel = create?.options?.find((option) => option.name === "voice_channel");
+  const autoTranscribe = create?.options?.find((option) => option.name === "auto_transcribe");
   assert.notEqual(url?.required, true);
   assert.equal(voiceChannel?.channel_types?.length, 1);
+  assert.notEqual(autoTranscribe?.required, true);
 });
 
 test("起動時に最新のmeetingコマンド定義を対象Guildへ登録する", async () => {

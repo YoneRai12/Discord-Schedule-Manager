@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { normalizeMemberAlias } from "./participants.mjs";
 import { generateMeetingId, normalizeMeetingId } from "./meeting-id.mjs";
+import { discordVoiceChannelFromUrl } from "./meeting-venue.mjs";
 import { AttendanceTemplateRepository } from "./storage/attendance-template-repository.mjs";
 import { migrateFeatureSchema } from "./storage/feature-schema.mjs";
 import { PersonalReminderRepository } from "./storage/personal-reminder-repository.mjs";
@@ -50,6 +51,10 @@ function mapMeeting(row) {
     endsAtMs: Number(row.ends_at_ms),
     timeZone: row.time_zone,
     meetingUrl: row.meeting_url,
+    voiceChannelId: row.voice_channel_id || null,
+    voiceAutoRecord: Boolean(row.voice_auto_record),
+    voiceAutoStartedAtMs: row.voice_auto_started_at_ms == null ? null : Number(row.voice_auto_started_at_ms),
+    voiceAutoSessionId: row.voice_auto_session_id || null,
     status: row.status,
     scheduleRevision: Number(row.schedule_revision || 0),
     cardRevision: Number(row.card_revision || 0),
@@ -150,6 +155,10 @@ export class MeetingDatabase {
         ends_at_ms INTEGER NOT NULL,
         time_zone TEXT NOT NULL,
         meeting_url TEXT NOT NULL,
+        voice_channel_id TEXT,
+        voice_auto_record INTEGER NOT NULL DEFAULT 0 CHECK(voice_auto_record IN (0, 1)),
+        voice_auto_started_at_ms INTEGER,
+        voice_auto_session_id TEXT,
         status TEXT NOT NULL CHECK(status IN ('active', 'cancelled', 'completed')),
         schedule_revision INTEGER NOT NULL DEFAULT 0 CHECK(schedule_revision >= 0),
         card_revision INTEGER NOT NULL DEFAULT 0 CHECK(card_revision >= 0),
@@ -263,6 +272,7 @@ export class MeetingDatabase {
     `);
     this.migrateMeetingScheduleRevision();
     this.migrateMeetingCardRevision();
+    this.migrateMeetingVoiceAutomation();
     this.migrateGroupDeliverySchema();
     this.migrateMemberAliasSchema();
   }
@@ -318,6 +328,33 @@ export class MeetingDatabase {
     this.db.exec(`
       ALTER TABLE meetings
       ADD COLUMN card_revision INTEGER NOT NULL DEFAULT 0 CHECK(card_revision >= 0);
+    `);
+  }
+
+  migrateMeetingVoiceAutomation() {
+    const columns = this.tableColumns("meetings");
+    if (!columns.has("voice_channel_id")) this.db.exec("ALTER TABLE meetings ADD COLUMN voice_channel_id TEXT;");
+    if (!columns.has("voice_auto_record")) {
+      this.db.exec("ALTER TABLE meetings ADD COLUMN voice_auto_record INTEGER NOT NULL DEFAULT 0 CHECK(voice_auto_record IN (0, 1));");
+    }
+    if (!columns.has("voice_auto_started_at_ms")) this.db.exec("ALTER TABLE meetings ADD COLUMN voice_auto_started_at_ms INTEGER;");
+    if (!columns.has("voice_auto_session_id")) this.db.exec("ALTER TABLE meetings ADD COLUMN voice_auto_session_id TEXT;");
+
+    const rows = this.db.prepare(`
+      SELECT id, guild_id, meeting_url FROM meetings
+      WHERE voice_channel_id IS NULL AND meeting_url != ''
+    `).all();
+    const update = this.db.prepare(`
+      UPDATE meetings SET voice_channel_id = ?, voice_auto_record = 1
+      WHERE id = ? AND guild_id = ? AND voice_channel_id IS NULL
+    `);
+    for (const row of rows) {
+      const voice = discordVoiceChannelFromUrl(row.meeting_url);
+      if (voice?.guildId === String(row.guild_id)) update.run(voice.channelId, row.id, row.guild_id);
+    }
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS meetings_voice_auto_idx
+      ON meetings(guild_id, voice_channel_id, voice_auto_record, voice_auto_started_at_ms, starts_at_ms);
     `);
   }
 
@@ -399,13 +436,18 @@ export class MeetingDatabase {
     const id = input.id ? normalizeMeetingId(input.id) : this.generateMeetingId();
     const reminders = normalizeReminderMinutes(input.reminderMinutes);
     const messageId = input.messageId ? String(input.messageId) : null;
+    const meetingUrl = String(input.meetingUrl ?? "").trim();
+    const voiceTarget = discordVoiceChannelFromUrl(meetingUrl);
+    const voiceChannelId = voiceTarget?.guildId === String(input.guildId) ? voiceTarget.channelId : null;
+    const voiceAutoRecord = voiceChannelId && input.voiceAutoRecord !== false ? 1 : 0;
     this.transaction(() => {
       this.db.prepare(`
         INSERT INTO meetings(
           id, guild_id, channel_id, message_id, created_by_id, created_by_name,
-          title, starts_at_ms, ends_at_ms, time_zone, meeting_url, status,
+          title, starts_at_ms, ends_at_ms, time_zone, meeting_url,
+          voice_channel_id, voice_auto_record, status,
           reminder_minutes_json, created_at_ms, updated_at_ms
-        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
       `).run(
         id,
         String(input.guildId),
@@ -417,7 +459,9 @@ export class MeetingDatabase {
         Number(input.startsAtMs),
         Number(input.endsAtMs),
         input.timeZone || "Asia/Tokyo",
-        String(input.meetingUrl ?? "").trim(),
+        meetingUrl,
+        voiceChannelId,
+        voiceAutoRecord,
         JSON.stringify(reminders),
         now,
         now,
@@ -518,7 +562,15 @@ export class MeetingDatabase {
       meetingUrl: patch.meetingUrl ?? current.meetingUrl,
       reminderMinutes: normalizeReminderMinutes(patch.reminderMinutes ?? current.reminderMinutes),
     };
+    const voiceTarget = discordVoiceChannelFromUrl(next.meetingUrl);
+    const voiceChannelId = voiceTarget?.guildId === current.guildId ? voiceTarget.channelId : null;
+    const voiceAutoRecord = voiceChannelId
+      ? Object.hasOwn(patch, "voiceAutoRecord")
+        ? (patch.voiceAutoRecord ? 1 : 0)
+        : voiceChannelId === current.voiceChannelId ? (current.voiceAutoRecord ? 1 : 0) : 1
+      : 0;
     const startsAtChanged = next.startsAtMs !== current.startsAtMs;
+    const voiceScheduleChanged = startsAtChanged || voiceChannelId !== current.voiceChannelId;
     const remindersChanged = JSON.stringify(next.reminderMinutes) !== JSON.stringify(current.reminderMinutes);
     const nextRevision = startsAtChanged ? current.scheduleRevision + 1 : current.scheduleRevision;
     const nextUpdatedAtMs = Math.max(Date.now(), current.updatedAtMs + 1);
@@ -526,6 +578,9 @@ export class MeetingDatabase {
       const update = this.db.prepare(`
         UPDATE meetings
         SET title = ?, starts_at_ms = ?, ends_at_ms = ?, meeting_url = ?,
+            voice_channel_id = ?, voice_auto_record = ?,
+            voice_auto_started_at_ms = CASE WHEN ? = 1 THEN NULL ELSE voice_auto_started_at_ms END,
+            voice_auto_session_id = CASE WHEN ? = 1 THEN NULL ELSE voice_auto_session_id END,
             reminder_minutes_json = ?, schedule_revision = ?, card_revision = card_revision + 1,
             updated_at_ms = ?
         WHERE id = ? AND status = 'active' AND updated_at_ms = ?
@@ -534,6 +589,10 @@ export class MeetingDatabase {
         next.startsAtMs,
         next.endsAtMs,
         next.meetingUrl,
+        voiceChannelId,
+        voiceAutoRecord,
+        voiceScheduleChanged ? 1 : 0,
+        voiceScheduleChanged ? 1 : 0,
         JSON.stringify(next.reminderMinutes),
         nextRevision,
         nextUpdatedAtMs,
@@ -595,13 +654,27 @@ export class MeetingDatabase {
     if (!current) throw new Error("会議が見つかりません");
     if (current.status !== "active") throw new Error("終了または中止済みの会議は更新できません");
     if (expectedUpdatedAtMs != null && current.updatedAtMs !== expectedUpdatedAtMs) throw updateConflict();
+    const normalizedUrl = String(meetingUrl ?? "").trim();
+    const voiceTarget = discordVoiceChannelFromUrl(normalizedUrl);
+    const voiceChannelId = voiceTarget?.guildId === current.guildId ? voiceTarget.channelId : null;
+    const voiceAutoRecord = voiceChannelId
+      ? voiceChannelId === current.voiceChannelId ? (current.voiceAutoRecord ? 1 : 0) : 1
+      : 0;
+    const voiceScheduleChanged = voiceChannelId !== current.voiceChannelId;
     const nextUpdatedAtMs = Math.max(Date.now(), current.updatedAtMs + 1);
     this.transaction(() => {
       const result = this.db.prepare(`
-        UPDATE meetings SET meeting_url = ?, card_revision = card_revision + 1, updated_at_ms = ?
+        UPDATE meetings SET meeting_url = ?, voice_channel_id = ?, voice_auto_record = ?,
+          voice_auto_started_at_ms = CASE WHEN ? = 1 THEN NULL ELSE voice_auto_started_at_ms END,
+          voice_auto_session_id = CASE WHEN ? = 1 THEN NULL ELSE voice_auto_session_id END,
+          card_revision = card_revision + 1, updated_at_ms = ?
         WHERE id = ? AND status = 'active' AND updated_at_ms = ?
       `).run(
-        String(meetingUrl),
+        normalizedUrl,
+        voiceChannelId,
+        voiceAutoRecord,
+        voiceScheduleChanged ? 1 : 0,
+        voiceScheduleChanged ? 1 : 0,
         nextUpdatedAtMs,
         normalizedId,
         current.updatedAtMs,
@@ -734,6 +807,139 @@ export class MeetingDatabase {
       WHERE guild_id = ? AND status = 'active' AND ends_at_ms >= ?
       ORDER BY starts_at_ms ASC LIMIT ?
     `).all(String(guildId), nowMs, limit).map(mapMeeting);
+  }
+
+  listVoiceAutoStartCandidates(guildId, {
+    nowMs = Date.now(),
+    earlyMinutes = 15,
+    limit = 20,
+  } = {}) {
+    const latestStartMs = Number(nowMs) + Math.max(0, Number(earlyMinutes) || 0) * 60_000;
+    return this.db.prepare(`
+      SELECT * FROM meetings
+      WHERE guild_id = ? AND status = 'active'
+        AND voice_auto_record = 1 AND voice_channel_id IS NOT NULL
+        AND voice_auto_started_at_ms IS NULL
+        AND starts_at_ms <= ? AND ends_at_ms >= ?
+      ORDER BY starts_at_ms ASC, created_at_ms ASC
+      LIMIT ?
+    `).all(String(guildId), latestStartMs, Number(nowMs), Math.max(1, Number(limit) || 20)).map(mapMeeting);
+  }
+
+  claimVoiceAutoStart(id, claimToken, {
+    nowMs = Date.now(),
+    earlyMinutes = 15,
+    expectedUpdatedAtMs = null,
+    expectedVoiceChannelId = null,
+  } = {}) {
+    const token = `claim:${String(claimToken ?? "").trim()}`;
+    if (!/^claim:[A-Za-z0-9_-]{8,80}$/u.test(token)) throw new Error("VC自動開始claimの形式が正しくありません");
+    const normalizedId = normalizeMeetingId(id);
+    const snapshot = this.getMeeting(normalizedId);
+    if (!snapshot) return false;
+    const expectedRevision = expectedUpdatedAtMs == null
+      ? snapshot.updatedAtMs
+      : Number(expectedUpdatedAtMs);
+    const expectedChannel = String(expectedVoiceChannelId ?? snapshot.voiceChannelId ?? "").trim();
+    if (!Number.isSafeInteger(expectedRevision) || !expectedChannel) return false;
+    const currentMs = Number(nowMs);
+    const leadMs = Math.max(0, Number(earlyMinutes) || 0) * 60_000;
+    if (!Number.isSafeInteger(currentMs) || !Number.isSafeInteger(leadMs)) return false;
+    const result = this.db.prepare(`
+      UPDATE meetings
+      SET voice_auto_started_at_ms = ?, voice_auto_session_id = ?
+      WHERE id = ? AND status = 'active' AND voice_auto_record = 1
+        AND voice_channel_id = ? AND updated_at_ms = ?
+        AND voice_auto_started_at_ms IS NULL
+        AND starts_at_ms <= ? AND ends_at_ms >= ?
+    `).run(
+      currentMs,
+      token,
+      normalizedId,
+      expectedChannel,
+      expectedRevision,
+      currentMs + leadMs,
+      currentMs,
+    );
+    return result.changes === 1;
+  }
+
+  finalizeVoiceAutoStart(id, claimToken, sessionId, { nowMs = Date.now() } = {}) {
+    const token = `claim:${String(claimToken ?? "").trim()}`;
+    const normalizedId = normalizeMeetingId(id);
+    const current = this.getMeeting(normalizedId);
+    if (!current) throw new Error("会議が見つかりません");
+    const updatedAtMs = Math.max(Number(nowMs), current.updatedAtMs + 1);
+    return this.transaction(() => {
+      const result = this.db.prepare(`
+        UPDATE meetings
+        SET voice_auto_session_id = ?, card_revision = card_revision + 1, updated_at_ms = ?
+        WHERE id = ? AND voice_auto_session_id = ?
+      `).run(String(sessionId), updatedAtMs, normalizedId, token);
+      if (result.changes !== 1) return false;
+      this.queueMeetingCardUpdateInternal(normalizedId, current.cardRevision + 1, updatedAtMs);
+      return true;
+    });
+  }
+
+  isVoiceAutoSessionCurrent(id, sessionId, {
+    voiceChannelId,
+    nowMs = Date.now(),
+    earlyMinutes = 15,
+  } = {}) {
+    const normalizedId = normalizeMeetingId(id);
+    const session = String(sessionId ?? "").trim();
+    const channel = String(voiceChannelId ?? "").trim();
+    const currentMs = Number(nowMs);
+    const leadMs = Math.max(0, Number(earlyMinutes) || 0) * 60_000;
+    if (!session || session.startsWith("claim:") || !channel) return false;
+    if (!Number.isSafeInteger(currentMs) || !Number.isSafeInteger(leadMs)) return false;
+    return Boolean(this.db.prepare(`
+      SELECT 1 FROM meetings
+      WHERE id = ? AND voice_auto_session_id = ? AND voice_channel_id = ?
+        AND status = 'active' AND voice_auto_record = 1
+        AND starts_at_ms <= ? AND ends_at_ms >= ?
+      LIMIT 1
+    `).get(normalizedId, session, channel, currentMs + leadMs, currentMs));
+  }
+
+  releaseVoiceAutoStart(id, sessionId, { expectedVoiceChannelId = null } = {}) {
+    const rawSession = String(sessionId ?? "").trim();
+    if (!rawSession) return false;
+    const storedSession = rawSession.startsWith("claim:")
+      ? rawSession
+      : /^[A-Fa-f0-9]{10}$/u.test(rawSession)
+        ? rawSession.toUpperCase()
+        : `claim:${rawSession}`;
+    const expectedChannel = String(expectedVoiceChannelId ?? "").trim();
+    const result = this.db.prepare(`
+      UPDATE meetings
+      SET voice_auto_started_at_ms = NULL, voice_auto_session_id = NULL
+      WHERE id = ? AND voice_auto_session_id = ?
+        AND (? = '' OR voice_channel_id = ?)
+    `).run(normalizeMeetingId(id), storedSession, expectedChannel, expectedChannel);
+    return result.changes === 1;
+  }
+
+  recoverStaleVoiceAutoClaims({ nowMs = Date.now(), staleAfterMs = 5 * 60_000 } = {}) {
+    const cutoff = Number(nowMs) - Math.max(60_000, Number(staleAfterMs) || 5 * 60_000);
+    return this.db.prepare(`
+      UPDATE meetings
+      SET voice_auto_started_at_ms = NULL, voice_auto_session_id = NULL
+      WHERE voice_auto_session_id LIKE 'claim:%' AND voice_auto_started_at_ms <= ?
+    `).run(cutoff).changes;
+  }
+
+  listFinalizedVoiceAutoStarts(guildId, { limit = 100 } = {}) {
+    return this.db.prepare(`
+      SELECT * FROM meetings
+      WHERE guild_id = ? AND status = 'active' AND voice_auto_record = 1
+        AND voice_channel_id IS NOT NULL
+        AND voice_auto_session_id IS NOT NULL
+        AND voice_auto_session_id NOT LIKE 'claim:%'
+      ORDER BY voice_auto_started_at_ms ASC, starts_at_ms ASC
+      LIMIT ?
+    `).all(String(guildId), Math.max(1, Number(limit) || 100)).map(mapMeeting);
   }
 
   listActiveMeetingIds(guildId, { nowMs = Date.now() } = {}) {

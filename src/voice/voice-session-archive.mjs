@@ -36,6 +36,7 @@ const PRIVATE_META_FIELDS = [
   "voiceChannelId",
   "outputChannelId",
   "requestedById",
+  "sourceMeetingId",
   "title",
   "consents",
   "noticeMessageId",

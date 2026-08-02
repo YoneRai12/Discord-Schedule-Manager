@@ -169,6 +169,8 @@ export function loadConfig({ requireSecrets = true } = {}) {
     meetingVoiceMaxSessionMinutes: integer("MEETING_VOICE_MAX_SESSION_MINUTES", 240, { min: 5, max: 480 }),
     meetingVoiceNoticeIntervalMinutes: integer("MEETING_VOICE_NOTICE_INTERVAL_MINUTES", 30, { min: 5, max: 60 }),
     meetingVoiceMaxParticipants: integer("MEETING_VOICE_MAX_PARTICIPANTS", 20, { min: 1, max: 25 }),
+    meetingVoiceAutoStartEarlyMinutes: integer("MEETING_VOICE_AUTO_START_EARLY_MINUTES", 15, { min: 0, max: 120 }),
+    meetingVoiceAutoStartPollSeconds: integer("MEETING_VOICE_AUTO_START_POLL_SECONDS", 30, { min: 10, max: 120 }),
     meetingVoicePythonCommand: String(process.env.MEETING_VOICE_PYTHON_COMMAND || "python").trim(),
     meetingVoiceSttModel: String(process.env.MEETING_VOICE_STT_MODEL || "large-v3").trim(),
     meetingVoiceSttDevice: choice("MEETING_VOICE_STT_DEVICE", "auto", ["auto", "cuda", "cpu"]),

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { ChannelType } from "discord.js";
 import { MeetingCoordinator } from "../src/coordinator.mjs";
 import {
   discordVoiceChannelUrl,
@@ -34,7 +35,7 @@ test("Discord VC・Google Meet・未定を開催場所として判定する", ()
   assert.equal(meetingVenueFromUrl("").type, "undecided");
 });
 
-test("確認画面のDiscord VCボタンは操作した本人が今いるVCを参加先にする", async () => {
+test("確認画面のDiscord VCボタンは任意VCの選択メニューを表示する", async () => {
   const bot = makeCoordinator();
   const draft = bot.createDraft({
     action: "create",
@@ -53,17 +54,18 @@ test("確認画面のDiscord VCボタンは操作した本人が今いるVCを�
     guildId: GUILD_ID,
     channelId: TEXT_CHANNEL_ID,
     user: { id: draft.creatorId },
-    member: { voice: { channelId: VOICE_CHANNEL_ID } },
+    member: { voice: { channelId: null } },
     update: async (payload) => updates.push(payload),
     reply: async () => {},
   }, draft.draftId, "venue-discord");
 
-  assert.equal(draft.meetingUrl, `https://discord.com/channels/${GUILD_ID}/${VOICE_CHANNEL_ID}`);
+  assert.equal(draft.meetingUrl, "");
   assert.equal(updates.length, 1);
-  assert.match(updates[0].embeds[0].toJSON().description, /Discord VC/u);
+  assert.match(updates[0].content, /開催するVCを選んで/u);
+  assert.equal(updates[0].components[0].toJSON().components[0].channel_types[0], 2);
 });
 
-test("Discord VCボタンはVC未参加なら登録せず短い案内を返す", async () => {
+test("選択メニューで指定したVCを保存し自動議事録をONにする", async () => {
   const bot = makeCoordinator();
   const draft = bot.createDraft({
     action: "create",
@@ -76,18 +78,26 @@ test("Discord VCボタンはVC未参加なら登録せず短い案内を返す",
     reminderMinutes: [30, 0],
     meetingUrl: "",
   });
-  const replies = [];
-  await bot.handleDraftButton({
+  const updates = [];
+  const selected = {
+    id: VOICE_CHANNEL_ID,
+    guildId: GUILD_ID,
+    type: ChannelType.GuildVoice,
+  };
+  await bot.handleDraftVoiceChannelSelect({
     guildId: GUILD_ID,
     channelId: TEXT_CHANNEL_ID,
     user: { id: draft.creatorId },
-    member: { voice: { channelId: null } },
-    update: async () => {},
-    reply: async (payload) => replies.push(payload),
-  }, draft.draftId, "venue-discord");
+    memberPermissions: { has: () => true },
+    values: [VOICE_CHANNEL_ID],
+    channels: new Map([[VOICE_CHANNEL_ID, selected]]),
+    update: async (payload) => updates.push(payload),
+    reply: async () => {},
+  }, draft.draftId);
 
-  assert.equal(draft.meetingUrl, "");
-  assert.match(replies[0].content, /先に使うVCへ参加/u);
+  assert.equal(draft.meetingUrl, `https://discord.com/channels/${GUILD_ID}/${VOICE_CHANNEL_ID}`);
+  assert.equal(draft.voiceAutoRecord, true);
+  assert.match(updates[0].embeds[0].toJSON().description, /自動議事録:\*\* ON/u);
 });
 
 test("Google Meetボタンの入力欄からURLを確認画面へ戻せる", async () => {

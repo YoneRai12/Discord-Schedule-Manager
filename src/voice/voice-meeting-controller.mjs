@@ -51,12 +51,15 @@ function buttonRows(id, { active = false } = {}) {
   )];
 }
 
-function consentNotice({ id, title, required, consented, summaryEnabled, factCheckEnabled, paused = false }) {
+function consentNotice({ id, title, required, consented, summaryEnabled, factCheckEnabled, paused = false, automatic = false }) {
   return {
     content: [
       paused ? "⏸️ **新しい参加者の同意待ちのため録音を一時停止しています**" : "🎙️ **VC文字起こしの同意確認**",
       `セッション: **${safeDisplayText(id, 16)}** / ${safeDisplayText(title || "VCミーティング", 100)}`,
       `同意: **${consented}/${required}人**`,
+      automatic
+        ? "- 予定で指定されたDiscord VCへの入室を検知し、同意確認を自動で開始しました。"
+        : "- 会議管理者の操作で同意確認を開始しました。",
       "- 音声は外部の文字起こしAPIへ送らず、このPCのローカルWhisperだけで処理します。",
       "- ローカル音声・文字起こし・一時要約は、開始から24時間を上限に自動削除します。",
       "- 音声そのものはDiscordへアップロードしません。文字起こしと要約はこの専用チャンネルへ送ります。",
@@ -90,6 +93,9 @@ export class VoiceMeetingController {
     noticeIntervalMinutes = 30,
     maxParticipants = 20,
     canManage = () => false,
+    validateAutomaticSession = null,
+    releaseAutomaticSession = null,
+    automaticValidationIntervalMs = 15_000,
     logger = console,
     now = () => Date.now(),
   } = {}) {
@@ -108,6 +114,13 @@ export class VoiceMeetingController {
     this.noticeIntervalMinutes = Math.max(5, Math.min(120, Number(noticeIntervalMinutes) || 30));
     this.maxParticipants = Math.max(1, Math.min(50, Number(maxParticipants) || 20));
     this.canManage = canManage;
+    this.validateAutomaticSession = typeof validateAutomaticSession === "function"
+      ? validateAutomaticSession
+      : null;
+    this.releaseAutomaticSession = typeof releaseAutomaticSession === "function"
+      ? releaseAutomaticSession
+      : null;
+    this.automaticValidationIntervalMs = Math.max(1_000, Math.min(60_000, Number(automaticValidationIntervalMs) || 15_000));
     this.logger = logger;
     this.now = now;
     this.session = null;
@@ -115,6 +128,61 @@ export class VoiceMeetingController {
     this.maxTimer = null;
     this.noticeTimer = null;
     this.janitorTimer = null;
+    this.automaticValidationTimer = null;
+    this.starting = false;
+    this.operationTail = Promise.resolve();
+    this.automaticPendingOutcomes = new Map();
+  }
+
+  runSessionOperation(operation) {
+    const run = this.operationTail.then(operation, operation);
+    this.operationTail = run.catch(() => {});
+    return run;
+  }
+
+  automaticSessionContext(session = this.session, extra = {}) {
+    return {
+      sourceMeetingId: session?.sourceMeetingId || null,
+      voiceChannelId: session?.voiceChannel?.id || null,
+      sessionId: session?.id || null,
+      nowMs: this.now(),
+      ...extra,
+    };
+  }
+
+  startAutomaticValidationTimer() {
+    clearInterval(this.automaticValidationTimer);
+    this.automaticValidationTimer = null;
+    if (!this.session?.automatic || !this.validateAutomaticSession) return;
+    this.automaticValidationTimer = setInterval(() => {
+      void this.runSessionOperation(() => this.validateAutomaticPending()).catch((error) => {
+        this.logger.warn?.(`[voice] automatic_validation_failed code=${shortCode(error)}`);
+      });
+    }, this.automaticValidationIntervalMs);
+    this.automaticValidationTimer.unref?.();
+  }
+
+  async validateAutomaticPending() {
+    const session = this.session;
+    if (!session?.automatic || session.state !== "pending_consent" || !this.validateAutomaticSession) return true;
+    let result;
+    try {
+      result = await this.validateAutomaticSession(this.automaticSessionContext(session));
+    } catch (error) {
+      this.logger.warn?.(`[voice] automatic_validation_failed code=${shortCode(error)}`);
+      await this.cancelPending("予定の有効性を確認できないため、自動同意確認を終了しました", {
+        retryable: true,
+        releaseReason: "schedule_validation_failed",
+      });
+      return false;
+    }
+    const valid = result === true || result?.valid === true;
+    if (valid) return true;
+    await this.cancelPending("予定が終了・変更・中止されたため、自動同意確認を終了しました", {
+      retryable: true,
+      releaseReason: String(result?.reason || "schedule_invalid"),
+    });
+    return false;
   }
 
   async initialize() {
@@ -136,7 +204,8 @@ export class VoiceMeetingController {
   privacyText() {
     return [
       "**VC文字起こしのプライバシー**",
-      "- 管理者が手動で開始し、VC内の全員が毎回同意するまで録音しません。",
+      "- 管理者の手動操作、または予定で指定されたVCへの入室により同意確認を開始します。",
+      "- 自動開始でも、VC内の全員が毎回同意するまで録音しません。Botも同意完了前はVCへ入りません。",
       "- 新しい参加者が入ると全録音を停止し、その人の同意後に再開します。",
       "- 音声はこのPCだけで文字起こしし、外部STT APIへ送りません。",
       "- ローカル音声・文字起こしは開始から24時間で削除します。管理者は早期削除もできます。",
@@ -188,9 +257,6 @@ export class VoiceMeetingController {
   }
 
   async requestStart(subject, { title = "VCミーティング" } = {}) {
-    if (!this.enabled) throw new Error("VC文字起こし機能は設定されていません");
-    if (this.session && ACTIVE_STATES.has(this.session.state)) throw new Error("すでにVC文字起こしセッションが動作中です");
-    if (this.processing.size) throw new Error("前のVC文字起こしを処理中です。完了後に開始してください");
     const guild = await this.client.guilds.fetch(this.guildId);
     const actorId = String(subject?.user?.id || subject?.author?.id || "");
     const actor = await guild.members.fetch(actorId);
@@ -198,6 +264,33 @@ export class VoiceMeetingController {
     if (!voiceChannel || voiceChannel.guildId !== guild.id || voiceChannel.type === ChannelType.GuildStageVoice) {
       throw new Error("開始する本人が通常のDiscord VCへ入ってから実行してください");
     }
+    return this.requestStartForVoiceChannel({
+      guild,
+      voiceChannel,
+      requestedById: actor.id,
+      title,
+      automatic: false,
+    });
+  }
+
+  async requestStartForVoiceChannel({
+    guild: providedGuild = null,
+    voiceChannel,
+    requestedById = "system",
+    title = "VCミーティング",
+    automatic = false,
+    sourceMeetingId = null,
+  } = {}) {
+    if (!this.enabled) throw new Error("VC文字起こし機能は設定されていません");
+    if (this.starting) throw new Error("VC文字起こしの開始処理が進行中です");
+    if (this.session && ACTIVE_STATES.has(this.session.state)) throw new Error("すでにVC文字起こしセッションが動作中です");
+    if (this.processing.size) throw new Error("前のVC文字起こしを処理中です。完了後に開始してください");
+    this.starting = true;
+    try {
+      const guild = providedGuild || await this.client.guilds.fetch(this.guildId);
+      if (!voiceChannel || voiceChannel.guildId !== guild.id || voiceChannel.type !== ChannelType.GuildVoice) {
+        throw new Error("予定で指定された通常のDiscord VCを確認できません");
+      }
     const members = humanMembers(voiceChannel);
     if (!members.length || members.length > this.maxParticipants) {
       throw new Error(`VC参加者は1〜${this.maxParticipants}人の範囲で開始してください`);
@@ -212,7 +305,8 @@ export class VoiceMeetingController {
       guildId: guild.id,
       voiceChannelId: voiceChannel.id,
       outputChannelId: outputChannel.id,
-      requestedById: actor.id,
+      requestedById: String(requestedById),
+      sourceMeetingId: sourceMeetingId ? String(sourceMeetingId) : null,
       title: safeDisplayText(title, 100) || "VCミーティング",
       state: "pending_consent",
       policyRevision: CONSENT_POLICY_REVISION,
@@ -228,6 +322,7 @@ export class VoiceMeetingController {
       consented: 0,
       summaryEnabled: this.summaryEnabled,
       factCheckEnabled: this.factCheckEnabled,
+      automatic,
     }));
     this.session = {
       id,
@@ -235,7 +330,10 @@ export class VoiceMeetingController {
       voiceChannel,
       outputChannel,
       noticeMessageId: notice.id,
-      requestedById: actor.id,
+      requestedById: String(requestedById),
+      sourceMeetingId: sourceMeetingId ? String(sourceMeetingId) : null,
+      automatic: Boolean(automatic),
+      automaticReady: !automatic,
       title: record.title || safeDisplayText(title, 100),
       state: "pending_consent",
       createdAtMs,
@@ -245,6 +343,9 @@ export class VoiceMeetingController {
     };
     await this.archive.updateSession(id, { noticeMessageId: notice.id });
     return { sessionId: id, required: requiredUserIds.size, outputChannelId: outputChannel.id };
+    } finally {
+      this.starting = false;
+    }
   }
 
   async updateConsentNotice({ paused = false } = {}) {
@@ -260,6 +361,7 @@ export class VoiceMeetingController {
         summaryEnabled: this.summaryEnabled,
         factCheckEnabled: this.factCheckEnabled,
         paused,
+        automatic: session.automatic,
       }));
     } catch (error) {
       this.logger.warn?.(`[voice] consent_notice_update_failed code=${shortCode(error)}`);
@@ -267,6 +369,10 @@ export class VoiceMeetingController {
   }
 
   async consent(subject) {
+    return this.runSessionOperation(() => this.consentInternal(subject));
+  }
+
+  async consentInternal(subject) {
     const session = this.session;
     if (!session || !["pending_consent", "paused_for_consent"].includes(session.state)) {
       throw new Error("同意できるVC文字起こしセッションがありません");
@@ -278,40 +384,47 @@ export class VoiceMeetingController {
     }
     session.requiredUserIds.add(userId);
     session.consentedUserIds.add(userId);
-    const stored = await this.archive.getSession(session.id);
     await this.archive.updateSession(session.id, {
       state: session.state,
       requiredUserIds: [...session.requiredUserIds],
       consentedUserIds: [...session.consentedUserIds],
-      consents: [
-        ...(stored?.consents || []),
-        { userId, decision: "allow", decidedAtMs: this.now(), policyRevision: CONSENT_POLICY_REVISION },
-      ],
+      consent: { userId, decision: "allow", decidedAtMs: this.now(), policyRevision: CONSENT_POLICY_REVISION },
     });
     const allConsented = [...session.requiredUserIds].every((id) => session.consentedUserIds.has(id));
+    let activated = false;
     if (allConsented) {
-      if (session.state === "pending_consent") await this.beginRecording();
-      else await this.resumeRecording();
+      if (session.state === "pending_consent") {
+        if (!session.automatic || session.automaticReady) activated = await this.beginRecording();
+      } else {
+        activated = await this.resumeRecording();
+      }
     } else {
       await this.updateConsentNotice({ paused: session.state === "paused_for_consent" });
     }
-    return { allConsented, consented: session.consentedUserIds.size, required: session.requiredUserIds.size };
+    return {
+      allConsented: allConsented && activated,
+      consented: session.consentedUserIds.size,
+      required: session.requiredUserIds.size,
+    };
   }
 
   async decline(subject, { withdraw = false } = {}) {
+    return this.runSessionOperation(() => this.declineInternal(subject, { withdraw }));
+  }
+
+  async declineInternal(subject, { withdraw = false } = {}) {
     const session = this.session;
     if (!session) throw new Error("対象のVC文字起こしセッションがありません");
     const userId = String(subject.user?.id || subject.author?.id || "");
     if (!session.requiredUserIds.has(userId)) throw new Error("対象VCの参加者だけが操作できます");
-    const stored = await this.archive.getSession(session.id);
     await this.archive.updateSession(session.id, {
-      consents: [
-        ...(stored?.consents || []),
-        { userId, decision: withdraw ? "withdraw" : "deny", decidedAtMs: this.now(), policyRevision: CONSENT_POLICY_REVISION },
-      ],
+      consent: { userId, decision: withdraw ? "withdraw" : "deny", decidedAtMs: this.now(), policyRevision: CONSENT_POLICY_REVISION },
     });
     if (session.state === "pending_consent") {
-      await this.cancelPending("参加者が同意しなかったため開始を取り消しました");
+      await this.cancelPending("参加者が同意しなかったため開始を取り消しました", {
+        retryable: false,
+        releaseReason: withdraw ? "consent_withdrawn" : "consent_denied",
+      });
       return { cancelled: true };
     }
     await this.stopSession({ reason: "consent_withdrawn", requestedById: userId });
@@ -321,7 +434,26 @@ export class VoiceMeetingController {
   async beginRecording() {
     const session = this.session;
     if (!session || session.state !== "pending_consent") return false;
+    if (session.automatic && !session.automaticReady) return false;
+    if (!(await this.validateAutomaticPending())) return false;
+    if (this.session !== session || session.state !== "pending_consent") return false;
     const currentMembers = humanMembers(session.voiceChannel);
+    if (!currentMembers.length) {
+      await this.cancelPending("VCが空になったため、自動同意確認を終了しました", {
+        retryable: session.automatic,
+        releaseReason: "voice_empty",
+      });
+      return false;
+    }
+    try {
+      await this.validateOutputChannel(session.guild, currentMembers);
+    } catch (error) {
+      await this.cancelPending("参加者が議事録チャンネルを確認できないため、録音を開始しませんでした", {
+        retryable: false,
+        releaseReason: "output_channel_forbidden",
+      });
+      return false;
+    }
     const currentIds = new Set(currentMembers.map((member) => String(member.id)));
     session.requiredUserIds = currentIds;
     const allConsented = [...currentIds].every((id) => session.consentedUserIds.has(id));
@@ -335,6 +467,8 @@ export class VoiceMeetingController {
       sessionId: session.id,
       consentedUserIds: session.consentedUserIds,
     });
+    clearInterval(this.automaticValidationTimer);
+    this.automaticValidationTimer = null;
     session.state = "recording";
     await this.archive.updateSession(session.id, { state: "recording", startedAtMs: this.now() });
     const notice = await session.outputChannel.messages.fetch(session.noticeMessageId);
@@ -403,8 +537,12 @@ export class VoiceMeetingController {
   }
 
   async handleVoiceStateUpdate(oldState, newState) {
+    return this.runSessionOperation(() => this.handleVoiceStateUpdateInternal(oldState, newState));
+  }
+
+  async handleVoiceStateUpdateInternal(oldState, newState) {
     const session = this.session;
-    if (!session || !["recording", "paused_for_consent"].includes(session.state)) return false;
+    if (!session || !["pending_consent", "recording", "paused_for_consent"].includes(session.state)) return false;
     const user = newState?.member?.user || oldState?.member?.user;
     if (!user || user.bot || String(newState.guild?.id || oldState.guild?.id || "") !== this.guildId) return false;
     const userId = String(user.id);
@@ -412,8 +550,56 @@ export class VoiceMeetingController {
       && String(oldState.channelId || "") !== String(session.voiceChannel.id);
     const left = String(oldState.channelId || "") === String(session.voiceChannel.id)
       && String(newState.channelId || "") !== String(session.voiceChannel.id);
+    if (session.state === "pending_consent" && joined) {
+      try {
+        await this.validateOutputChannel(session.guild, humanMembers(session.voiceChannel));
+      } catch (error) {
+        await this.cancelPending("新しい参加者が議事録チャンネルを確認できないため、自動同意確認を終了しました", {
+          retryable: false,
+          releaseReason: "output_channel_forbidden",
+        });
+        return true;
+      }
+      session.requiredUserIds.add(userId);
+      session.consentedUserIds.delete(userId);
+      await this.archive.updateSession(session.id, {
+        state: session.state,
+        requiredUserIds: [...session.requiredUserIds],
+        consentedUserIds: [...session.consentedUserIds],
+      });
+      await this.updateConsentNotice();
+      return true;
+    }
+    if (session.state === "pending_consent" && left) {
+      session.requiredUserIds.delete(userId);
+      session.consentedUserIds.delete(userId);
+      const remaining = humanMembers(session.voiceChannel);
+      if (!remaining.length) {
+        await this.cancelPending("VCが空になったため、自動同意確認を終了しました", {
+          retryable: session.automatic,
+          releaseReason: "voice_empty",
+        });
+        return true;
+      }
+      await this.archive.updateSession(session.id, {
+        state: session.state,
+        requiredUserIds: [...session.requiredUserIds],
+        consentedUserIds: [...session.consentedUserIds],
+      });
+      if ([...session.requiredUserIds].every((id) => session.consentedUserIds.has(id))) {
+        await this.beginRecording();
+      } else {
+        await this.updateConsentNotice();
+      }
+      return true;
+    }
     if (joined && !session.consentedUserIds.has(userId)) {
       await this.pauseForConsent(userId);
+      try {
+        await this.validateOutputChannel(session.guild, humanMembers(session.voiceChannel));
+      } catch (error) {
+        await this.stopSession({ reason: "participant_output_channel_forbidden", requestedById: "system" });
+      }
       return true;
     }
     if (left) {
@@ -434,17 +620,79 @@ export class VoiceMeetingController {
     return false;
   }
 
-  async cancelPending(reason) {
+  async confirmAutomaticPending(expectedSessionId) {
+    return this.runSessionOperation(async () => {
+      const session = this.session;
+      if (!session?.automatic || session.state !== "pending_consent") return false;
+      if (String(expectedSessionId || "") !== String(session.id)) return false;
+      session.automaticReady = true;
+      this.startAutomaticValidationTimer();
+      const allConsented = [...session.requiredUserIds].every((id) => session.consentedUserIds.has(id));
+      if (!allConsented) return true;
+      return this.beginRecording();
+    });
+  }
+
+  consumeAutomaticPendingOutcome(expectedSessionId) {
+    const id = String(expectedSessionId || "");
+    const outcome = this.automaticPendingOutcomes.get(id) || null;
+    this.automaticPendingOutcomes.delete(id);
+    return outcome ? { ...outcome } : null;
+  }
+
+  async cancelAutomaticPending({
+    expectedSessionId = null,
+    reason = "automatic_cancelled",
+    retryable = true,
+  } = {}) {
+    return this.runSessionOperation(async () => {
+      const session = this.session;
+      if (!session?.automatic || session.state !== "pending_consent") return false;
+      if (expectedSessionId && String(expectedSessionId) !== String(session.id)) return false;
+      await this.cancelPending("自動議事録の開始確認を取り消しました", {
+        retryable,
+        releaseReason: reason,
+      });
+      return true;
+    });
+  }
+
+  async validateAutomaticPendingNow() {
+    return this.runSessionOperation(() => this.validateAutomaticPending());
+  }
+
+  async cancelPending(reason, { retryable = false, releaseReason = "pending_cancelled" } = {}) {
     const session = this.session;
     if (!session) return;
     clearTimeout(this.maxTimer);
     clearInterval(this.noticeTimer);
+    clearInterval(this.automaticValidationTimer);
+    this.automaticValidationTimer = null;
+    const releaseContext = this.automaticSessionContext(session, {
+      reason: String(releaseReason || "pending_cancelled"),
+    });
+    if (session.automatic) {
+      this.automaticPendingOutcomes.set(String(session.id), {
+        retryable: Boolean(retryable),
+        reason: releaseContext.reason,
+      });
+      while (this.automaticPendingOutcomes.size > 100) {
+        this.automaticPendingOutcomes.delete(this.automaticPendingOutcomes.keys().next().value);
+      }
+    }
     try {
       const notice = await session.outputChannel.messages.fetch(session.noticeMessageId);
       await notice.edit({ content: safeDisplayText(reason, 300), components: [], allowedMentions: { parse: [] } });
     } catch {}
     await this.archive.deleteSession(session.id);
     this.session = null;
+    if (retryable && session.automatic && this.releaseAutomaticSession) {
+      try {
+        await this.releaseAutomaticSession(releaseContext);
+      } catch (error) {
+        this.logger.warn?.(`[voice] automatic_release_failed code=${shortCode(error)}`);
+      }
+    }
   }
 
   async stopSession({ reason = "manual", requestedById = "system" } = {}) {
@@ -453,6 +701,8 @@ export class VoiceMeetingController {
     if (["stopping", "processing"].includes(session.state)) return { stopped: true, processing: true };
     clearTimeout(this.maxTimer);
     clearInterval(this.noticeTimer);
+    clearInterval(this.automaticValidationTimer);
+    this.automaticValidationTimer = null;
     session.state = "stopping";
     await this.archive.updateSession(session.id, { state: "stopping", stopReason: reason, stoppedById: requestedById });
     await this.receiver.stop();
@@ -564,6 +814,9 @@ export class VoiceMeetingController {
     clearInterval(this.janitorTimer);
     clearTimeout(this.maxTimer);
     clearInterval(this.noticeTimer);
+    clearInterval(this.automaticValidationTimer);
+    this.automaticValidationTimer = null;
+    await this.operationTail.catch(() => {});
     if (this.session) {
       const session = this.session;
       await this.receiver.stop({ discardActive: false });
@@ -572,6 +825,7 @@ export class VoiceMeetingController {
     }
     await Promise.allSettled([...this.processing.values()]);
     await this.archive.close?.();
+    this.automaticPendingOutcomes.clear();
   }
 }
 

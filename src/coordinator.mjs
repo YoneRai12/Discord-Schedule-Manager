@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import {
+  ChannelType,
   EmbedBuilder,
   MessageFlags,
   PermissionFlagsBits,
@@ -14,6 +15,7 @@ import {
   buildDraftPayload,
   buildMeetingPayload,
   buildMeetingUrlModal,
+  buildVoiceChannelSelectionPayload,
 } from "./discord-ui.mjs";
 import { parseGuildNaturalCommand } from "./local-command-router.mjs";
 import {
@@ -948,7 +950,7 @@ export class MeetingCoordinator {
     }
   }
 
-  buildCreateDraft({ title, startsAtMs, durationMinutes, reminderMinutes, meetingUrl, guildId, channelId, creatorId, creatorName, invitees = [], participantSource = "none", templateName = null, autoTitle = false }) {
+  buildCreateDraft({ title, startsAtMs, durationMinutes, reminderMinutes, meetingUrl, voiceAutoRecord = undefined, guildId, channelId, creatorId, creatorName, invitees = [], participantSource = "none", templateName = null, autoTitle = false }) {
     if (!title || startsAtMs == null) throw new Error("会議名と開始日時が必要です");
     const duration = durationMinutes || this.config.defaultDurationMinutes;
     return this.createDraft({
@@ -962,6 +964,7 @@ export class MeetingCoordinator {
       endsAtMs: startsAtMs + duration * 60_000,
       reminderMinutes: normalizeMeetingReminders(reminderMinutes, this.config.defaultReminders),
       meetingUrl: String(meetingUrl ?? "").trim(),
+      voiceAutoRecord,
       invitees,
       participantSource,
       templateName,
@@ -1024,6 +1027,12 @@ export class MeetingCoordinator {
       if (parts[3] === "external-url") await this.handleDraftUrlModal(interaction, parts[2]);
       return;
     }
+    if (interaction.isChannelSelectMenu?.() && interaction.customId.startsWith("meeting:draft:")) {
+      if (!inConfiguredGuild) return;
+      const parts = interaction.customId.split(":");
+      if (parts[3] === "voice-channel") await this.handleDraftVoiceChannelSelect(interaction, parts[2]);
+      return;
+    }
     if (!interaction.isButton() || !interaction.customId.startsWith("meeting:")) return;
     const parts = interaction.customId.split(":");
     if (parts[1] === "draft") {
@@ -1055,12 +1064,12 @@ export class MeetingCoordinator {
       return;
     }
     if (action === "venue-discord") {
-      try {
-        draft.meetingUrl = discordVoiceChannelUrl(interaction.guildId, interaction.member?.voice?.channelId);
-        await interaction.update(buildDraftPayload(draft));
-      } catch (error) {
-        await interaction.reply({ content: safeDisplayText(error.message, 220), flags: MessageFlags.Ephemeral });
-      }
+      await interaction.update(buildVoiceChannelSelectionPayload(draft));
+      return;
+    }
+    if (action === "voice-auto-toggle") {
+      draft.voiceAutoRecord = draft.voiceAutoRecord === false;
+      await interaction.update(buildDraftPayload(draft));
       return;
     }
     if (action === "cancel") {
@@ -1131,6 +1140,36 @@ export class MeetingCoordinator {
     }
   }
 
+  async handleDraftVoiceChannelSelect(interaction, draftId) {
+    this.cleanupDrafts();
+    const draft = this.drafts.get(draftId);
+    if (!draft || draft.expiresAtMs <= Date.now()) {
+      await interaction.reply({ content: "この確認は期限切れです。もう一度登録してください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (draft.creatorId !== interaction.user.id) {
+      await interaction.reply({ content: "この確認を操作できるのは登録を依頼した本人だけです。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (String(interaction.guildId ?? "") !== draft.guildId || String(interaction.channelId ?? "") !== draft.channelId) {
+      await interaction.reply({ content: "この確認は作成したサーバーとチャンネルでだけ操作できます。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!this.canManage(interaction)) {
+      await interaction.reply({ content: "現在は会議を管理する権限がありません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    const voiceChannelId = String(interaction.values?.[0] || "");
+    const selected = interaction.channels?.get?.(voiceChannelId);
+    if (!selected || selected.type !== ChannelType.GuildVoice || selected.guildId !== interaction.guildId) {
+      await interaction.reply({ content: "通常のDiscord VCを1つ選んでください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    draft.meetingUrl = discordVoiceChannelUrl(interaction.guildId, voiceChannelId);
+    draft.voiceAutoRecord = true;
+    await interaction.update(buildDraftPayload(draft));
+  }
+
   async confirmCreate(interaction, draft) {
     const channel = interaction.channel;
     const permissions = channel?.permissionsFor?.(this.client.user);
@@ -1155,6 +1194,7 @@ export class MeetingCoordinator {
         endsAtMs: draft.endsAtMs,
         timeZone: this.config.timeZone,
         meetingUrl: draft.meetingUrl,
+        voiceAutoRecord: draft.voiceAutoRecord,
         reminderMinutes: draft.reminderMinutes,
         attendeeMentionOffsets: this.attendeeMentionOffsets,
         messageId: interaction.message.id,
@@ -1617,8 +1657,13 @@ export class MeetingCoordinator {
   async commandCreate(interaction) {
     const rawUrl = interaction.options.getString("url")?.trim() || null;
     const voiceChannel = interaction.options.getChannel("voice_channel");
+    const autoTranscribe = interaction.options.getBoolean("auto_transcribe");
     if (rawUrl && voiceChannel) {
       await interaction.reply({ content: "会議URLとDiscord VCはどちらか一方だけ選んでください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (autoTranscribe != null && !voiceChannel) {
+      await interaction.reply({ content: "自動議事録を指定する場合はDiscord VCも選んでください。", flags: MessageFlags.Ephemeral });
       return;
     }
     let resolvingInvitation = false;
@@ -1649,6 +1694,7 @@ export class MeetingCoordinator {
         meetingUrl: voiceChannel
           ? discordVoiceChannelUrl(interaction.guildId, voiceChannel.id)
           : rawUrl ? await this.resolveSubmittedMeetingUrl([rawUrl]) : "",
+        voiceAutoRecord: voiceChannel ? autoTranscribe !== false : false,
         guildId: interaction.guildId,
         channelId: interaction.channelId,
         creatorId: interaction.user.id,
@@ -1965,7 +2011,7 @@ export class MeetingCoordinator {
       "1. 初回だけ: `/meeting member-add` または通常チャンネルでBotをメンションし、Discordメンバーへ「メンバーA」などの呼び名を登録します。",
       `2. 固定メンバー: ${mention} テンプレート「全体定例」として参加者: メンバーA、メンバーB を保存`,
       `3. 会議登録: ${mention} 来週月曜20:30から全体定例、URL未定（URLは省略できます）`,
-      "4. 黄色い確認画面で「今いるDiscord VC」「Google Meet / 外部URL」「未定で登録」から開催方法を選びます。",
+      "4. 黄色い確認画面で「Discord VCを選ぶ」「Google Meet / 外部URL」「未定で登録」から開催方法を選びます。Discord VCでは自動議事録も切り替えられます。",
       `5. URLを後から足す: 同じ会議名・日時とURLをまとめて送るか、会議カードへ ${mention} とURLを付けて返信します。`,
       "6. 招待された人はボタンまたはDMで「参加します」「未定です」「欠席します」「1時間前と10分前に通知して」と返信できます。",
       "`/meeting` の全操作は、通常チャンネルでBotをメンションして自然な日本語でも実行できます。",
