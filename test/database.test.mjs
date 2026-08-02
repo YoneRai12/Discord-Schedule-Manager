@@ -65,6 +65,13 @@ test("会議・出欠・通知をSQLiteへ再起動可能な形で保存する",
   assert.equal(rsvps[0].status, "declined");
 });
 
+test("会議URLが未定でも空文字へ正規化して保存する", (t) => {
+  const store = withDatabase(t);
+  const meeting = store.createMeeting(meetingInput({ meetingUrl: null }));
+  assert.equal(meeting.meetingUrl, "");
+  assert.equal(store.getSnapshot().meetings[0].meetingUrl, "");
+});
+
 test("同じDBを別Discordテナントへ流用しない", (t) => {
   const store = withDatabase(t);
   store.bindTenant({ guildId: GUILD_ID, botUserId: BOT_ID });

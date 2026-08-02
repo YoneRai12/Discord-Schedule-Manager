@@ -9,7 +9,12 @@ import {
   parseTemplateManagementMessage,
 } from "./attendance-templates.mjs";
 import { buildMeetingCommand } from "./commands.mjs";
-import { buildDirectConfirmationPayload, buildDraftPayload, buildMeetingPayload } from "./discord-ui.mjs";
+import {
+  buildDirectConfirmationPayload,
+  buildDraftPayload,
+  buildMeetingPayload,
+  buildMeetingUrlModal,
+} from "./discord-ui.mjs";
 import { parseGuildNaturalCommand } from "./local-command-router.mjs";
 import {
   extractMeetingIds,
@@ -18,6 +23,7 @@ import {
 } from "./meeting-id.mjs";
 import { MeetingTargetResolver } from "./meeting-target-resolver.mjs";
 import { resolveMeetingUrl } from "./meeting-url-resolver.mjs";
+import { discordVoiceChannelUrl } from "./meeting-venue.mjs";
 import { resolveParticipantSnapshot } from "./participant-resolution.mjs";
 import { MAX_TEMPLATE_MEMBERS } from "./storage/attendance-template-repository.mjs";
 import {
@@ -235,7 +241,9 @@ export class MeetingCoordinator {
       if (sameChannelOnly && String(meeting.channelId) !== String(subject?.channelId)) continue;
       if (await this.canViewMeeting(subject, meeting)) visible.push(meeting);
     }
-    if (visible.length === 1) return { status: "resolved", meeting: visible[0], candidates: visible };
+    if (visible.length === 1) {
+      return { status: "resolved", via: result?.via || null, meeting: visible[0], candidates: visible };
+    }
     if (visible.length > 1) return { status: "ambiguous", candidates: visible };
     return { status: "not_found", candidates: [] };
   }
@@ -620,6 +628,32 @@ export class MeetingCoordinator {
         missingFields: interpretation.missingFields.filter((field) => field !== "title"),
       };
     }
+    // URL未定で登録した同じ会議へ、後から日時・会議名・URLをまとめて
+    // 再送した場合は重複作成せずURL追記として扱う。対象照合はローカルだけで行う。
+    if (interpretation.action === "create" && meetingUrl && interpretation.startsAtMs != null) {
+      const existingTarget = await this.visibleMeetingTarget(message, this.meetingTargets.resolve({
+        guildId: message.guildId,
+        channelId: message.channelId,
+        authorId: message.author.id,
+        rawText,
+        replyMessageId: message.reference?.messageId || null,
+      }), { sameChannelOnly: true });
+      const canAttachToExisting = existingTarget.status === "resolved"
+        && ["explicit_id", "reply", "title"].includes(existingTarget.via)
+        && !String(existingTarget.meeting.meetingUrl ?? "").trim()
+        && Math.abs(existingTarget.meeting.startsAtMs - interpretation.startsAtMs) <= 5 * 60_000;
+      if (canAttachToExisting) {
+        interpretation = {
+          ...interpretation,
+          action: "update",
+          meetingId: existingTarget.meeting.id,
+          title: null,
+          startsAtMs: null,
+          providedFields: ["meetingUrl"],
+          missingFields: [],
+        };
+      }
+    }
     if (interpretation.action === "update" && !interpretation.meetingId) {
       const target = await this.visibleMeetingTarget(message, this.meetingTargets.resolve({
         guildId: message.guildId,
@@ -915,7 +949,7 @@ export class MeetingCoordinator {
   }
 
   buildCreateDraft({ title, startsAtMs, durationMinutes, reminderMinutes, meetingUrl, guildId, channelId, creatorId, creatorName, invitees = [], participantSource = "none", templateName = null, autoTitle = false }) {
-    if (!title || startsAtMs == null || !meetingUrl) throw new Error("会議名・開始日時・URLが必要です");
+    if (!title || startsAtMs == null) throw new Error("会議名と開始日時が必要です");
     const duration = durationMinutes || this.config.defaultDurationMinutes;
     return this.createDraft({
       action: "create",
@@ -927,7 +961,7 @@ export class MeetingCoordinator {
       startsAtMs,
       endsAtMs: startsAtMs + duration * 60_000,
       reminderMinutes: normalizeMeetingReminders(reminderMinutes, this.config.defaultReminders),
-      meetingUrl,
+      meetingUrl: String(meetingUrl ?? "").trim(),
       invitees,
       participantSource,
       templateName,
@@ -984,6 +1018,12 @@ export class MeetingCoordinator {
       await this.voiceMeetingController.handleButton(interaction);
       return;
     }
+    if (interaction.isModalSubmit?.() && interaction.customId.startsWith("meeting:draft:")) {
+      if (!inConfiguredGuild) return;
+      const parts = interaction.customId.split(":");
+      if (parts[3] === "external-url") await this.handleDraftUrlModal(interaction, parts[2]);
+      return;
+    }
     if (!interaction.isButton() || !interaction.customId.startsWith("meeting:")) return;
     const parts = interaction.customId.split(":");
     if (parts[1] === "draft") {
@@ -1010,11 +1050,25 @@ export class MeetingCoordinator {
       await interaction.reply({ content: "この確認を操作できるのは登録を依頼した本人だけです。", flags: MessageFlags.Ephemeral });
       return;
     }
+    if (action === "venue-external") {
+      await interaction.showModal(buildMeetingUrlModal(draftId));
+      return;
+    }
+    if (action === "venue-discord") {
+      try {
+        draft.meetingUrl = discordVoiceChannelUrl(interaction.guildId, interaction.member?.voice?.channelId);
+        await interaction.update(buildDraftPayload(draft));
+      } catch (error) {
+        await interaction.reply({ content: safeDisplayText(error.message, 220), flags: MessageFlags.Ephemeral });
+      }
+      return;
+    }
     if (action === "cancel") {
       this.drafts.delete(draftId);
       await interaction.update({ content: "登録を取り消しました。", embeds: [], components: [], allowedMentions: { parse: [] } });
       return;
     }
+    if (action === "confirm-undecided") action = "confirm";
     if (action !== "confirm") return;
     if (String(interaction.guildId ?? "") !== draft.guildId || String(interaction.channelId ?? "") !== draft.channelId) {
       await interaction.reply({ content: "この確認は作成したサーバーとチャンネルでだけ確定できます。", flags: MessageFlags.Ephemeral });
@@ -1039,6 +1093,39 @@ export class MeetingCoordinator {
         content: `処理に失敗しました: ${safeDisplayText(error.message, 200)}`,
         embeds: [],
         components: [],
+        allowedMentions: { parse: [] },
+      });
+    }
+  }
+
+  async handleDraftUrlModal(interaction, draftId) {
+    this.cleanupDrafts();
+    const draft = this.drafts.get(draftId);
+    if (!draft || draft.expiresAtMs <= Date.now()) {
+      await interaction.reply({ content: "この確認は期限切れです。もう一度登録してください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (draft.creatorId !== interaction.user.id) {
+      await interaction.reply({ content: "この確認を操作できるのは登録を依頼した本人だけです。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (String(interaction.guildId ?? "") !== draft.guildId || String(interaction.channelId ?? "") !== draft.channelId) {
+      await interaction.reply({ content: "この確認は作成したサーバーとチャンネルでだけ操作できます。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    if (!this.canManage(interaction)) {
+      await interaction.reply({ content: "現在は会議を管理する権限がありません。", flags: MessageFlags.Ephemeral });
+      return;
+    }
+    await interaction.deferUpdate();
+    try {
+      const rawUrl = interaction.fields.getTextInputValue("meeting_url");
+      draft.meetingUrl = await this.resolveSubmittedMeetingUrl([rawUrl]);
+      await interaction.editReply(buildDraftPayload(draft));
+    } catch (error) {
+      await interaction.followUp({
+        content: `会議URLを確認できませんでした: ${safeDisplayText(error.message, 220)}`,
+        flags: MessageFlags.Ephemeral,
         allowedMentions: { parse: [] },
       });
     }
@@ -1528,9 +1615,15 @@ export class MeetingCoordinator {
   }
 
   async commandCreate(interaction) {
-    const rawUrl = interaction.options.getString("url", true);
+    const rawUrl = interaction.options.getString("url")?.trim() || null;
+    const voiceChannel = interaction.options.getChannel("voice_channel");
+    if (rawUrl && voiceChannel) {
+      await interaction.reply({ content: "会議URLとDiscord VCはどちらか一方だけ選んでください。", flags: MessageFlags.Ephemeral });
+      return;
+    }
     let resolvingInvitation = false;
     try {
+      if (!rawUrl) throw new Error("url_not_set");
       resolvingInvitation = isCalendarInvitationUrl(normalizeMeetingUrl(rawUrl));
     } catch {
       // 入力エラーは下の共通エラー返信で案内する。
@@ -1553,7 +1646,9 @@ export class MeetingCoordinator {
         startsAtMs: start,
         durationMinutes: duration,
         reminderMinutes: reminders,
-        meetingUrl: await this.resolveSubmittedMeetingUrl([rawUrl]),
+        meetingUrl: voiceChannel
+          ? discordVoiceChannelUrl(interaction.guildId, voiceChannel.id)
+          : rawUrl ? await this.resolveSubmittedMeetingUrl([rawUrl]) : "",
         guildId: interaction.guildId,
         channelId: interaction.channelId,
         creatorId: interaction.user.id,
@@ -1869,9 +1964,9 @@ export class MeetingCoordinator {
       "**会議Botのかんたん使い方**",
       "1. 初回だけ: `/meeting member-add` または通常チャンネルでBotをメンションし、Discordメンバーへ「メンバーA」などの呼び名を登録します。",
       `2. 固定メンバー: ${mention} テンプレート「全体定例」として参加者: メンバーA、メンバーB を保存`,
-      `3. 会議登録: ${mention} 来週月曜20:30から全体定例、URLは…（Googleカレンダーの招待URLでもMeet URLを自動取得）`,
-      `4. URLを直す: 会議カードへ ${mention} とURLを付けて返信します。会議が1件だけなら \`${mention} URL\` だけでも認識します。`,
-      "5. 黄色い確認画面で日時・URL登録済み・DM送信先を確認し、「登録する」を押します。",
+      `3. 会議登録: ${mention} 来週月曜20:30から全体定例、URL未定（URLは省略できます）`,
+      "4. 黄色い確認画面で「今いるDiscord VC」「Google Meet / 外部URL」「未定で登録」から開催方法を選びます。",
+      `5. URLを後から足す: 同じ会議名・日時とURLをまとめて送るか、会議カードへ ${mention} とURLを付けて返信します。`,
       "6. 招待された人はボタンまたはDMで「参加します」「未定です」「欠席します」「1時間前と10分前に通知して」と返信できます。",
       "`/meeting` の全操作は、通常チャンネルでBotをメンションして自然な日本語でも実行できます。",
       "例: `会議一覧を見せて` / `全体定例のリンクはこれ URL` / `MEET0001の出欠状況` / `自分の通知設定を見せて`",

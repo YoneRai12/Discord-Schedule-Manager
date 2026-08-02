@@ -27,6 +27,7 @@ function createMeeting(store, {
   messageId = null,
   createdById = ADMIN_ID,
   startsAtMs = Date.now() + 2 * 60 * 60_000,
+  meetingUrl = "https://meet.example.com/original-room",
 } = {}) {
   const meeting = store.createMeeting({
     id,
@@ -38,7 +39,7 @@ function createMeeting(store, {
     startsAtMs,
     endsAtMs: startsAtMs + 60 * 60_000,
     timeZone: "Asia/Tokyo",
-    meetingUrl: "https://meet.example.com/original-room",
+    meetingUrl,
     reminderMinutes: [30, 0],
     everyoneOffsets: [0],
   });
@@ -248,6 +249,65 @@ test("会議名・日時・固定メンバー・URLを順不同で混ぜても�
     new Set(result.drafts[0].invitees.map((item) => item.userId)),
     new Set(["member-a", "member-b", "member-c"]),
   );
+});
+
+test("URL未定の自然文でも会議を作成候補にできる", async (t) => {
+  const store = fixture(t);
+  const startsAtMs = Date.now() + 3 * 60 * 60_000;
+  const { bot, aiInputs } = makeCoordinator(store, {
+    interpretation: {
+      action: "create",
+      meetingId: null,
+      title: "全体MTG",
+      startsAtMs,
+      durationMinutes: 60,
+      reminderMinutes: [30, 0],
+      providedFields: ["title", "startsAt"],
+      missingFields: [],
+      confidence: 0.97,
+      clarification: null,
+    },
+  });
+
+  const result = await requestUrlUpdate(bot, "全体MTG 3時間後 URL未定");
+  assert.equal(aiInputs.length, 1);
+  assert.equal(aiInputs[0].hasMeetingUrl, false);
+  assert.equal(result.drafts.length, 1);
+  assert.equal(result.drafts[0].action, "create");
+  assert.equal(result.drafts[0].meetingUrl, "");
+  const labels = result.replies[0].components[0].toJSON().components.map((button) => button.label);
+  assert.equal(labels.includes("未定で登録"), true);
+});
+
+test("URL未定で登録済みの同じ会議へ日時とURLを再送するとURL追記になる", async (t) => {
+  const store = fixture(t);
+  const startsAtMs = Date.now() + 4 * 60 * 60_000;
+  createMeeting(store, {
+    id: "MEET0001",
+    title: "全体MTG",
+    startsAtMs,
+    meetingUrl: "",
+  });
+  const { bot, aiInputs } = makeCoordinator(store, {
+    interpretation: {
+      action: "create",
+      meetingId: null,
+      title: "全体MTG",
+      startsAtMs,
+      durationMinutes: 60,
+      reminderMinutes: [30, 0],
+      providedFields: ["title", "startsAt", "meetingUrl"],
+      missingFields: [],
+      confidence: 0.97,
+      clarification: null,
+    },
+  });
+
+  const result = await requestUrlUpdate(bot, `全体MTG 同じ日時 URL ${REPLACEMENT_URL}`);
+  assert.equal(aiInputs.length, 1);
+  assert.equal(JSON.stringify(aiInputs).includes(REPLACEMENT_URL), false);
+  assert.equal(result.drafts.length, 1);
+  assertUrlUpdateDraft(result.drafts[0], "MEET0001");
 });
 
 test("会議名だけ無い場合は日時から仮名を付け、確認画面で自動設定と分かる", async (t) => {

@@ -75,7 +75,7 @@ action規則:
 - 会議IDが入力にない場合は推測せず meetingId=null にしてください。対象会議はBotが返信先・会議名・ローカル保存情報から安全に決めます。
 - 会議操作でない、意図が曖昧、または作成か更新か判別できない場合は unknown。
 - providedFields はユーザーが明示的に指定・変更した項目だけ。URLがある場合は meetingUrl を含めます。
-- create の不足候補は title, startsAt, meetingUrl。
+- create の不足候補は title, startsAt。会議URLは未定のまま作成でき、後から追加できます。
 - update の不足候補は requestedChanges。meetingIdの不足はBotがローカルで解決するため、不足項目にしません。
 - clarification は不足や矛盾を一文で尋ねる場合だけ設定します。
 `.trim();
@@ -139,7 +139,6 @@ export function validateInterpretation(
   if (action === "create") {
     if (!title) missingFields.push("title");
     if (startsAtMs == null) missingFields.push("startsAt");
-    if (!hasMeetingUrl) missingFields.push("meetingUrl");
   } else if (action === "update") {
     if (requestedFields.has("title") && !title) missingFields.push("title");
     if (requestedFields.has("startsAt") && startsAtMs == null) missingFields.push("startsAt");

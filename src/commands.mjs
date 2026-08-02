@@ -1,4 +1,4 @@
-import { SlashCommandBuilder } from "discord.js";
+import { ChannelType, SlashCommandBuilder } from "discord.js";
 
 function addInviteeOptions(command) {
   command.addStringOption((option) => option
@@ -36,9 +36,12 @@ export function buildMeetingCommand() {
         .setMaxLength(40))
       .addStringOption((option) => option
         .setName("url")
-        .setDescription("Google Meet・Zoomなどの会議URL")
-        .setRequired(true)
+        .setDescription("Google Meet・Zoomなどの会議URL（未定なら省略できます）")
         .setMaxLength(2_048))
+      .addChannelOption((option) => option
+        .setName("voice_channel")
+        .setDescription("Discord VCで開く場合のボイスチャンネル")
+        .addChannelTypes(ChannelType.GuildVoice))
       .addIntegerOption((option) => option
         .setName("duration")
         .setDescription("予定時間（分）。未指定は60分")
