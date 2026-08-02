@@ -34,6 +34,20 @@ export function meetingVenueFromUrl(value) {
   return { type: "external", label: MEETING_VENUES.external };
 }
 
+export function discordVoiceChannelFromUrl(value) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return null;
+  try {
+    const parsed = new URL(raw);
+    if (!DISCORD_HOSTS.has(parsed.hostname.toLowerCase())) return null;
+    const match = parsed.pathname.match(/^\/channels\/(\d{16,22})\/(\d{16,22})(?:\/)?$/u);
+    if (!match) return null;
+    return { guildId: match[1], channelId: match[2] };
+  } catch {
+    return null;
+  }
+}
+
 export function meetingUrlStatusText(value) {
   return String(value ?? "").trim()
     ? "登録済み（AIへは未送信）"

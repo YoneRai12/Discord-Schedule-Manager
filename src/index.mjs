@@ -18,6 +18,7 @@ import { GoogleSheetsSync } from "./sheets-sync.mjs";
 import { MeetingWebSync } from "./web-sync.mjs";
 import { DiscordVoiceReceiver } from "./voice/discord-voice-receiver.mjs";
 import { LocalTranscriber } from "./voice/local-transcriber.mjs";
+import { ScheduledVoiceMeetingStarter } from "./voice/scheduled-voice-meeting-starter.mjs";
 import { VoiceMeetingController } from "./voice/voice-meeting-controller.mjs";
 import { VoiceMinutesAnalyzer } from "./voice/voice-minutes-analyzer.mjs";
 import { VoiceSessionArchive } from "./voice/voice-session-archive.mjs";
@@ -123,6 +124,28 @@ const voiceMeetingController = config.meetingVoiceEnabled
     noticeIntervalMinutes: config.meetingVoiceNoticeIntervalMinutes,
     maxParticipants: config.meetingVoiceMaxParticipants,
     canManage: (subject) => coordinator?.canManage(subject) === true,
+    validateAutomaticSession: ({ sourceMeetingId, voiceChannelId, sessionId, nowMs }) => (
+      store.isVoiceAutoSessionCurrent(sourceMeetingId, sessionId, {
+        voiceChannelId,
+        nowMs,
+        earlyMinutes: config.meetingVoiceAutoStartEarlyMinutes,
+      })
+    ),
+    releaseAutomaticSession: ({ sourceMeetingId, voiceChannelId, sessionId }) => (
+      store.releaseVoiceAutoStart(sourceMeetingId, sessionId, {
+        expectedVoiceChannelId: voiceChannelId,
+      })
+    ),
+  })
+  : null;
+const scheduledVoiceMeetingStarter = voiceMeetingController
+  ? new ScheduledVoiceMeetingStarter({
+    client,
+    store,
+    controller: voiceMeetingController,
+    guildId: config.guildId,
+    earlyMinutes: config.meetingVoiceAutoStartEarlyMinutes,
+    intervalSeconds: config.meetingVoiceAutoStartPollSeconds,
   })
   : null;
 coordinator = new MeetingCoordinator({
@@ -168,6 +191,7 @@ client.once(Events.ClientReady, async (readyClient) => {
     store.bindTenant({ guildId: guild.id, botUserId: readyClient.user.id });
     await coordinator.registerCommands();
     await voiceMeetingController?.initialize();
+    await scheduledVoiceMeetingStarter?.start();
     const sheetsStartup = await initializeOptionalSheets({
       sheetsSync,
       intervalMs: config.sheetsSyncIntervalSeconds * 1_000,
@@ -251,7 +275,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
 client.on(Events.VoiceStateUpdate, (oldState, newState) => {
   if (!voiceMeetingController) return;
-  void voiceMeetingController.handleVoiceStateUpdate(oldState, newState).catch((error) => {
+  void voiceMeetingController.handleVoiceStateUpdate(oldState, newState).then((handled) => (
+    handled ? false : scheduledVoiceMeetingStarter?.handleVoiceStateUpdate(oldState, newState)
+  )).catch((error) => {
     const code = String(error?.code || error?.status || error?.name || "unknown").slice(0, 80);
     console.error(`[voice] state update failed code=${code}`);
   });
@@ -271,6 +297,7 @@ async function shutdown(exitCode = 0) {
     }
     sheetsSync.close();
     webSync.close();
+    scheduledVoiceMeetingStarter?.close();
     await Promise.all([
       stopSchedulerAndDrain(scheduler, { timeoutMs: 10_000, label: "meeting-scheduler" }),
       stopSchedulerAndDrain(personalReminderScheduler, { timeoutMs: 10_000, label: "personal-reminder-scheduler" }),

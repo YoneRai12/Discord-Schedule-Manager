@@ -2,6 +2,8 @@ import {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelSelectMenuBuilder,
+  ChannelType,
   EmbedBuilder,
   ModalBuilder,
   TextInputBuilder,
@@ -93,6 +95,12 @@ export function buildMeetingPayload(meeting, rsvps, options = {}) {
       `**終了予定:** ${discordTimestamp(meeting.endsAtMs, "t")}`,
       `**開催場所:** ${meetingVenueFromUrl(meeting.meetingUrl).label}`,
       `**会議URL:** ${meetingUrlStatusText(meeting.meetingUrl)}`,
+      ...(meeting.voiceChannelId ? [
+        `**指定VC:** <#${meeting.voiceChannelId}>`,
+        `**自動議事録:** ${meeting.voiceAutoRecord
+          ? meeting.voiceAutoStartedAtMs ? "同意確認を開始済み" : "ON（入室時に同意確認）"
+          : "OFF"}`,
+      ] : []),
       `**通知:** ${reminderText(meeting, attendeeMentionOffsets)}`,
     ].join("\n"))
     .addFields(
@@ -124,6 +132,11 @@ export function buildDraftPayload(draft) {
   lines.push(`**会議URL:** ${draft.meetingUrl
     ? meetingUrlStatusText(draft.meetingUrl)
     : isUpdate ? "変更なし" : meetingUrlStatusText("")}`);
+  if (meetingVenueFromUrl(draft.meetingUrl).type === "discord_voice") {
+    lines.push(`**自動議事録:** ${draft.voiceAutoRecord === false
+      ? "OFF"
+      : "ON（入室を検知→全員同意後に録音）"}`);
+  }
   if (draft.templateName) {
     lines.push(`**参加者テンプレート:** ${safeDisplayText(draft.templateName, 40)}（会議用に${draft.invitees?.length || 0}人を確定）`);
   }
@@ -143,7 +156,7 @@ export function buildDraftPayload(draft) {
     row.addComponents(
       new ButtonBuilder()
         .setCustomId(`meeting:draft:${draft.draftId}:venue-discord`)
-        .setLabel("今いるDiscord VC")
+        .setLabel("Discord VCを選ぶ")
         .setEmoji("🎙️")
         .setStyle(ButtonStyle.Primary),
       new ButtonBuilder()
@@ -164,6 +177,12 @@ export function buildDraftPayload(draft) {
         .setStyle(ButtonStyle.Success),
     );
   }
+  if (meetingVenueFromUrl(draft.meetingUrl).type === "discord_voice") {
+    row.addComponents(new ButtonBuilder()
+      .setCustomId(`meeting:draft:${draft.draftId}:voice-auto-toggle`)
+      .setLabel(draft.voiceAutoRecord === false ? "自動議事録 OFF" : "自動議事録 ON")
+      .setStyle(draft.voiceAutoRecord === false ? ButtonStyle.Secondary : ButtonStyle.Success));
+  }
   row.addComponents(
     new ButtonBuilder()
       .setCustomId(`meeting:draft:${draft.draftId}:cancel`)
@@ -174,6 +193,33 @@ export function buildDraftPayload(draft) {
     row.addComponents(new ButtonBuilder().setLabel("URLを確認").setStyle(ButtonStyle.Link).setURL(draft.meetingUrl));
   }
   return { embeds: [embed], components: [row], allowedMentions: { parse: [] } };
+}
+
+export function buildVoiceChannelSelectionPayload(draft) {
+  return {
+    content: [
+      `🎙️ **${safeDisplayText(draft.title, 100)}** を開催するVCを選んでください。`,
+      "開始15分前から終了時刻までに人が入ると同意確認を自動表示し、全員同意後に録音します。",
+    ].join("\n"),
+    embeds: [],
+    components: [
+      new ActionRowBuilder().addComponents(
+        new ChannelSelectMenuBuilder()
+          .setCustomId(`meeting:draft:${draft.draftId}:voice-channel`)
+          .setPlaceholder("開催するDiscord VCを選択")
+          .addChannelTypes(ChannelType.GuildVoice)
+          .setMinValues(1)
+          .setMaxValues(1),
+      ),
+      new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`meeting:draft:${draft.draftId}:cancel`)
+          .setLabel("取り消す")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+    allowedMentions: { parse: [] },
+  };
 }
 
 export function buildMeetingUrlModal(draftId) {

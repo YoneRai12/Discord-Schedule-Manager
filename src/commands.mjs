@@ -42,6 +42,9 @@ export function buildMeetingCommand() {
         .setName("voice_channel")
         .setDescription("Discord VCで開く場合のボイスチャンネル")
         .addChannelTypes(ChannelType.GuildVoice))
+      .addBooleanOption((option) => option
+        .setName("auto_transcribe")
+        .setDescription("指定VCへの入室時に同意確認を自動表示（既定はON）"))
       .addIntegerOption((option) => option
         .setName("duration")
         .setDescription("予定時間（分）。未指定は60分")
