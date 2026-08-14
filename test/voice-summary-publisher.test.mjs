@@ -157,3 +157,94 @@ test("publisherは長いsummaryを分割し最後の投稿へ文字起こしtxt�
   assert.equal(sent.at(-1).files[0].name, "voice-transcript.txt");
   assert.ok(sent.every((payload) => payload.allowedMentions.parse.length === 0));
 });
+
+test("publisherはabort後に後続chunkや文字起こし添付を投稿しない", async () => {
+  const abortController = new AbortController();
+  const sent = [];
+  let deleted = 0;
+  const channel = {
+    id: channelId,
+    guildId,
+    isTextBased: () => true,
+    async send(payload) {
+      sent.push(payload);
+      abortController.abort("deleted");
+      return { id: fakeId(3), async delete() { deleted += 1; } };
+    },
+  };
+  const client = { guilds: { async fetch() {
+    return { id: guildId, channels: { async fetch() { return channel; } } };
+  } } };
+  const publisher = new VoiceSummaryPublisher({ client, guildId, outputChannelId: channelId });
+  const longTopics = Array.from({ length: 12 }, (_, index) => `${index + 1}: ${"長い要約内容".repeat(45)}`);
+
+  await assert.rejects(publisher.publish({
+    session: { guildId },
+    transcript: rawTranscript(),
+    analysis: analysis({
+      factCheckUsed: false,
+      factChecks: [],
+      minutes: { overview: "概要", topics: longTopics, decisions: [], actionItems: [], openQuestions: [] },
+    }),
+    signal: abortController.signal,
+  }), (error) => error?.code === "ABORTED");
+  assert.equal(sent.length, 1);
+  assert.equal(deleted, 1);
+  assert.equal(Array.isArray(sent[0].files), false);
+});
+
+test("publisherは途中chunk失敗時に投稿済みchunkを巻き戻す", async () => {
+  const sent = [];
+  let deleted = 0;
+  const channel = {
+    id: channelId,
+    guildId,
+    isTextBased: () => true,
+    async send(payload) {
+      sent.push(payload);
+      if (sent.length === 2) throw new Error("discord unavailable");
+      return { id: fakeId(3), async delete() { deleted += 1; } };
+    },
+  };
+  const client = { guilds: { async fetch() {
+    return { id: guildId, channels: { async fetch() { return channel; } } };
+  } } };
+  const publisher = new VoiceSummaryPublisher({ client, guildId, outputChannelId: channelId });
+  const longTopics = Array.from({ length: 12 }, (_, index) => `${index + 1}: ${"長い要約内容".repeat(45)}`);
+
+  await assert.rejects(publisher.publish({
+    session: { guildId },
+    transcript: rawTranscript(),
+    analysis: analysis({
+      factCheckUsed: false,
+      factChecks: [],
+      minutes: { overview: "概要", topics: longTopics, decisions: [], actionItems: [], openQuestions: [] },
+    }),
+  }), /discord unavailable/u);
+  assert.equal(sent.length, 2);
+  assert.equal(deleted, 1);
+});
+
+test("publisherはabort中のDiscord削除失敗を固定codeで表面化する", async () => {
+  const abortController = new AbortController();
+  const channel = {
+    id: channelId,
+    guildId,
+    isTextBased: () => true,
+    async send() {
+      abortController.abort("deleted");
+      return { id: fakeId(3), async delete() { throw new Error("private discord detail"); } };
+    },
+  };
+  const client = { guilds: { async fetch() {
+    return { id: guildId, channels: { async fetch() { return channel; } } };
+  } } };
+  const publisher = new VoiceSummaryPublisher({ client, guildId, outputChannelId: channelId });
+
+  await assert.rejects(publisher.publish({
+    session: { guildId },
+    transcript: rawTranscript(),
+    analysis: analysis(),
+    signal: abortController.signal,
+  }), (error) => error?.code === "PUBLISH_ROLLBACK_FAILED" && !error.message.includes("private discord detail"));
+});

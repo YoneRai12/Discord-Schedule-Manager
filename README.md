@@ -229,6 +229,18 @@ AIを使わず項目を直接入力する場合は`/meeting create`を使いま�
 powershell -ExecutionPolicy Bypass -File scripts/setup-local-voice.ps1 -PythonPath "Pythonの実行ファイル"
 ```
 
+既定の`-Device cuda`では、固定バージョンの`faster-whisper`に加えてNVIDIA公式のCUDA 12用cuBLAS・cuDNN・runtimeをWindows x64の`.voice-venv`内だけへ入れます。システム全体のCUDAや他プロジェクトのPython環境は変更しません。CPUだけで使う環境は`-Device cpu`を指定すると巨大なNVIDIA依存を導入しません。`MEETING_VOICE_STT_DEVICE=cuda`で使う場合は、次のローカル合成音声テストで実際のGPU推論まで確認できます。
+
+```powershell
+.\.voice-venv\Scripts\python.exe scripts\verify_voice_cuda.py
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup-local-voice.ps1 -PythonPath "Pythonの実行ファイル" -Device cpu
+```
+
+GPUモデルの初期化後にcuBLAS・cuDNN・VRAM不足など既知のCUDA実行時障害が起きた場合だけ、同じローカルモデルをCPU `int8`で再試行します。壊れた音声や未知の例外をCPU再試行で隠さず、安全側で失敗として残します。
+
 `.env`へ`.env.example`の`MEETING_VOICE_*`を設定します。`MEETING_VOICE_OUTPUT_CHANNEL_ID`には文字起こしと議事録を投稿するテキストチャンネルを指定します。`@everyone`の閲覧拒否は必須ではありません。公開チャンネルを指定すると議事録も公開されるため、用途に合うチャンネルを選んでください。暗号鍵は32バイトのランダム値をBase64化したものを使い、GitやDiscordへ貼らないでください。
 
 ```text
@@ -239,6 +251,13 @@ powershell -ExecutionPolicy Bypass -File scripts/setup-local-voice.ps1 -PythonPa
 ```
 
 同じ操作は`/meeting voice-start`、`voice-stop`、`voice-status`、`voice-privacy`でもできます。24時間以内の失敗データは`voice-reprocess`、即時削除は`voice-delete`です。AI要約を有効にした場合も、実名・Discord ID・URL・メール・電話番号・会議IDをローカルで除去した文字起こしだけをCodexへ送ります。裏取りを有効にした場合は、個人情報を含まない公開事実の短い主張だけがWeb検索対象です。
+
+障害対応でBOTを止めてローカル管理者が再処理する場合は、次の保守コマンドも使えます。コード側にもプロセス間排他ロックがあり、BOT録音・別の再処理がアーカイブを使用中なら実行を拒否します。IDを省略すると、24時間内で最新の`processing_failed`だけを選びます。すでに文字起こしが完成していて要約だけ直す場合は、音声推論を繰り返さない`--reuse-transcript`を使います。コマンドのログにはセッションID・会議名・本文を出しません。
+
+```powershell
+node scripts/reprocess_failed_voice_session.mjs
+node scripts/reprocess_failed_voice_session.mjs --reuse-transcript セッションID
+```
 
 ## プライバシー設計
 
@@ -381,6 +400,14 @@ POST
 - `src/web-projection.mjs`: WEB公開用の明示allowlist projection
 - `src/web-sync.mjs`: HMAC署名付きの任意片方向WEB同期
 - `src/discord-ui.mjs`: 会議カード、DM、ボタン
+- `src/voice/discord-voice-receiver.mjs`: Discordのユーザー別音声受信とBot音声除外
+- `src/voice/voice-session-archive.mjs`: 24時間固定・AES-256-GCM暗号化アーカイブ
+- `src/voice/local-transcriber.mjs`: 単一ローカルPythonワーカーの実行・上限・後始末
+- `src/voice/voice-meeting-controller.mjs`: VC自動開始、停止、再処理、保存済み文字起こしの再要約
+- `src/voice/voice-minutes-analyzer.mjs`: 匿名化済み議事録の要約と安全な公開事実候補の裏取り
+- `src/voice/voice-summary-publisher.mjs`: 要約分割と最後の発言者付きTXT添付
+- `scripts/reprocess_failed_voice_session.mjs`: 通常BOT停止中の安全な再処理・再要約
+- `scripts/verify_voice_cuda.py`: 合成音声だけを使うCUDA実推論診断
 - `scripts/runtime-support.mjs`: 任意連携の起動分離と安全な終了待ち
 - `scripts/manage-autostart.ps1`: Windowsタスクの登録・確認・解除
 - `scripts/backup-database.mjs`: WAL対応SQLiteオンラインバックアップ

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
@@ -140,6 +141,8 @@ test("expiry stays fixed at session start plus 24 hours and purge removes expire
   );
   assert.equal((await archive.purgeExpired()).purged, 0);
   now += 60 * 60 * 1_000;
+  assert.deepEqual(await archive.purgeExpired({ excludeSessionIds: ["ttl_session"] }), { purged: 0, failures: 0 });
+  assert.equal((await archive.getSession("ttl_session")).state, "processing");
   assert.deepEqual(await archive.purgeExpired(), { purged: 1, failures: 0 });
   assert.equal(await archive.getSession("ttl_session"), null);
   assert.throws(
@@ -203,4 +206,101 @@ test("initialize removes stale plaintext parts without extending expiry", async 
   assert.equal(recovered.failureCode, "STALE_PART_REMOVED");
   assert.equal(recovered.segments[0].state, "discarded_after_restart");
   await second.close();
+});
+
+test("同じ音声アーカイブを別process相当のinstanceが同時利用できない", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-archive-lock-"));
+  const archiveKey = key();
+  const first = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey });
+  const second = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey });
+  await first.initialize();
+
+  await assert.rejects(
+    second.initialize(),
+    (error) => error?.code === "ARCHIVE_IN_USE",
+  );
+
+  await first.close();
+  await second.initialize();
+  await second.close();
+  await rm(root, { recursive: true, force: true });
+});
+
+test("所有processが強制終了してもOS管理lockが自動解放される", async (t) => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-archive-process-lock-"));
+  const archiveKey = key();
+  const moduleUrl = new URL("../src/voice/voice-session-archive.mjs", import.meta.url).href;
+  const childCode = [
+    `import { VoiceSessionArchive } from ${JSON.stringify(moduleUrl)};`,
+    `const archive = new VoiceSessionArchive({ rootDir: ${JSON.stringify(root)}, encryptionKey: ${JSON.stringify(archiveKey)} });`,
+    "await archive.initialize();",
+    "process.stdout.write('ready\\n');",
+    "setInterval(() => {}, 1_000);",
+  ].join("\n");
+  const child = spawn(process.execPath, ["--input-type=module", "--eval", childCode], {
+    stdio: ["ignore", "pipe", "pipe"],
+    windowsHide: true,
+  });
+  t.after(() => child.kill());
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("child archive did not initialize")), 10_000);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`child archive exited early (${code})`));
+    });
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      if (!chunk.includes("ready")) return;
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+
+  const contender = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey });
+  await assert.rejects(contender.initialize(), (error) => error?.code === "ARCHIVE_IN_USE");
+  child.kill();
+  await new Promise((resolve) => child.once("exit", resolve));
+
+  await contender.initialize();
+  await contender.close();
+  await rm(root, { recursive: true, force: true });
+});
+
+test("再処理state claimはarchive内部でcompare-and-setされる", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-archive-transition-"));
+  const archive = new VoiceSessionArchive({ rootDir: root, encryptionKey: key() });
+  await archive.initialize();
+  await archive.createSession({ sessionId: "transition_session", state: "processing_failed" });
+
+  const results = await Promise.all([
+    archive.transitionSession("transition_session", ["processing_failed"], { state: "reprocessing" }),
+    archive.transitionSession("transition_session", ["processing_failed"], { state: "reprocessing" }),
+  ]);
+
+  assert.equal(results.filter(Boolean).length, 1);
+  assert.equal(results.filter((result) => result === null).length, 1);
+  assert.equal((await archive.getSession("transition_session")).state, "reprocessing");
+  await archive.close();
+  await rm(root, { recursive: true, force: true });
+});
+
+test("再処理中の異常終了stateは次回lock取得後に再試行可能へ戻る", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-archive-recovery-"));
+  const archiveKey = key();
+  const first = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey });
+  await first.initialize();
+  await first.createSession({ sessionId: "reprocess_interrupted", state: "reprocessing" });
+  await first.createSession({ sessionId: "reanalyze_interrupted", state: "reanalyzing" });
+  await first.close();
+
+  const second = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey });
+  await second.initialize();
+  const reprocess = await second.getSession("reprocess_interrupted");
+  const reanalyze = await second.getSession("reanalyze_interrupted");
+  assert.equal(reprocess.state, "processing_failed");
+  assert.equal(reprocess.failureCode, "PROCESS_INTERRUPTED");
+  assert.equal(reanalyze.state, "analysis_failed");
+  assert.equal(reanalyze.failureCode, "ANALYSIS_INTERRUPTED");
+  await second.close();
+  await rm(root, { recursive: true, force: true });
 });

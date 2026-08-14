@@ -27,7 +27,13 @@ function temporaryProviderPaths(t) {
     etag: "test-etag",
     client_version: "test-version",
     models: [
-      { slug: "gpt-5.3-codex-spark", description: "test model" },
+      {
+        slug: "gpt-5.3-codex-spark",
+        description: "test model",
+        include_apps_usage_instructions: true,
+        include_plugin_usage_instructions: true,
+        include_skills_usage_instructions: true,
+      },
       { slug: "unrelated-model", description: "must not be copied" },
     ],
   }), "utf8");
@@ -180,6 +186,9 @@ test("Codex App Serverをstdio・一時thread・read-only・承認なしで呼�
   assert.equal(Object.hasOwn(isolatedCatalog.models[0], "tool_mode"), false);
   assert.equal(Object.hasOwn(isolatedCatalog.models[0], "multi_agent_version"), false);
   assert.equal(Object.hasOwn(isolatedCatalog.models[0], "supports_reasoning_summary_parameter"), false);
+  assert.equal(isolatedCatalog.models[0].include_apps_usage_instructions, false);
+  assert.equal(isolatedCatalog.models[0].include_plugin_usage_instructions, false);
+  assert.equal(isolatedCatalog.models[0].include_skills_usage_instructions, false);
   const isolatedConfig = fs.readFileSync(path.join(spawnCall.options.env.CODEX_HOME, "config.toml"), "utf8");
   assert.match(isolatedConfig, /^model_catalog_json = /mu);
   assert.match(isolatedConfig, /^cli_auth_credentials_store = "file"$/mu);
@@ -308,6 +317,25 @@ test("Codexモデルcacheに未確認フィールドが増えた場合は安全�
     (error) => error.code === "model_catalog_schema_changed",
   );
   assert.equal(spawnCalls, 0);
+});
+
+test("Codexモデルcacheの利用指示フラグがboolean以外なら安全側で起動しない", async (t) => {
+  const paths = temporaryProviderPaths(t);
+  const cachePath = path.join(paths.sourceHome, "models_cache.json");
+  const cache = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+  cache.models[0].include_apps_usage_instructions = "true";
+  fs.writeFileSync(cachePath, JSON.stringify(cache), "utf8");
+  const provider = new CodexAppServerProvider({
+    environment: { PATH: "safe", USERPROFILE: paths.root, CODEX_HOME: paths.sourceHome },
+    sandboxDir: paths.sandboxDir,
+    spawnImpl: () => fakeAppServer().child,
+  });
+  t.after(() => provider.close());
+
+  await assert.rejects(
+    provider.initialize(),
+    (error) => error.code === "model_catalog_schema_changed",
+  );
 });
 
 test("turnタイムアウト後は子プロセスを破棄し次回呼び出しで再初期化する", async (t) => {

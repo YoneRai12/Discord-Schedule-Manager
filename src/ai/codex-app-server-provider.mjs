@@ -160,6 +160,8 @@ const MODEL_CATALOG_ALLOWED_KEYS = new Set([
   "display_name",
   "effective_context_window_percent",
   "experimental_supported_tools",
+  "include_apps_usage_instructions",
+  "include_plugin_usage_instructions",
   "include_skills_usage_instructions",
   "input_modalities",
   "max_context_window",
@@ -394,8 +396,20 @@ export class CodexAppServerProvider {
     if (unexpectedModelKeys.length) {
       throw codedError("Codexモデル一覧に未確認の項目があります", "model_catalog_schema_changed");
     }
+    for (const field of [
+      "include_apps_usage_instructions",
+      "include_plugin_usage_instructions",
+      "include_skills_usage_instructions",
+    ]) {
+      if (Object.hasOwn(sourceModel, field) && typeof sourceModel[field] !== "boolean") {
+        throw codedError("Codexモデル一覧の機能フラグ形式が正しくありません", "model_catalog_schema_changed");
+      }
+    }
     const {
       supports_reasoning_summary_parameter: supportsReasoningSummaryParameter,
+      include_apps_usage_instructions: _includeAppsUsageInstructions,
+      include_plugin_usage_instructions: _includePluginUsageInstructions,
+      include_skills_usage_instructions: _includeSkillsUsageInstructions,
       ...compatibleModelFields
     } = sourceModel;
     // 0.145系cacheから0.144系model_catalog_jsonへ渡す際の公式schema差分を埋める。
@@ -404,6 +418,9 @@ export class CodexAppServerProvider {
       supports_reasoning_summaries: Boolean(
         sourceModel.supports_reasoning_summaries ?? supportsReasoningSummaryParameter,
       ),
+      include_apps_usage_instructions: false,
+      include_plugin_usage_instructions: false,
+      include_skills_usage_instructions: false,
     };
     const selectedModelText = JSON.stringify(compatibleModel);
     if (/"(?:access_token|refresh_token|api_key|private_key|client_secret|account_id|email)"\s*:/iu.test(selectedModelText)) {

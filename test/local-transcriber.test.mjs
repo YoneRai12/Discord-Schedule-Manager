@@ -216,3 +216,50 @@ test("decrypted workspace cleanup failure overrides success and is reported fail
   );
   assert.equal(JSON.stringify(logs).includes("sensitive local detail"), false);
 });
+
+test("abort kills the active worker and waits for decrypted workspace cleanup", async () => {
+  const archive = archiveStub();
+  const abortController = new AbortController();
+  let child;
+  const transcriber = new LocalTranscriber({
+    archive,
+    pythonCommand: "python",
+    scriptPath: "worker.py",
+    model: "local-model",
+    spawnImpl: () => {
+      child = childThat({ stdout: validOutput, closeDelayMs: 10_000 });
+      return child;
+    },
+  });
+  const task = transcriber.transcribeSession("cancelled", { signal: abortController.signal });
+  await new Promise((resolve) => setImmediate(resolve));
+  abortController.abort("deleted");
+
+  await assert.rejects(task, (error) => error?.code === "ABORTED");
+  assert.deepEqual(child.killCalls, ["SIGKILL"]);
+  assert.deepEqual(archive.cleaned, ["work_cancelled"]);
+});
+
+test("queued job aborted before start never materializes decrypted audio", async () => {
+  const archive = archiveStub();
+  const abortController = new AbortController();
+  let spawnCount = 0;
+  const transcriber = new LocalTranscriber({
+    archive,
+    pythonCommand: "python",
+    scriptPath: "worker.py",
+    model: "local-model",
+    spawnImpl: () => {
+      spawnCount += 1;
+      return childThat({ stdout: validOutput, closeDelayMs: 10 });
+    },
+  });
+  const first = transcriber.transcribeSession("first");
+  const second = transcriber.transcribeSession("never-materialized", { signal: abortController.signal });
+  abortController.abort("deleted");
+
+  await first;
+  await assert.rejects(second, (error) => error?.code === "ABORTED");
+  assert.deepEqual(archive.materialized, ["first"]);
+  assert.equal(spawnCount, 1);
+});

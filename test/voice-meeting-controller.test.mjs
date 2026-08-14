@@ -14,9 +14,11 @@ const NEW_PARTICIPANT_ID = fakeId(6);
 function fakeArchive() {
   const sessions = new Map();
   const updates = [];
+  const events = [];
   return {
     sessions,
     updates,
+    events,
     async initialize() {},
     async purgeExpired() { return { deleted: 0, failed: 0 }; },
     async createSession(record) {
@@ -33,14 +35,20 @@ function fakeArchive() {
       sessions.set(id, next);
       return sessions.get(id);
     },
+    async transitionSession(id, expectedStates, patch) {
+      const current = sessions.get(id);
+      if (!current || !expectedStates.includes(current.state)) return null;
+      return this.updateSession(id, patch);
+    },
     async writeTranscript(id, transcript) {
       sessions.set(id, { ...(sessions.get(id) || {}), transcript });
     },
+    async readTranscript(id) { return sessions.get(id)?.transcript || null; },
     async writeAnalysis(id, analysis) {
       sessions.set(id, { ...(sessions.get(id) || {}), analysis });
     },
-    async deleteSession(id) { sessions.delete(id); },
-    async close() {},
+    async deleteSession(id) { events.push(`delete:${id}`); sessions.delete(id); },
+    async close() { events.push("close"); },
   };
 }
 
@@ -172,7 +180,7 @@ function controllerFixture(options = {}) {
     releaseAutomaticSession: options.releaseAutomaticSession,
     automaticValidationIntervalMs: options.automaticValidationIntervalMs,
     now: () => 1_800_000_000_000,
-    logger: { warn() {}, error() {} },
+    logger: options.logger || { warn() {}, error() {} },
   });
   return { controller, archive, receiver, ...discord };
 }
@@ -182,6 +190,7 @@ function clearControllerTimers(controller) {
   clearInterval(controller.noticeTimer);
   clearInterval(controller.janitorTimer);
   clearInterval(controller.automaticValidationTimer);
+  for (const timer of controller.processingExpiryTimers.values()) clearTimeout(timer);
 }
 
 test("全員同意前はreceiverを開始せず、全員同意後だけ開始する", async (t) => {
@@ -519,6 +528,201 @@ test("議事録channelで@everyoneの明示denyがなくても開始できる", 
   assert.equal(archive.sessions.size, 1);
   assert.equal(sent.length, 1);
   assert.equal(controller.session.state, "pending_consent");
+});
+
+test("保存済み文字起こしの要約だけを再生成し、音声文字起こしは繰り返さない", async () => {
+  const analyzerCalls = [];
+  const publisherCalls = [];
+  const fixture = controllerFixture({
+    transcriber: {
+      async transcribeSession() { throw new Error("音声文字起こしを再実行してはいけません"); },
+    },
+    analyzer: {
+      async analyze(transcript, options) {
+        analyzerCalls.push({ transcript, options });
+        return { aiUsed: true, factCheckUsed: false, minutes: { summary: "要約" }, factChecks: [] };
+      },
+    },
+    publisher: {
+      async publish(payload) { publisherCalls.push(payload); },
+    },
+  });
+  const id = "A1B2C3D4E5";
+  const transcript = {
+    version: 1,
+    segments: [{ speakerId: PARTICIPANT_ID, speakerName: "参加者", startMs: 0, endMs: 1, text: "発言" }],
+  };
+  fixture.archive.sessions.set(id, {
+    id,
+    guildId: GUILD_ID,
+    outputChannelId: OUTPUT_CHANNEL_ID,
+    expiresAtMs: 1_800_000_060_000,
+    state: "review_pending",
+    transcript,
+  });
+
+  const result = await fixture.controller.reanalyze(id);
+
+  assert.deepEqual(result, { ok: true, aiUsed: true });
+  assert.equal(analyzerCalls.length, 1);
+  assert.equal(publisherCalls.length, 1);
+  assert.equal(publisherCalls[0].transcript, transcript);
+  assert.equal(fixture.archive.sessions.get(id).state, "review_pending");
+  assert.equal(fixture.controller.processing.size, 0);
+});
+
+test("録音中の削除は文字起こしを開始せずactive音声を破棄してからarchiveを消す", async (t) => {
+  let transcribeCalls = 0;
+  const fixture = controllerFixture({
+    transcriber: {
+      async transcribeSession() {
+        transcribeCalls += 1;
+        return { version: 1, segments: [] };
+      },
+    },
+  });
+  t.after(() => clearControllerTimers(fixture.controller));
+  const started = await fixture.controller.requestStart({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: PARTICIPANT_ID } });
+
+  assert.equal(await fixture.controller.deleteSession(started.sessionId), true);
+  assert.equal(transcribeCalls, 0);
+  assert.equal(fixture.controller.session, null);
+  assert.deepEqual(fixture.receiver.calls.stop, [{ discardActive: true }]);
+  assert.equal(fixture.archive.sessions.has(started.sessionId), false);
+});
+
+test("同じ録音を並行削除してもreceiver停止とarchive削除を一度だけ実行する", async (t) => {
+  const fixture = controllerFixture();
+  t.after(() => clearControllerTimers(fixture.controller));
+  const started = await fixture.controller.requestStart({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: PARTICIPANT_ID } });
+  let releaseStop;
+  const stopGate = new Promise((resolve) => { releaseStop = resolve; });
+  fixture.receiver.stop = async (options) => {
+    fixture.receiver.calls.stop.push(options);
+    await stopGate;
+  };
+
+  const first = fixture.controller.deleteSession(started.sessionId);
+  const second = fixture.controller.deleteSession(started.sessionId);
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseStop();
+  assert.deepEqual(await Promise.all([first, second]), [true, true]);
+  assert.deepEqual(fixture.receiver.calls.stop, [{ discardActive: true }]);
+  assert.equal(fixture.archive.sessions.has(started.sessionId), false);
+});
+
+test("receiver停止に失敗した削除はarchiveとactive参照を保持し、再試行で安全に削除する", async (t) => {
+  const fixture = controllerFixture();
+  t.after(() => clearControllerTimers(fixture.controller));
+  const started = await fixture.controller.requestStart({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: PARTICIPANT_ID } });
+  let attempts = 0;
+  fixture.receiver.stop = async (options) => {
+    fixture.receiver.calls.stop.push(options);
+    attempts += 1;
+    if (attempts === 1) throw new Error("temporary stop failure");
+  };
+
+  await assert.rejects(fixture.controller.deleteSession(started.sessionId), /temporary stop failure/u);
+  assert.equal(fixture.controller.session?.id, started.sessionId);
+  assert.equal(fixture.controller.session?.state, "deleting");
+  assert.equal(fixture.archive.sessions.has(started.sessionId), true);
+  assert.equal(await fixture.controller.deleteSession(started.sessionId), true);
+  assert.equal(fixture.receiver.calls.stop.length, 2);
+  assert.equal(fixture.archive.sessions.has(started.sessionId), false);
+});
+
+test("active削除中のcloseは削除完了を待ちreceiverを二重停止せず最後にarchiveを閉じる", async (t) => {
+  const fixture = controllerFixture();
+  t.after(() => clearControllerTimers(fixture.controller));
+  const started = await fixture.controller.requestStart({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: PARTICIPANT_ID } });
+  let releaseStop;
+  const stopGate = new Promise((resolve) => { releaseStop = resolve; });
+  fixture.receiver.stop = async (options) => {
+    fixture.receiver.calls.stop.push(options);
+    await stopGate;
+  };
+
+  const deleting = fixture.controller.deleteSession(started.sessionId);
+  await new Promise((resolve) => setImmediate(resolve));
+  const closing = fixture.controller.close();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.receiver.calls.stop.length, 1);
+  releaseStop();
+  await Promise.all([deleting, closing]);
+
+  assert.deepEqual(fixture.receiver.calls.stop, [{ discardActive: true }]);
+  assert.deepEqual(fixture.archive.events.slice(-2), [`delete:${started.sessionId}`, "close"]);
+  assert.equal(fixture.archive.sessions.has(started.sessionId), false);
+});
+
+test("処理中の削除はworkerをabortし、失敗通知や議事録を投稿せずcleanup後にarchiveを消す", async (t) => {
+  let observedSignal;
+  const publisherCalls = [];
+  const fixture = controllerFixture({
+    transcriber: {
+      async transcribeSession(_id, { signal } = {}) {
+        observedSignal = signal;
+        return new Promise((resolve, reject) => {
+          signal.addEventListener("abort", () => reject(Object.assign(new Error("aborted"), { code: "ABORTED" })), { once: true });
+        });
+      },
+    },
+    publisher: { async publish(payload) { publisherCalls.push(payload); } },
+  });
+  t.after(() => clearControllerTimers(fixture.controller));
+  const started = await fixture.controller.requestStart({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: PARTICIPANT_ID } });
+  await fixture.controller.stopSession({ reason: "manual", requestedById: ACTOR_ID });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(await fixture.controller.deleteSession(started.sessionId), true);
+  assert.equal(observedSignal.aborted, true);
+  assert.equal(publisherCalls.length, 0);
+  assert.equal(fixture.archive.sessions.has(started.sessionId), false);
+  assert.equal(fixture.sent.some((payload) => /自動処理に失敗/u.test(payload.content || "")), false);
+  assert.equal(fixture.controller.processing.has(started.sessionId), false);
+});
+
+test("削除中のDiscord rollback失敗はABORTEDにせず固定codeだけを警告して成功扱いしない", async (t) => {
+  const logs = [];
+  let publishSignal;
+  const fixture = controllerFixture({
+    logger: { warn() {}, error: (...values) => logs.push(values.join(" ")) },
+    transcriber: { async transcribeSession() { return { version: 1, segments: [] }; } },
+    publisher: {
+      async publish({ signal }) {
+        publishSignal = signal;
+        await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+        throw Object.assign(new Error("private transcript body"), { code: "PUBLISH_ROLLBACK_FAILED" });
+      },
+    },
+  });
+  t.after(() => clearControllerTimers(fixture.controller));
+  const started = await fixture.controller.requestStart({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: PARTICIPANT_ID } });
+  await fixture.controller.stopSession({ reason: "manual", requestedById: ACTOR_ID });
+  while (!publishSignal) await new Promise((resolve) => setImmediate(resolve));
+
+  await assert.rejects(
+    fixture.controller.deleteSession(started.sessionId),
+    (error) => error?.code === "PUBLISH_ROLLBACK_FAILED",
+  );
+  assert.equal(fixture.archive.sessions.get(started.sessionId).state, "deletion_failed");
+  assert.equal(fixture.archive.sessions.has(started.sessionId), true);
+  const combined = JSON.stringify({ logs, sent: fixture.sent });
+  assert.match(combined, /PUBLISH_ROLLBACK_FAILED/u);
+  assert.doesNotMatch(combined, /private transcript body/u);
+  assert.equal(fixture.sent.some((payload) => /削除確認を完了できません/u.test(payload.content || "")), true);
 });
 
 test("disabled時のprivacy/statusは要約・Web検索・機能の無効状態を明示する", () => {

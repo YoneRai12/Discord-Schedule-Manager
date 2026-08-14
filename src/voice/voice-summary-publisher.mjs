@@ -10,6 +10,10 @@ const ALLOWED_MENTIONS_NONE = Object.freeze({ parse: [], users: [], roles: [], r
 function codedError(message, code) {
   return Object.assign(new Error(message), { code });
 }
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw codedError("議事録の公開処理は取り消されました", "ABORTED");
+}
 function requireSnowflake(value, label) {
   const id = String(value ?? "");
   if (!/^\d{16,20}$/u.test(id)) throw codedError(`${label}が不正です`, "invalid_discord_id");
@@ -167,7 +171,8 @@ export class VoiceSummaryPublisher {
     return channel;
   }
 
-  async publish({ session = {}, transcript, analysis } = {}) {
+  async publish({ session = {}, transcript, analysis, signal = undefined } = {}) {
+    throwIfAborted(signal);
     // Always rebuild a UTF-8 text attachment from structured transcript data.
     // Any session audio buffers/paths are deliberately ignored and can never become files.
     const sanitizedTranscript = sanitizeVoiceTranscript(transcript, { knownNames: session.knownNames || [] });
@@ -175,21 +180,37 @@ export class VoiceSummaryPublisher {
     const chunks = splitContent(formatSummary(analysis, factChecks));
     const attachment = attributedTranscriptBuffer(transcript, sanitizedTranscript);
     const channel = await this.resolveOutputChannel(session);
+    throwIfAborted(signal);
     const messageIds = [];
-    for (let index = 0; index < chunks.length; index += 1) {
-      const payload = {
-        content: chunks[index],
-        allowedMentions: { ...ALLOWED_MENTIONS_NONE, parse: [], users: [], roles: [] },
-        ...(index === chunks.length - 1 ? {
-          files: [{
-            attachment,
-            name: "voice-transcript.txt",
-            description: "発言者名・時刻付きVC文字起こし",
-          }],
-        } : {}),
-      };
-      const message = await channel.send(payload);
-      if (message?.id) messageIds.push(String(message.id));
+    const sentMessages = [];
+    try {
+      for (let index = 0; index < chunks.length; index += 1) {
+        throwIfAborted(signal);
+        const payload = {
+          content: chunks[index],
+          allowedMentions: { ...ALLOWED_MENTIONS_NONE, parse: [], users: [], roles: [] },
+          ...(index === chunks.length - 1 ? {
+            files: [{
+              attachment,
+              name: "voice-transcript.txt",
+              description: "発言者名・時刻付きVC文字起こし",
+            }],
+          } : {}),
+        };
+        const message = await channel.send(payload);
+        sentMessages.push(message);
+        if (message?.id) messageIds.push(String(message.id));
+        throwIfAborted(signal);
+      }
+    } catch (error) {
+      const rollback = await Promise.allSettled(sentMessages.reverse().map(async (message) => {
+        if (typeof message?.delete !== "function") throw new Error("message delete unavailable");
+        await message.delete();
+      }));
+      if (rollback.some((result) => result.status === "rejected")) {
+        throw codedError("議事録の途中投稿を削除できませんでした", "PUBLISH_ROLLBACK_FAILED");
+      }
+      throw error;
     }
     return { channelId: this.outputChannelId, messageIds, partCount: chunks.length };
   }

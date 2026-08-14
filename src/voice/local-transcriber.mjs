@@ -80,6 +80,10 @@ function validateTranscript(value) {
   return result;
 }
 
+function abortedError() {
+  return new LocalTranscriberError("ABORTED", "local transcription was cancelled");
+}
+
 export class LocalTranscriber {
   #archive;
   #pythonCommand;
@@ -130,20 +134,25 @@ export class LocalTranscriber {
     this.#spawn = spawnImpl;
   }
 
-  transcribeSession(sessionId) {
+  transcribeSession(sessionId, { signal = undefined } = {}) {
     const id = String(sessionId ?? "");
-    const job = this.#queue.then(() => this.#run(id), () => this.#run(id));
+    if (signal != null && typeof signal.aborted !== "boolean") {
+      throw new LocalTranscriberError("INVALID_CONFIGURATION", "signal is invalid");
+    }
+    const job = this.#queue.then(() => this.#run(id, signal), () => this.#run(id, signal));
     this.#queue = job.catch(() => {});
     return job;
   }
 
-  async #run(sessionId) {
+  async #run(sessionId, signal) {
     let workspace;
     let result;
     let runError;
     try {
+      if (signal?.aborted) throw abortedError();
       workspace = await this.#archive.materializeTranscriptionInput(sessionId);
-      const stdout = await this.#spawnWorker(workspace.manifestPath);
+      if (signal?.aborted) throw abortedError();
+      const stdout = await this.#spawnWorker(workspace.manifestPath, signal);
       let parsed;
       try {
         parsed = JSON.parse(stdout);
@@ -151,6 +160,7 @@ export class LocalTranscriber {
         throw new LocalTranscriberError("INVALID_OUTPUT", "local transcription returned malformed JSON", { cause: error });
       }
       result = validateTranscript(parsed);
+      if (signal?.aborted) throw abortedError();
       await this.#archive.writeTranscript(sessionId, result);
     } catch (error) {
       runError = error;
@@ -172,8 +182,12 @@ export class LocalTranscriber {
     return result;
   }
 
-  #spawnWorker(manifestPath) {
+  #spawnWorker(manifestPath, signal) {
     return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(abortedError());
+        return;
+      }
       let child;
       try {
         child = this.#spawn(this.#pythonCommand, [
@@ -204,6 +218,8 @@ export class LocalTranscriber {
         if (!terminalError) terminalError = error;
         child.kill?.("SIGKILL");
       };
+      const onAbort = () => failAndKill(abortedError());
+      signal?.addEventListener?.("abort", onAbort, { once: true });
       const timer = setTimeout(() => {
         failAndKill(new LocalTranscriberError("TIMEOUT", "local transcription exceeded its time limit"));
       }, this.#timeoutMs);
@@ -227,10 +243,11 @@ export class LocalTranscriber {
       child.once("error", (error) => {
         terminalError ||= new LocalTranscriberError("SPAWN_FAILED", "local transcription worker failed to start", { cause: error });
       });
-      child.once("close", (code, signal) => {
+      child.once("close", (code, terminationSignal) => {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        signal?.removeEventListener?.("abort", onAbort);
         if (terminalError) {
           reject(terminalError);
           return;
@@ -239,7 +256,7 @@ export class LocalTranscriber {
           reject(new LocalTranscriberError("WORKER_FAILED", "local transcription worker exited unsuccessfully"));
           return;
         }
-        if (signal) {
+        if (terminationSignal) {
           reject(new LocalTranscriberError("WORKER_FAILED", "local transcription worker was terminated"));
           return;
         }

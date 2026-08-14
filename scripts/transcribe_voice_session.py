@@ -8,16 +8,19 @@ filesystem paths are never logged or sent to an external service.
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import logging
 import os
 from pathlib import Path
 import sys
+import sysconfig
 from typing import Any
 
 
 MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 MAX_SEGMENTS = 100_000
+_NVIDIA_DLL_HANDLES: list[Any] = []
 
 
 class WorkerError(Exception):
@@ -102,7 +105,49 @@ def _model_is_local(model: str) -> bool:
     return candidate.exists()
 
 
+def _activate_local_nvidia_dlls() -> None:
+    """Expose NVIDIA wheels installed in this virtual environment to Windows.
+
+    Python 3.8+ no longer searches PATH alone for all dependent DLLs loaded by
+    extension modules.  Keep the returned handles alive for the worker's whole
+    process lifetime so CTranslate2 can load cuBLAS/cuDNN lazily on its first
+    inference without requiring a machine-wide CUDA installation.
+    """
+    if os.name != "nt" or not hasattr(os, "add_dll_directory"):
+        return
+
+    purelib = Path(sysconfig.get_path("purelib"))
+    candidates = (
+        purelib / "nvidia" / "cublas" / "bin",
+        purelib / "nvidia" / "cudnn" / "bin",
+        purelib / "nvidia" / "cuda_runtime" / "bin",
+    )
+    active = {str(path).casefold() for path in candidates if path.is_dir()}
+    if not active:
+        return
+
+    current_path = os.environ.get("PATH", "")
+    path_parts = [part for part in current_path.split(os.pathsep) if part]
+    existing = {part.casefold() for part in path_parts}
+    for directory in candidates:
+        if not directory.is_dir():
+            continue
+        rendered = str(directory)
+        if rendered.casefold() not in existing:
+            path_parts.insert(0, rendered)
+            existing.add(rendered.casefold())
+        try:
+            _NVIDIA_DLL_HANDLES.append(os.add_dll_directory(rendered))
+        except OSError:
+            # A broken or inaccessible wheel directory must not weaken the
+            # worker boundary.  CUDA inference will fail and use the narrowly
+            # scoped CPU fallback below.
+            continue
+    os.environ["PATH"] = os.pathsep.join(path_parts)
+
+
 def _load_model(model_name: str, device: str, compute_type: str):
+    _activate_local_nvidia_dlls()
     try:
         from faster_whisper import WhisperModel
     except ImportError as error:
@@ -113,6 +158,39 @@ def _load_model(model_name: str, device: str, compute_type: str):
         kwargs["local_files_only"] = True
         model_name = str(Path(model_name).expanduser().resolve(strict=True))
     return WhisperModel(model_name, **kwargs)
+
+
+def _is_cuda_runtime_failure(error: Exception) -> bool:
+    """Return true only for GPU runtime failures that are safe to retry on CPU."""
+    message = str(error).lower()
+    return isinstance(error, RuntimeError) and any(
+        marker in message
+        for marker in (
+            "cublas",
+            "cudnn",
+            "cuda driver",
+            "cuda runtime",
+            "cuda_error",
+            "out of memory",
+        )
+    )
+
+
+def _is_cuda_initialization_failure(error: Exception) -> bool:
+    """Recognize only expected local CUDA availability/runtime failures."""
+    if _is_cuda_runtime_failure(error):
+        return True
+    message = str(error).lower()
+    return isinstance(error, (RuntimeError, ValueError)) and "cuda" in message and any(
+        marker in message
+        for marker in (
+            "not available",
+            "no cuda",
+            "no device",
+            "device not found",
+            "unsupported device",
+        )
+    )
 
 
 def _transcribe(model: Any, segments: list[dict[str, Any]]) -> dict[str, Any]:
@@ -153,11 +231,24 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
     if args.device in {"auto", "cuda"}:
         try:
             model = _load_model(args.model, "cuda", "float16")
-        except Exception:
-            # Only model initialization falls back.  Retrying an inference
-            # failure could duplicate work and mask a corrupt local input.
-            model = _load_model(args.model, "cpu", "int8")
-        return _transcribe(model, segments)
+        except Exception as error:
+            # Model initialization failures are also safe to retry locally on
+            # CPU because no segment inference has started yet.
+            if isinstance(error, WorkerError) or not _is_cuda_initialization_failure(error):
+                raise
+            return _transcribe(_load_model(args.model, "cpu", "int8"), segments)
+        try:
+            return _transcribe(model, segments)
+        except Exception as error:
+            # CTranslate2 can finish model initialization before it loads
+            # cuBLAS/cuDNN on the first inference.  Retry only recognized
+            # CUDA runtime failures; malformed audio and other failures
+            # remain fail-closed instead of being masked.
+            if not _is_cuda_runtime_failure(error):
+                raise
+            del model
+            gc.collect()
+            return _transcribe(_load_model(args.model, "cpu", "int8"), segments)
     return _transcribe(_load_model(args.model, "cpu", "int8"), segments)
 
 
