@@ -15,3 +15,5 @@ credentials*.json
 *.log
 .DS_Store
 .voice-venv/
+__pycache__/
+*.py[cod]

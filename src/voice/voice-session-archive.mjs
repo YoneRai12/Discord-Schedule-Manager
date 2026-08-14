@@ -1,4 +1,5 @@
 import {
+  createHash,
   createCipheriv,
   createDecipheriv,
   randomBytes,
@@ -21,6 +22,7 @@ import {
   unlink,
   writeFile,
 } from "node:fs/promises";
+import { createServer } from "node:net";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
 
@@ -114,6 +116,19 @@ function isWithin(root, candidate) {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
+function archiveLockEndpoint(rootDir) {
+  const digest = createHash("sha256")
+    .update(process.platform === "win32" ? rootDir.toLowerCase() : rootDir)
+    .digest("hex");
+  if (process.platform === "win32") return `\\\\.\\pipe\\discord-meeting-voice-${digest.slice(0, 32)}`;
+  if (process.platform === "linux") return `\0discord-meeting-voice-${digest.slice(0, 48)}`;
+  return {
+    host: "127.0.0.1",
+    port: 30_000 + (Number.parseInt(digest.slice(0, 8), 16) % 20_000),
+    exclusive: true,
+  };
+}
+
 async function exists(target) {
   try {
     await lstat(target);
@@ -135,6 +150,9 @@ export class VoiceSessionArchive {
   #initialized = false;
   #closed = false;
   #operation = Promise.resolve();
+  #lockServer = null;
+  #lockCompromised = false;
+  #releasingLock = false;
 
   constructor({ rootDir, encryptionKey, retentionMs = RETENTION_MS, now = () => Date.now(), logger = undefined } = {}) {
     if (!rootDir || !path.isAbsolute(String(rootDir))) {
@@ -161,18 +179,25 @@ export class VoiceSessionArchive {
       if (this.#initialized) return;
       await mkdir(this.#rootDir, { recursive: true, mode: 0o700 });
       await this.#assertRootIsPhysicalDirectory();
-      await mkdir(this.#sessionsDir, { mode: 0o700 }).catch((error) => {
-        if (error?.code !== "EEXIST") throw error;
-      });
-      await mkdir(this.#workDir, { mode: 0o700 }).catch((error) => {
-        if (error?.code !== "EEXIST") throw error;
-      });
-      await this.#assertSafeExistingPath(this.#sessionsDir, { directory: true });
-      await this.#assertSafeExistingPath(this.#workDir, { directory: true });
-      await this.#loadIndex();
-      await this.#removeStaleParts();
-      this.#initialized = true;
-      await this.#purgeExpiredInternal();
+      await this.#acquireProcessLock();
+      try {
+        await mkdir(this.#sessionsDir, { mode: 0o700 }).catch((error) => {
+          if (error?.code !== "EEXIST") throw error;
+        });
+        await mkdir(this.#workDir, { mode: 0o700 }).catch((error) => {
+          if (error?.code !== "EEXIST") throw error;
+        });
+        await this.#assertSafeExistingPath(this.#sessionsDir, { directory: true });
+        await this.#assertSafeExistingPath(this.#workDir, { directory: true });
+        await this.#loadIndex();
+        await this.#recoverInterruptedJobs();
+        await this.#removeStaleParts();
+        this.#initialized = true;
+        await this.#purgeExpiredInternal();
+      } catch (error) {
+        await this.#releaseProcessLock().catch(() => {});
+        throw error;
+      }
     });
   }
 
@@ -231,35 +256,20 @@ export class VoiceSessionArchive {
     return this.#serialize(async () => {
       this.#assertReady();
       const id = safeId(sessionId, "sessionId");
+      return this.#updateSessionInternal(id, patch);
+    });
+  }
+
+  async transitionSession(sessionId, expectedStates, patch = {}) {
+    return this.#serialize(async () => {
+      this.#assertReady();
+      const id = safeId(sessionId, "sessionId");
+      const expected = new Set(Array.isArray(expectedStates) ? expectedStates.map(String) : []);
+      if (!expected.size) throw new VoiceArchiveError("INVALID_STATE_TRANSITION", "expected states are required");
       const current = await this.#getSessionInternal(id);
       if (!current) throw new VoiceArchiveError("SESSION_NOT_FOUND", "voice session was not found");
-      for (const immutable of ["sessionId", "createdAt", "expiresAt", "createdAtMs", "expiresAtMs", "segments"]) {
-        if (Object.hasOwn(patch, immutable)) {
-          throw new VoiceArchiveError("IMMUTABLE_SESSION_FIELD", `${immutable} cannot be changed`);
-        }
-      }
-      const next = { ...current };
-      const recognized = new Set([...PRIVATE_META_FIELDS, "state", "failureCode", "consent"]);
-      const unknown = Object.keys(patch).filter((field) => !recognized.has(field));
-      if (unknown.length) {
-        throw new VoiceArchiveError("UNSUPPORTED_SESSION_FIELD", "session patch contains an unsupported field");
-      }
-      for (const field of [...PRIVATE_META_FIELDS, "state", "failureCode"]) {
-        if (Object.hasOwn(patch, field)) next[field] = structuredClone(patch[field]);
-      }
-      if (Object.hasOwn(patch, "consent")) {
-        const history = Array.isArray(next.consents) ? next.consents : [];
-        next.consents = [...history, structuredClone(patch.consent)].slice(-10_000);
-      }
-      next.state = String(next.state ?? "");
-      if (!next.state || next.state.length > 96) throw new VoiceArchiveError("INVALID_STATE", "session state is invalid");
-      next.failureCode = cleanFailureCode(next.failureCode);
-      await this.#writePrivateSession(id, next);
-      const indexEntry = this.#index.get(id);
-      indexEntry.state = next.state;
-      indexEntry.failureCode = next.failureCode;
-      await this.#persistIndex();
-      return structuredClone(next);
+      if (!expected.has(current.state)) return null;
+      return this.#updateSessionInternal(id, patch, current);
     });
   }
 
@@ -368,10 +378,13 @@ export class VoiceSessionArchive {
     return this.#readSessionArtifact(sessionId, "analysis");
   }
 
-  async purgeExpired() {
+  async purgeExpired({ excludeSessionIds = [] } = {}) {
     return this.#serialize(async () => {
       this.#assertReady();
-      return this.#purgeExpiredInternal();
+      const excluded = new Set(Array.isArray(excludeSessionIds)
+        ? excludeSessionIds.map((id) => safeId(id, "sessionId"))
+        : []);
+      return this.#purgeExpiredInternal(excluded);
     });
   }
 
@@ -448,10 +461,63 @@ export class VoiceSessionArchive {
 
   async close() {
     return this.#serialize(async () => {
-      this.#key.fill(0);
-      this.#closed = true;
-      this.#initialized = false;
+      try {
+        await this.#releaseProcessLock();
+      } finally {
+        this.#key.fill(0);
+        this.#closed = true;
+        this.#initialized = false;
+      }
     });
+  }
+
+  async #acquireProcessLock() {
+    if (this.#lockServer) return;
+    const server = createServer((socket) => socket.destroy());
+    await new Promise((resolve, reject) => {
+      const onError = (error) => {
+        server.off("listening", onListening);
+        reject(error?.code === "EADDRINUSE"
+          ? new VoiceArchiveError("ARCHIVE_IN_USE", "voice archive is already in use", { cause: error })
+          : new VoiceArchiveError("ARCHIVE_LOCK_FAILED", "voice archive lock could not be acquired", { cause: error }));
+      };
+      const onListening = () => {
+        server.off("error", onError);
+        resolve();
+      };
+      server.once("error", onError);
+      server.once("listening", onListening);
+      server.listen(archiveLockEndpoint(this.#rootDir));
+    });
+    server.unref();
+    this.#lockServer = server;
+    this.#lockCompromised = false;
+    server.on("error", () => {
+      if (this.#lockServer !== server || this.#releasingLock) return;
+      this.#lockCompromised = true;
+      this.#logger?.error?.("voice archive lock failed", { failureCode: "ARCHIVE_LOCK_FAILED" });
+    });
+    server.on("close", () => {
+      if (this.#lockServer === server && !this.#releasingLock) this.#lockCompromised = true;
+    });
+  }
+
+  async #releaseProcessLock() {
+    const server = this.#lockServer;
+    if (!server) return;
+    this.#releasingLock = true;
+    try {
+      await new Promise((resolve, reject) => {
+        server.close((error) => {
+          if (error && error.code !== "ERR_SERVER_NOT_RUNNING") reject(error);
+          else resolve();
+        });
+      });
+      this.#lockServer = null;
+      this.#lockCompromised = false;
+    } finally {
+      this.#releasingLock = false;
+    }
   }
 
   async #writeSessionArtifact(sessionId, type, value) {
@@ -482,11 +548,12 @@ export class VoiceSessionArchive {
     });
   }
 
-  async #purgeExpiredInternal() {
+  async #purgeExpiredInternal(excluded = new Set()) {
     const now = dateMs(this.#now(), "now");
     let purged = 0;
     let failures = 0;
     for (const [sessionId, entry] of [...this.#index]) {
+      if (excluded.has(sessionId)) continue;
       if (Date.parse(entry.expiresAt) > now) continue;
       try {
         await this.#deleteTreeSafe(this.#sessionDir(sessionId));
@@ -571,6 +638,26 @@ export class VoiceSessionArchive {
     if (this.#index.size !== parsed.sessions.length) throw new VoiceArchiveError("CORRUPT_INDEX", "voice archive index contains duplicates");
   }
 
+  async #recoverInterruptedJobs() {
+    const recoveries = new Map([
+      ["reprocessing", { state: "processing_failed", failureCode: "PROCESS_INTERRUPTED" }],
+      ["reanalyzing", { state: "analysis_failed", failureCode: "ANALYSIS_INTERRUPTED" }],
+    ]);
+    let changed = false;
+    for (const [sessionId, entry] of this.#index) {
+      const recovery = recoveries.get(entry.state);
+      if (!recovery) continue;
+      const session = await this.#getSessionInternal(sessionId);
+      session.state = recovery.state;
+      session.failureCode = recovery.failureCode;
+      await this.#writePrivateSession(sessionId, session);
+      entry.state = recovery.state;
+      entry.failureCode = recovery.failureCode;
+      changed = true;
+    }
+    if (changed) await this.#persistIndex();
+  }
+
   async #persistIndex() {
     const indexPath = path.join(this.#rootDir, INDEX_FILE);
     const tempPath = path.join(this.#rootDir, `.index-${randomUUID()}.tmp`);
@@ -602,6 +689,38 @@ export class VoiceSessionArchive {
       throw new VoiceArchiveError("CORRUPT_METADATA", "encrypted session metadata does not match its index");
     }
     return { ...privateMeta, ...structuredClone(entry) };
+  }
+
+  async #updateSessionInternal(sessionId, patch, currentValue = null) {
+    const current = currentValue || await this.#getSessionInternal(sessionId);
+    if (!current) throw new VoiceArchiveError("SESSION_NOT_FOUND", "voice session was not found");
+    for (const immutable of ["sessionId", "createdAt", "expiresAt", "createdAtMs", "expiresAtMs", "segments"]) {
+      if (Object.hasOwn(patch, immutable)) {
+        throw new VoiceArchiveError("IMMUTABLE_SESSION_FIELD", `${immutable} cannot be changed`);
+      }
+    }
+    const next = { ...current };
+    const recognized = new Set([...PRIVATE_META_FIELDS, "state", "failureCode", "consent"]);
+    const unknown = Object.keys(patch).filter((field) => !recognized.has(field));
+    if (unknown.length) {
+      throw new VoiceArchiveError("UNSUPPORTED_SESSION_FIELD", "session patch contains an unsupported field");
+    }
+    for (const field of [...PRIVATE_META_FIELDS, "state", "failureCode"]) {
+      if (Object.hasOwn(patch, field)) next[field] = structuredClone(patch[field]);
+    }
+    if (Object.hasOwn(patch, "consent")) {
+      const history = Array.isArray(next.consents) ? next.consents : [];
+      next.consents = [...history, structuredClone(patch.consent)].slice(-10_000);
+    }
+    next.state = String(next.state ?? "");
+    if (!next.state || next.state.length > 96) throw new VoiceArchiveError("INVALID_STATE", "session state is invalid");
+    next.failureCode = cleanFailureCode(next.failureCode);
+    await this.#writePrivateSession(sessionId, next);
+    const indexEntry = this.#index.get(sessionId);
+    indexEntry.state = next.state;
+    indexEntry.failureCode = next.failureCode;
+    await this.#persistIndex();
+    return structuredClone(next);
   }
 
   async #requireSession(sessionId) {
@@ -815,6 +934,9 @@ export class VoiceSessionArchive {
   #assertReady() {
     if (this.#closed) throw new VoiceArchiveError("ARCHIVE_CLOSED", "voice archive is closed");
     if (!this.#initialized) throw new VoiceArchiveError("ARCHIVE_NOT_INITIALIZED", "voice archive is not initialized");
+    if (this.#lockCompromised) {
+      throw new VoiceArchiveError("ARCHIVE_LOCK_FAILED", "voice archive process lock was lost");
+    }
   }
 
   #serialize(operation) {

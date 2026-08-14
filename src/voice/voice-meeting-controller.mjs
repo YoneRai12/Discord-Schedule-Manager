@@ -10,10 +10,42 @@ import {
 import { safeDisplayText } from "../privacy.mjs";
 
 const CONSENT_POLICY_REVISION = "voice-local-24h-v1";
-const ACTIVE_STATES = new Set(["pending_consent", "recording", "paused_for_consent", "stopping", "processing"]);
+const ACTIVE_STATES = new Set(["pending_consent", "recording", "paused_for_consent", "stopping", "processing", "deleting"]);
 
 function shortCode(error) {
-  return String(error?.code || error?.status || error?.name || "voice_error").slice(0, 80);
+  const value = String(error?.code || error?.status || error?.name || "voice_error").slice(0, 80);
+  return /^[A-Za-z0-9_:-]{1,80}$/u.test(value) ? value : "voice_error";
+}
+
+function abortedError() {
+  return Object.assign(new Error("VC議事録の処理は取り消されました"), { code: "ABORTED" });
+}
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) throw abortedError();
+}
+
+function isAborted(error) {
+  return error?.code === "ABORTED" || error?.name === "AbortError";
+}
+
+function awaitWithAbort(value, signal) {
+  if (!signal) return Promise.resolve(value);
+  if (signal.aborted) return Promise.reject(abortedError());
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(abortedError());
+    signal.addEventListener("abort", onAbort, { once: true });
+    Promise.resolve(value).then(
+      (result) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(result);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function sessionId() {
@@ -165,11 +197,16 @@ export class VoiceMeetingController {
     this.now = now;
     this.session = null;
     this.processing = new Map();
+    this.processingAbortControllers = new Map();
+    this.processingExpiryTimers = new Map();
+    this.deletionTasks = new Map();
     this.maxTimer = null;
     this.noticeTimer = null;
     this.janitorTimer = null;
     this.automaticValidationTimer = null;
     this.starting = false;
+    this.closing = false;
+    this.closePromise = null;
     this.operationTail = Promise.resolve();
     this.automaticPendingOutcomes = new Map();
   }
@@ -178,6 +215,54 @@ export class VoiceMeetingController {
     const run = this.operationTail.then(operation, operation);
     this.operationTail = run.catch(() => {});
     return run;
+  }
+
+  registerProcessing(session, operation) {
+    const id = String(session.id);
+    if (this.processing.has(id) || this.processingAbortControllers.has(id)) {
+      throw new Error("このセッションはすでに処理中です");
+    }
+    const abortController = new AbortController();
+    this.processingAbortControllers.set(id, abortController);
+    const task = Promise.resolve().then(() => operation(abortController.signal));
+    this.processing.set(id, task);
+    const remainingMs = Number(session.expiresAtMs) - this.now();
+    if (Number.isFinite(remainingMs)) {
+      const expiryTimer = setTimeout(() => {
+        void this.deleteSession(id, { reason: "expired" }).catch((error) => {
+          this.logger.warn?.(`[voice] retention_delete_failed code=${shortCode(error)}`);
+        });
+      }, Math.max(0, Math.min(remainingMs, 0x7FFFFFFF)));
+      expiryTimer.unref?.();
+      this.processingExpiryTimers.set(id, expiryTimer);
+    }
+    const cleanup = () => {
+      if (this.processing.get(id) === task) this.processing.delete(id);
+      if (this.processingAbortControllers.get(id) === abortController) {
+        this.processingAbortControllers.delete(id);
+      }
+      const expiryTimer = this.processingExpiryTimers.get(id);
+      if (expiryTimer) clearTimeout(expiryTimer);
+      this.processingExpiryTimers.delete(id);
+    };
+    task.then(cleanup, cleanup);
+    return task;
+  }
+
+  async purgeExpiredSafely() {
+    const nowMs = this.now();
+    const candidates = new Set([
+      ...(this.session?.expiresAtMs <= nowMs ? [this.session.id] : []),
+      ...this.processing.keys(),
+    ]);
+    for (const id of candidates) {
+      const record = await this.archive.getSession(id).catch(() => null);
+      if (record?.expiresAtMs <= nowMs) await this.deleteSession(id, { reason: "expired" });
+    }
+    return this.archive.purgeExpired?.({
+      nowMs,
+      excludeSessionIds: [this.session?.id, ...this.processing.keys()].filter(Boolean),
+    });
   }
 
   automaticSessionContext(session = this.session, extra = {}) {
@@ -233,10 +318,10 @@ export class VoiceMeetingController {
       throw Object.assign(new Error("期限切れ音声データを削除できないためVC録音を開始できません"), { code: "voice_purge_failed" });
     }
     this.janitorTimer = setInterval(() => {
-      void this.archive.purgeExpired?.({ nowMs: this.now() }).catch((error) => {
+      void this.purgeExpiredSafely().catch((error) => {
         this.logger.warn?.(`[voice] retention_purge_failed code=${shortCode(error)}`);
       });
-    }, 15 * 60_000);
+    }, 60_000);
     this.janitorTimer.unref?.();
     return { enabled: true };
   }
@@ -295,6 +380,7 @@ export class VoiceMeetingController {
   }
 
   async requestStart(subject, { title = "VCミーティング" } = {}) {
+    if (this.closing) throw new Error("VC文字起こし機能を終了中です");
     const guild = await this.client.guilds.fetch(this.guildId);
     const actorId = String(subject?.user?.id || subject?.author?.id || "");
     const actor = await guild.members.fetch(actorId);
@@ -319,6 +405,7 @@ export class VoiceMeetingController {
     automatic = false,
     sourceMeetingId = null,
   } = {}) {
+    if (this.closing) throw new Error("VC文字起こし機能を終了中です");
     if (!this.enabled) throw new Error("VC文字起こし機能は設定されていません");
     if (this.starting) throw new Error("VC文字起こしの開始処理が進行中です");
     if (this.session && ACTIVE_STATES.has(this.session.state)) throw new Error("すでにVC文字起こしセッションが動作中です");
@@ -473,7 +560,7 @@ export class VoiceMeetingController {
       });
       return { cancelled: true };
     }
-    await this.stopSession({ reason: "consent_withdrawn", requestedById: userId });
+    await this.stopSessionInternal({ reason: "consent_withdrawn", requestedById: userId });
     return { stopped: true };
   }
 
@@ -684,7 +771,7 @@ export class VoiceMeetingController {
       }
       const remaining = humanMembers(session.voiceChannel);
       if (!remaining.length) {
-        await this.stopSession({ reason: "voice_empty", requestedById: "system" });
+        await this.stopSessionInternal({ reason: "voice_empty", requestedById: "system" });
         return true;
       }
       if (session.automatic) {
@@ -808,8 +895,14 @@ export class VoiceMeetingController {
   }
 
   async stopSession({ reason = "manual", requestedById = "system" } = {}) {
+    if (this.closing) return { stopped: false, closing: true };
+    return this.runSessionOperation(() => this.stopSessionInternal({ reason, requestedById }));
+  }
+
+  async stopSessionInternal({ reason = "manual", requestedById = "system" } = {}) {
     const session = this.session;
     if (!session) return { stopped: false };
+    if (session.state === "deleting") return { stopped: true, processing: false, deleting: true };
     if (["stopping", "processing"].includes(session.state)) return { stopped: true, processing: true };
     clearTimeout(this.maxTimer);
     clearInterval(this.noticeTimer);
@@ -824,32 +917,35 @@ export class VoiceMeetingController {
       content: `⏳ セッション **${safeDisplayText(session.id, 16)}** のローカル文字起こしと議事録を処理しています。`,
       allowedMentions: { parse: [] },
     });
-    const processPromise = this.processSession(session);
-    this.processing.set(session.id, processPromise);
+    const processPromise = this.registerProcessing(
+      session,
+      (signal) => this.processSession(session, { signal }),
+    );
     this.session = null;
-    processPromise.finally(() => this.processing.delete(session.id));
     return { stopped: true, processing: true, sessionId: session.id };
   }
 
-  async processSession(session) {
+  async processSession(session, { signal = undefined } = {}) {
     try {
-      const audioTranscript = await this.transcriber.transcribeSession(session.id);
+      throwIfAborted(signal);
+      const audioTranscript = await this.transcriber.transcribeSession(session.id, { signal });
+      throwIfAborted(signal);
       const transcript = mergeTranscriptSegments(audioTranscript, session.chatSegments);
       await this.archive.writeTranscript(session.id, transcript);
-      const analysis = this.analyzer
-        ? await this.analyzer.analyze(transcript, { knownNames: transcript.segments?.map((item) => item.speakerName) || [] })
-        : { aiUsed: false, factCheckUsed: false, minutes: null, factChecks: [] };
-      await this.archive.writeAnalysis?.(session.id, analysis);
-      if (this.publisher) {
-        await this.publisher.publish({
-          session: { ...session, state: "review_pending" },
-          transcript,
-          analysis,
-        });
-      }
-      await this.archive.updateSession(session.id, { state: "review_pending", completedAtMs: this.now() });
-      return { ok: true };
+      throwIfAborted(signal);
+      const outcome = await this.analyzeAndPublish(session, transcript, { signal });
+      return { ok: true, aiUsed: outcome.aiUsed === true };
     } catch (error) {
+      if (isAborted(error)) return { ok: false, code: "ABORTED", aborted: true };
+      if (signal?.aborted) {
+        const code = shortCode(error);
+        this.logger.error?.(`[voice] cancellation_cleanup_failed code=${code}`);
+        await session.outputChannel.send({
+          content: `⚠️ VC議事録の削除確認を完了できませんでした。管理者は再起動前にログの固定エラーコードを確認してください。エラーコード: ${code}`,
+          allowedMentions: { parse: [] },
+        }).catch(() => {});
+        return { ok: false, code, cancellationFailed: true };
+      }
       await this.archive.updateSession(session.id, { state: "processing_failed", failureCode: shortCode(error) }).catch(() => {});
       await session.outputChannel.send({
         content: [
@@ -863,27 +959,153 @@ export class VoiceMeetingController {
     }
   }
 
-  async reprocess(sessionIdValue) {
-    const id = String(sessionIdValue || "").trim().toUpperCase();
-    if (!/^[A-F0-9]{10}$/u.test(id)) throw new Error("セッションIDの形式が正しくありません");
-    if (this.processing.has(id)) throw new Error("このセッションはすでに処理中です");
-    const record = await this.archive.getSession(id);
-    if (!record || record.guildId !== this.guildId || record.expiresAtMs <= this.now()) {
-      throw new Error("再処理できるローカル音声が見つかりません");
+  async analyzeAndPublish(session, transcript, { signal = undefined } = {}) {
+    throwIfAborted(signal);
+    const analysis = this.analyzer
+      ? await awaitWithAbort(
+        this.analyzer.analyze(transcript, { knownNames: transcript.segments?.map((item) => item.speakerName) || [] }),
+        signal,
+      )
+      : { aiUsed: false, factCheckUsed: false, minutes: null, factChecks: [] };
+    throwIfAborted(signal);
+    await this.archive.writeAnalysis?.(session.id, analysis);
+    throwIfAborted(signal);
+    if (this.publisher) {
+      await this.publisher.publish({
+        session: { ...session, state: "review_pending" },
+        transcript,
+        analysis,
+        signal,
+      });
     }
-    const guild = await this.client.guilds.fetch(this.guildId);
-    const outputChannel = await guild.channels.fetch(record.outputChannelId);
-    const session = { ...record, guild, outputChannel, id };
-    const task = this.processSession(session);
-    this.processing.set(id, task);
-    task.finally(() => this.processing.delete(id));
-    return { sessionId: id, processing: true };
+    throwIfAborted(signal);
+    await this.archive.updateSession(session.id, { state: "review_pending", completedAtMs: this.now() });
+    return { ok: true, aiUsed: analysis.aiUsed === true };
   }
 
-  async deleteSession(sessionIdValue) {
+  async reprocess(sessionIdValue) {
+    if (this.closing) throw new Error("VC文字起こし機能を終了中です");
     const id = String(sessionIdValue || "").trim().toUpperCase();
     if (!/^[A-F0-9]{10}$/u.test(id)) throw new Error("セッションIDの形式が正しくありません");
-    if (this.session?.id === id) await this.stopSession({ reason: "deleted", requestedById: "manager" });
+    return this.runSessionOperation(async () => {
+      if (this.processing.has(id)) throw new Error("このセッションはすでに処理中です");
+      const record = await this.archive.getSession(id);
+      if (!record || record.guildId !== this.guildId || record.expiresAtMs <= this.now()) {
+        throw new Error("再処理できるローカル音声が見つかりません");
+      }
+      if (record.state !== "processing_failed") {
+        throw new Error("失敗状態のセッションだけ再処理できます");
+      }
+      const guild = await this.client.guilds.fetch(this.guildId);
+      const outputChannel = await guild.channels.fetch(record.outputChannelId);
+      const claimed = await this.archive.transitionSession(id, ["processing_failed"], {
+        state: "reprocessing",
+        failureCode: null,
+      });
+      if (!claimed) throw new Error("このセッションは別の処理が開始済みです");
+      const session = { ...claimed, guild, outputChannel, id };
+      const task = this.registerProcessing(session, (signal) => this.processSession(session, { signal }));
+      return { sessionId: id, processing: true, task };
+    });
+  }
+
+  async reanalyze(sessionIdValue) {
+    if (this.closing) throw new Error("VC文字起こし機能を終了中です");
+    const id = String(sessionIdValue || "").trim().toUpperCase();
+    if (!/^[A-F0-9]{10}$/u.test(id)) throw new Error("セッションIDの形式が正しくありません");
+    const prepared = await this.runSessionOperation(async () => {
+      if (this.processing.has(id)) throw new Error("このセッションはすでに処理中です");
+      const record = await this.archive.getSession(id);
+      if (!record || record.guildId !== this.guildId || record.expiresAtMs <= this.now()) {
+        throw new Error("再処理できるローカル音声が見つかりません");
+      }
+      if (!["review_pending", "analysis_failed"].includes(record.state)) {
+        throw new Error("文字起こし完了後のセッションだけ要約を再生成できます");
+      }
+      const transcript = await this.archive.readTranscript?.(id);
+      if (!transcript?.segments || !Array.isArray(transcript.segments)) {
+        throw new Error("再利用できる文字起こしが見つかりません");
+      }
+      const guild = await this.client.guilds.fetch(this.guildId);
+      const outputChannel = await guild.channels.fetch(record.outputChannelId);
+      const claimed = await this.archive.transitionSession(id, ["review_pending", "analysis_failed"], {
+        state: "reanalyzing",
+        failureCode: null,
+      });
+      if (!claimed) throw new Error("このセッションは別の処理が開始済みです");
+      const session = { ...claimed, guild, outputChannel, id };
+      const task = this.registerProcessing(session, async (signal) => {
+        try {
+          return await this.analyzeAndPublish(session, transcript, { signal });
+        } catch (error) {
+          if (isAborted(error)) throw error;
+          await this.archive.updateSession(id, {
+            state: "analysis_failed",
+            failureCode: shortCode(error),
+          }).catch(() => {});
+          throw error;
+        }
+      });
+      return { task };
+    });
+    return prepared.task;
+  }
+
+  async deleteSession(sessionIdValue, { reason = "deleted" } = {}) {
+    const id = String(sessionIdValue || "").trim().toUpperCase();
+    if (!/^[A-F0-9]{10}$/u.test(id)) throw new Error("セッションIDの形式が正しくありません");
+    const existing = this.deletionTasks.get(id);
+    if (existing) return existing;
+    if (this.closing) throw new Error("VC文字起こし機能を終了中です");
+    const task = this.deleteSessionInternal(id, { reason });
+    this.deletionTasks.set(id, task);
+    try {
+      return await task;
+    } finally {
+      if (this.deletionTasks.get(id) === task) this.deletionTasks.delete(id);
+    }
+  }
+
+  async deleteSessionInternal(id, { reason = "deleted" } = {}) {
+    const prepared = await this.runSessionOperation(async () => {
+      const record = await this.archive.getSession(id);
+      if (!record) return { missing: true };
+      const claimed = await this.archive.transitionSession(id, [record.state], {
+        state: "deleting",
+        failureCode: null,
+      });
+      if (!claimed) throw new Error("セッション状態が変わったため削除をやり直してください");
+      const activeSession = this.session?.id === id ? this.session : null;
+      if (activeSession) {
+        activeSession.state = "deleting";
+        clearTimeout(this.maxTimer);
+        clearInterval(this.noticeTimer);
+        clearInterval(this.automaticValidationTimer);
+        this.automaticValidationTimer = null;
+      }
+      this.processingAbortControllers.get(id)?.abort(reason);
+      return { activeSession, task: this.processing.get(id) || null };
+    });
+    if (prepared.missing) return false;
+    if (prepared.activeSession) await this.receiver.stop({ discardActive: true });
+    if (prepared.activeSession) {
+      await this.runSessionOperation(async () => {
+        if (this.session === prepared.activeSession) this.session = null;
+      });
+    }
+    let taskOutcome = null;
+    if (prepared.task) {
+      taskOutcome = await prepared.task.catch((error) => ({
+        ok: false,
+        code: shortCode(error),
+        cancellationFailed: true,
+      }));
+    }
+    if (taskOutcome?.ok === false && taskOutcome.code !== "ABORTED") {
+      const code = shortCode({ code: taskOutcome.code });
+      await this.archive.updateSession(id, { state: "deletion_failed", failureCode: code }).catch(() => {});
+      throw Object.assign(new Error("削除確認に失敗しました。管理者ログを確認してください"), { code });
+    }
     await this.archive.deleteSession(id);
     return true;
   }
@@ -924,12 +1146,21 @@ export class VoiceMeetingController {
   }
 
   async close() {
+    if (this.closePromise) return this.closePromise;
+    this.closing = true;
+    const task = this.closeInternal();
+    this.closePromise = task;
+    return task;
+  }
+
+  async closeInternal() {
     clearInterval(this.janitorTimer);
     clearTimeout(this.maxTimer);
     clearInterval(this.noticeTimer);
     clearInterval(this.automaticValidationTimer);
     this.automaticValidationTimer = null;
     await this.operationTail.catch(() => {});
+    await Promise.allSettled([...this.deletionTasks.values()]);
     if (this.session) {
       const session = this.session;
       await this.receiver.stop({ discardActive: false });
