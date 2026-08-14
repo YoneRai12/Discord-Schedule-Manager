@@ -32,13 +32,29 @@ function formatTimestamp(milliseconds) {
   return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}.${String(millis).padStart(3, "0")}`;
 }
 
-function transcriptBuffer(transcript) {
+function attributedTranscriptBuffer(rawTranscript, sanitizedTranscript) {
+  const speakerNames = new Map();
+  rawTranscript.segments.forEach((segment, index) => {
+    const token = sanitizedTranscript.segments[index].speaker;
+    if (!speakerNames.has(token)) {
+      const displayName = neutralizeMentions(segment.speakerName || token)
+        .replace(/[\r\n]/gu, " ")
+        .replace(/\s+/gu, " ")
+        .trim()
+        .slice(0, 100) || token;
+      speakerNames.set(token, displayName);
+    }
+  });
   const lines = [
-    "VC文字起こし（匿名化済み）",
-    ...(transcript.language ? [`language: ${transcript.language}`] : []),
+    "VC文字起こし（発言者別・時刻順）",
+    "※AI要約へは話者名・Discord ID・URL等を除いた匿名版だけを送っています。",
     "",
-    ...transcript.segments.map((segment) => (
-      `[${formatTimestamp(segment.startMs)} - ${formatTimestamp(segment.endMs)}] ${segment.speaker}: ${segment.text}`
+    "話者一覧",
+    ...[...speakerNames].map(([token, name]) => `- ${token}: ${name}`),
+    "",
+    "発言記録",
+    ...rawTranscript.segments.map((segment, index) => (
+      `[${formatTimestamp(sanitizedTranscript.segments[index].startMs)} - ${formatTimestamp(sanitizedTranscript.segments[index].endMs)}] ${speakerNames.get(sanitizedTranscript.segments[index].speaker)} (${sanitizedTranscript.segments[index].speaker}): ${neutralizeMentions(segment.text)}`
     )),
     "",
   ];
@@ -157,18 +173,18 @@ export class VoiceSummaryPublisher {
     const sanitizedTranscript = sanitizeVoiceTranscript(transcript, { knownNames: session.knownNames || [] });
     const factChecks = validatedFactChecks(analysis?.factChecks || []);
     const chunks = splitContent(formatSummary(analysis, factChecks));
-    const attachment = transcriptBuffer(sanitizedTranscript);
+    const attachment = attributedTranscriptBuffer(transcript, sanitizedTranscript);
     const channel = await this.resolveOutputChannel(session);
     const messageIds = [];
     for (let index = 0; index < chunks.length; index += 1) {
       const payload = {
         content: chunks[index],
         allowedMentions: { ...ALLOWED_MENTIONS_NONE, parse: [], users: [], roles: [] },
-        ...(index === 0 ? {
+        ...(index === chunks.length - 1 ? {
           files: [{
             attachment,
             name: "voice-transcript.txt",
-            description: "匿名化済みVC文字起こし",
+            description: "発言者名・時刻付きVC文字起こし",
           }],
         } : {}),
       };

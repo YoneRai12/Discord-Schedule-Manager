@@ -58,6 +58,7 @@ function fakeReceiver() {
 
 function buildDiscord({ everyoneViewDenied = true, invisibleMemberId = null } = {}) {
   const sent = [];
+  const voiceSent = [];
   const edited = [];
   const notice = {
     id: fakeId(7),
@@ -71,11 +72,18 @@ function buildDiscord({ everyoneViewDenied = true, invisibleMemberId = null } = 
     guildId: GUILD_ID,
     type: ChannelType.GuildVoice,
     members: new Map(),
+    permissionsFor() { return { has: () => true }; },
+    messages: { async fetch() { return notice; } },
+    async send(payload) {
+      voiceSent.push(payload);
+      return notice;
+    },
   };
   const memberById = new Map();
   const addMember = (id) => {
     const member = {
       id,
+      displayName: `参加者-${id.slice(-4)}`,
       user: { id, bot: false },
       voice: { channel: voiceChannel, channelId: VOICE_CHANNEL_ID },
     };
@@ -127,6 +135,7 @@ function buildDiscord({ everyoneViewDenied = true, invisibleMemberId = null } = 
     actor,
     participant,
     sent,
+    voiceSent,
     edited,
     addMember,
   };
@@ -151,9 +160,11 @@ function controllerFixture(options = {}) {
     outputChannelId: OUTPUT_CHANNEL_ID,
     archive,
     receiver,
-    transcriber: {
-      async transcribeSession() { return { language: "ja-JP", segments: [] }; },
+    transcriber: options.transcriber || {
+      async transcribeSession() { return { version: 1, segments: [] }; },
     },
+    analyzer: options.analyzer,
+    publisher: options.publisher,
     enabled: true,
     summaryEnabled: false,
     factCheckEnabled: false,
@@ -196,9 +207,9 @@ test("全員同意前はreceiverを開始せず、全員同意後だけ開始す
   assert.ok(replies.every((payload) => payload.allowedMentions?.parse?.length === 0));
 });
 
-test("予定の指定VCからは同意確認だけを自動開始し、入室だけでは録音しない", async (t) => {
+test("予定の指定VCはDB確定後に同意ボタンなしで自動録音を開始する", async (t) => {
   const fixture = controllerFixture();
-  const { controller, receiver, guild, voiceChannel, sent } = fixture;
+  const { controller, receiver, guild, voiceChannel, sent, voiceSent } = fixture;
   t.after(() => clearControllerTimers(controller));
 
   const started = await controller.requestStartForVoiceChannel({
@@ -212,7 +223,13 @@ test("予定の指定VCからは同意確認だけを自動開始し、入室だ
   assert.equal(controller.session.id, started.sessionId);
   assert.equal(controller.session.state, "pending_consent");
   assert.equal(receiver.calls.start.length, 0);
-  assert.match(sent[0].content, /入室を検知.*同意確認を自動/u);
+  assert.equal(sent.length, 0);
+  assert.equal(await controller.confirmAutomaticPending(started.sessionId), true);
+  assert.equal(controller.session.state, "recording");
+  assert.equal(receiver.calls.start.length, 1);
+  assert.equal(voiceSent.length, 1);
+  assert.match(voiceSent[0].content, /自動文字起こしを開始/u);
+  assert.doesNotMatch(voiceSent[0].content, /同意確認/u);
 });
 
 test("同時同意を直列化しreceiver開始と同意監査記録を一度ずつ保持する", async (t) => {
@@ -254,12 +271,7 @@ test("録音直前に予定が無効ならreceiverを開始せずpendingを解�
     automatic: true,
     sourceMeetingId: "MEET0001",
   });
-  assert.equal(await controller.confirmAutomaticPending(started.sessionId), true);
-
-  await controller.consent({ user: { id: ACTOR_ID } });
-  const result = await controller.consent({ user: { id: PARTICIPANT_ID } });
-
-  assert.equal(result.allConsented, false);
+  assert.equal(await controller.confirmAutomaticPending(started.sessionId), false);
   assert.equal(receiver.calls.start.length, 0);
   assert.equal(controller.session, null);
   assert.equal(validations.at(-1).sessionId, started.sessionId);
@@ -269,7 +281,7 @@ test("録音直前に予定が無効ならreceiverを開始せずpendingを解�
   assert.equal(releases[0].reason, "meeting_rescheduled");
 });
 
-test("DB finalize前の全員同意は保持だけ行いconfirm後に一度だけ録音開始する", async (t) => {
+test("自動予定はDB finalize前には録音せずconfirm後に一度だけ開始する", async (t) => {
   const fixture = controllerFixture({ validateAutomaticSession: async () => true });
   const { controller, receiver, guild, voiceChannel } = fixture;
   t.after(() => clearControllerTimers(controller));
@@ -281,11 +293,6 @@ test("DB finalize前の全員同意は保持だけ行いconfirm後に一度だ�
     sourceMeetingId: "MEET0001",
   });
 
-  const results = await Promise.all([
-    controller.consent({ user: { id: ACTOR_ID } }),
-    controller.consent({ user: { id: PARTICIPANT_ID } }),
-  ]);
-  assert.equal(results.some((result) => result.allConsented), false);
   assert.equal(receiver.calls.start.length, 0);
   assert.equal(controller.session.state, "pending_consent");
 
@@ -359,30 +366,78 @@ test("finalize失敗など外部取消は再試行可能に解放し、明示den
   assert.equal(second.controller.consumeAutomaticPendingOutcome(denied.sessionId), null);
 });
 
-test("自動pending中の参加者が議事録チャンネルを見られなければ録音せず取消す", async (t) => {
-  const releases = [];
+test("自動予定は参加者が議事録チャンネルを見られなくてもVC録音を開始できる", async (t) => {
   const fixture = controllerFixture({
     invisibleMemberId: NEW_PARTICIPANT_ID,
-    releaseAutomaticSession: async (context) => releases.push(context),
+    validateAutomaticSession: async () => true,
   });
   const { controller, receiver, addMember, guild, voiceChannel } = fixture;
   t.after(() => clearControllerTimers(controller));
-  await controller.requestStartForVoiceChannel({
+  const started = await controller.requestStartForVoiceChannel({
     guild,
     voiceChannel,
     requestedById: ACTOR_ID,
     automatic: true,
     sourceMeetingId: "MEET0001",
   });
+  assert.equal(await controller.confirmAutomaticPending(started.sessionId), true);
   const newcomer = addMember(NEW_PARTICIPANT_ID);
 
   assert.equal(await controller.handleVoiceStateUpdate(
     { guild, channelId: null, member: newcomer },
     { guild, channelId: VOICE_CHANNEL_ID, member: newcomer },
   ), true);
+  assert.equal(controller.session.state, "recording");
+  assert.equal(receiver.calls.start.length, 1);
+  assert.equal(receiver.calls.pause, 0);
+  assert.equal(controller.session.consentedUserIds.has(NEW_PARTICIPANT_ID), true);
+});
+
+test("自動録音中のVCチャットを発言者付きで取り込み、最後の人の退室で自動処理する", async (t) => {
+  const fixture = controllerFixture({ validateAutomaticSession: async () => true });
+  const { controller, receiver, archive, guild, voiceChannel, actor } = fixture;
+  t.after(() => clearControllerTimers(controller));
+  const started = await controller.requestStartForVoiceChannel({
+    guild,
+    voiceChannel,
+    requestedById: ACTOR_ID,
+    automatic: true,
+    sourceMeetingId: "MEET0001",
+  });
+  await controller.confirmAutomaticPending(started.sessionId);
+
+  assert.equal(await controller.handleMessageCreate({
+    id: fakeId(8),
+    guildId: GUILD_ID,
+    channelId: VOICE_CHANNEL_ID,
+    createdTimestamp: 1_800_000_005_000,
+    author: { id: ACTOR_ID, bot: false, username: "actor" },
+    member: actor,
+    content: "読み上げ元のチャットです",
+  }), true);
+
+  voiceChannel.members.clear();
+  assert.equal(await controller.handleVoiceStateUpdate(
+    { guild, channelId: VOICE_CHANNEL_ID, member: actor },
+    { guild, channelId: null, member: actor },
+  ), true);
+  await Promise.allSettled([...controller.processing.values()]);
+
+  assert.equal(receiver.calls.stop.length, 1);
   assert.equal(controller.session, null);
-  assert.equal(receiver.calls.start.length, 0);
-  assert.equal(releases.length, 0);
+  const stored = archive.sessions.get(started.sessionId);
+  assert.equal(stored.state, "review_pending");
+  assert.deepEqual(stored.transcript.segments.map((segment) => ({
+    speakerId: segment.speakerId,
+    speakerName: segment.speakerName,
+    text: segment.text,
+    startMs: segment.startMs,
+  })), [{
+    speakerId: ACTOR_ID,
+    speakerName: actor.displayName,
+    text: "[チャット] 読み上げ元のチャットです",
+    startMs: 5_000,
+  }]);
 });
 
 test("同意待ち中の入退室を反映し、全員退出したら保留セッションを破棄する", async (t) => {
@@ -434,25 +489,6 @@ test("録音中の新規参加で即pauseし、その参加者を同意対象へ
   assert.ok(edited.every((payload) => payload.allowedMentions?.parse?.length === 0));
 });
 
-test("録音中に議事録チャンネルを見られない参加者が入ったらpause後に安全停止する", async (t) => {
-  const fixture = controllerFixture({ invisibleMemberId: NEW_PARTICIPANT_ID });
-  const { controller, receiver, addMember, guild, voiceChannel } = fixture;
-  t.after(() => clearControllerTimers(controller));
-  await controller.requestStart({ user: { id: ACTOR_ID } });
-  await controller.consent({ user: { id: ACTOR_ID } });
-  await controller.consent({ user: { id: PARTICIPANT_ID } });
-  const newcomer = addMember(NEW_PARTICIPANT_ID);
-
-  assert.equal(await controller.handleVoiceStateUpdate(
-    { guild, channelId: null, member: newcomer },
-    { guild, channelId: voiceChannel.id, member: newcomer },
-  ), true);
-  assert.equal(receiver.calls.pause, 1);
-  assert.equal(receiver.calls.stop.length, 1);
-  assert.equal(controller.session, null);
-  await Promise.allSettled([...controller.processing.values()]);
-});
-
 test("会議管理者でなくても現在の参加者は録音を停止できる", async (t) => {
   const fixture = controllerFixture();
   const { controller, receiver, sent } = fixture;
@@ -474,18 +510,15 @@ test("会議管理者でなくても現在の参加者は録音を停止でき�
   await Promise.allSettled([...controller.processing.values()]);
 });
 
-test("議事録channelで@everyoneのViewChannel denyがなければ開始を拒否する", async (t) => {
+test("議事録channelで@everyoneの明示denyがなくても開始できる", async (t) => {
   const fixture = controllerFixture({ everyoneViewDenied: false });
   const { controller, receiver, archive, sent } = fixture;
   t.after(() => clearControllerTimers(controller));
-  await assert.rejects(
-    controller.requestStart({ user: { id: ACTOR_ID } }),
-    /@everyone.*明示的に拒否/u,
-  );
+  await controller.requestStart({ user: { id: ACTOR_ID } });
   assert.equal(receiver.calls.start.length, 0);
-  assert.equal(archive.sessions.size, 0);
-  assert.equal(sent.length, 0);
-  assert.equal(controller.session, null);
+  assert.equal(archive.sessions.size, 1);
+  assert.equal(sent.length, 1);
+  assert.equal(controller.session.state, "pending_consent");
 });
 
 test("disabled時のprivacy/statusは要約・Web検索・機能の無効状態を明示する", () => {
@@ -497,5 +530,5 @@ test("disabled時のprivacy/statusは要約・Web検索・機能の無効状態�
   assert.equal(controller.statusText(), "VC文字起こし機能は無効です。");
   assert.match(controller.privacyText(), /AI要約は現在無効/u);
   assert.match(controller.privacyText(), /Web検索による裏取りは現在無効/u);
-  assert.match(controller.privacyText(), /全員が毎回同意するまで録音しません/u);
+  assert.match(controller.privacyText(), /同意ボタンを待たず/u);
 });

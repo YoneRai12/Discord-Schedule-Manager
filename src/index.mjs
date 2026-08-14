@@ -228,6 +228,14 @@ client.once(Events.ClientReady, async (readyClient) => {
 });
 
 client.on(Events.MessageCreate, async (message) => {
+  if (voiceMeetingController) {
+    try {
+      await voiceMeetingController.handleMessageCreate(message);
+    } catch (error) {
+      const code = String(error?.code || error?.status || error?.name || "unknown").slice(0, 80);
+      console.error(`[voice] VCチャット収録失敗 code=${code}`);
+    }
+  }
   if (message.author.bot || !client.user) return;
   if (message.guildId == null) {
     try {

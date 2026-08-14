@@ -95,7 +95,7 @@ powershell -NoProfile -ExecutionPolicy RemoteSigned -File ".\scripts\manage-auto
 
 Discord Developer Portalで専用Applicationを作成し、Botを追加します。既存Botのトークンを流用しないことを推奨します。
 
-このBotは`GUILDS`、`GUILD_MESSAGES`、`DIRECT_MESSAGES`だけを要求し、特権的な`MESSAGE CONTENT INTENT`を要求しません。サーバー内ではBot自身が直接メンションされたメッセージだけを自然言語操作の対象にします。
+このBotは`GUILDS`、`GUILD_MESSAGES`、`DIRECT_MESSAGES`、`GUILD_VOICE_STATES`を使います。読み上げBotの音声を再認識せずVCチャット原文を議事録に収録するため、Discord Developer Portalの`Privileged Gateway Intents`で`MESSAGE CONTENT INTENT`をONにしてください。議事録へ収録する通常メッセージは、録音中の指定VCチャットに限定します。
 
 招待URLには`bot`と`applications.commands`スコープを付け、次の権限を許可します。
 
@@ -103,6 +103,8 @@ Discord Developer Portalで専用Applicationを作成し、Botを追加します
 - メッセージを送信
 - 埋め込みリンク
 - メッセージ履歴を読む
+- ファイルを添付
+- 接続
 - アプリコマンドを使う
 
 `Administrator`は不要です。
@@ -217,9 +219,9 @@ AIを使わず項目を直接入力する場合は`/meeting create`を使いま�
 
 ## Discord VCの文字起こし・議事録
 
-会議の開催場所にDiscord VCを選び、自動議事録をONにすると、開始15分前から終了予定までの間に人が指定VCへ入った時点で同意確認を自動表示します。すでに入室している場合やBotを再起動した場合も定期確認で拾います。入室しただけでは録音せず、VC内の全員が同意してからBotが接続して録音を始めます。同じVCで複数の会議時間が重なっている場合は、誤った会議を選ばず自動開始を見送ります。自動議事録をOFFにして手動で開始することもできます。途中から人が入った場合は全員分の収録を一時停止し、その人の同意後に再開します。現在の参加者なら誰でも停止できます。
+会議の開催場所にDiscord VCを選び、自動議事録をONにすると、開始15分前から終了予定までの間に人が指定VCへ入った時点でBotが自動参加し、同意ボタンを待たずに録音と文字起こしを始めます。開始したことはVCチャットへ明示し、誰でも停止ボタンから止められます。すでに入室している場合やBotを再起動した場合も定期確認で拾います。同じVCで複数の会議時間が重なっている場合は、誤った会議を選ばず自動開始を見送ります。自動議事録をOFFにして手動で開始する場合だけ、従来の同意確認を使います。自動録音中に途中参加者が入った場合は、その人も文字起こし対象へ追加してVCチャットへ通知します。
 
-音声認識は`faster-whisper`を使ってBotのPC内だけで行います。音声をOpenAIや外部STT APIへ送りません。暗号化した音声・文字起こし・要約のローカルバックアップは、再処理や人間確認のため開始から固定24時間だけ保持し、再処理しても期限を延ばしません。期限後は自動削除され、管理者はそれより前に削除できます。専用チャンネルへ投稿した匿名化済み文字起こし・議事録はDiscord側のデータなので、ローカルの24時間削除には含まれません。
+音声認識は`faster-whisper`を使ってBotのPC内だけで行います。Discordからユーザー別に受け取った音声をそのまま話者情報として使い、読み上げBotの音声は除外してVCチャット原文を取り込みます。最後の参加者がVCから抜けると自動停止し、要約の一番最後の投稿に、実際のDiscord表示名・時刻・発言内容付きの`voice-transcript.txt`を添付します。AI要約には話者名・Discord ID・URL等を除いた匿名版だけを送ります。音声をOpenAIや外部STT APIへ送りません。暗号化した音声・文字起こし・要約のローカルバックアップは、再処理や人間確認のため開始から固定24時間だけ保持し、再処理しても期限を延ばしません。期限後は自動削除され、管理者はそれより前に削除できます。議事録チャンネルへ投稿した文字起こし・議事録はDiscord側のデータなので、ローカルの24時間削除には含まれません。
 
 準備は一度だけです。
 
@@ -227,7 +229,7 @@ AIを使わず項目を直接入力する場合は`/meeting create`を使いま�
 powershell -ExecutionPolicy Bypass -File scripts/setup-local-voice.ps1 -PythonPath "Pythonの実行ファイル"
 ```
 
-`.env`へ`.env.example`の`MEETING_VOICE_*`を設定します。`MEETING_VOICE_OUTPUT_CHANNEL_ID`には議事録専用の非公開テキストチャンネルを指定し、そのチャンネルでは`@everyone`の「チャンネルを見る」を明示的に拒否してください。暗号鍵は32バイトのランダム値をBase64化したものを使い、GitやDiscordへ貼らないでください。
+`.env`へ`.env.example`の`MEETING_VOICE_*`を設定します。`MEETING_VOICE_OUTPUT_CHANNEL_ID`には文字起こしと議事録を投稿するテキストチャンネルを指定します。`@everyone`の閲覧拒否は必須ではありません。公開チャンネルを指定すると議事録も公開されるため、用途に合うチャンネルを選んでください。暗号鍵は32バイトのランダム値をBase64化したものを使い、GitやDiscordへ貼らないでください。
 
 ```text
 @予定管理 VCの文字起こしを開始して

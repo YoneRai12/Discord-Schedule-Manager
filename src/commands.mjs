@@ -44,7 +44,7 @@ export function buildMeetingCommand() {
         .addChannelTypes(ChannelType.GuildVoice))
       .addBooleanOption((option) => option
         .setName("auto_transcribe")
-        .setDescription("指定VCへの入室時に同意確認を自動表示（既定はON）"))
+        .setDescription("指定VCへの入室時に録音と文字起こしを自動開始（既定はON）"))
       .addIntegerOption((option) => option
         .setName("duration")
         .setDescription("予定時間（分）。未指定は60分")

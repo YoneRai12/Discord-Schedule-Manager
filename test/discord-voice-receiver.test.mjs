@@ -5,7 +5,7 @@ import { DiscordVoiceReceiver } from "../src/voice/discord-voice-receiver.mjs";
 
 const fakeId = (prefix) => `${prefix}${"234567890"}${"12345678"}`;
 
-function fixture({ consentedUserIds = [] } = {}) {
+function fixture({ consentedUserIds = [], memberIsBot = false } = {}) {
   let joinOptions;
   let createSegmentCalls = 0;
   let subscribeCalls = 0;
@@ -42,7 +42,7 @@ function fixture({ consentedUserIds = [] } = {}) {
     voiceAdapterCreator: {},
     members: {
       async fetch() {
-        return { id: memberId, user: { bot: false }, voice: { channelId: voiceChannelId } };
+        return { id: memberId, user: { bot: memberIsBot }, voice: { channelId: voiceChannelId } };
       },
     },
   };
@@ -70,6 +70,20 @@ test("Discord VC接続は受信可能・発話不能で開始し、DAVEを無効
   assert.equal(item.joinOptions.selfDeaf, false);
   assert.equal(item.joinOptions.selfMute, true);
   assert.equal(Object.hasOwn(item.joinOptions, "daveEncryption"), false);
+  await item.receiver.stop();
+});
+
+test("読み上げBotを含むBotユーザーの音声は受信・segment作成しない", async () => {
+  const item = fixture({ memberIsBot: true });
+  await item.receiver.start({
+    guild: item.guild,
+    voiceChannelId: item.voiceChannelId,
+    sessionId: "ABCDEF1234",
+    consentedUserIds: [item.memberId],
+  });
+  assert.equal(await item.receiver.handleSpeakingStart(item.memberId), false);
+  assert.equal(item.createSegmentCalls, 0);
+  assert.equal(item.subscribeCalls, 0);
   await item.receiver.stop();
 });
 
