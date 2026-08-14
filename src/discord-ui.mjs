@@ -199,7 +199,7 @@ export function buildVoiceChannelSelectionPayload(draft) {
   return {
     content: [
       `🎙️ **${safeDisplayText(draft.title, 100)}** を開催するVCを選んでください。`,
-      "開始15分前から終了時刻までに人が入ると同意確認を自動表示し、全員同意後に録音します。",
+      "開始15分前から終了時刻までに人が入るとBotが自動参加し、録音と文字起こしを開始します。",
     ].join("\n"),
     embeds: [],
     components: [

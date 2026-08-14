@@ -26,18 +26,43 @@ function humanMembers(channel) {
     .sort((a, b) => String(a.id).localeCompare(String(b.id)));
 }
 
-function buttonRows(id, { active = false } = {}) {
+function humanDisplayName(member, user) {
+  return safeDisplayText(
+    member?.displayName || user?.globalName || user?.username || "参加者",
+    80,
+  ) || "参加者";
+}
+
+function mergeTranscriptSegments(audioTranscript, chatSegments = []) {
+  const audioSegments = Array.isArray(audioTranscript?.segments) ? audioTranscript.segments : [];
+  return {
+    version: 1,
+    segments: [...audioSegments, ...chatSegments]
+      .map((segment) => ({ ...segment }))
+      .sort((left, right) => (
+        Number(left.startMs || 0) - Number(right.startMs || 0)
+        || Number(left.endMs || 0) - Number(right.endMs || 0)
+      )),
+  };
+}
+
+function buttonRows(id, { active = false, automatic = false } = {}) {
   if (active) {
-    return [new ActionRowBuilder().addComponents(
+    const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId(`voice:stop:${id}`)
         .setLabel("録音を停止")
         .setStyle(ButtonStyle.Danger),
-      new ButtonBuilder()
-        .setCustomId(`voice:withdraw:${id}`)
-        .setLabel("同意を撤回して停止")
-        .setStyle(ButtonStyle.Secondary),
-    )];
+    );
+    if (!automatic) {
+      row.addComponents(
+        new ButtonBuilder()
+          .setCustomId(`voice:withdraw:${id}`)
+          .setLabel("同意を撤回して停止")
+          .setStyle(ButtonStyle.Secondary),
+      );
+    }
+    return [row];
   }
   return [new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -49,6 +74,21 @@ function buttonRows(id, { active = false } = {}) {
       .setLabel("同意しない")
       .setStyle(ButtonStyle.Danger),
   )];
+}
+
+function recordingNotice({ id, title, automatic = false }) {
+  return {
+    content: [
+      automatic ? "🔴 **自動文字起こしを開始しました**" : "🔴 **VC文字起こし中**",
+      `セッション: **${safeDisplayText(id, 16)}** / ${safeDisplayText(title || "VCミーティング", 100)}`,
+      automatic
+        ? "このVCの音声をBotがローカル録音・文字起こししています。参加者の同意ボタン操作は不要です。"
+        : "全参加者が同意しました。音声をローカル録音・文字起こししています。",
+      "ローカルデータは開始から24時間以内に削除されます。誰でも下のボタンから停止できます。",
+    ].join("\n"),
+    components: buttonRows(id, { active: true, automatic }),
+    allowedMentions: { parse: [] },
+  };
 }
 
 function consentNotice({ id, title, required, consented, summaryEnabled, factCheckEnabled, paused = false, automatic = false }) {
@@ -170,7 +210,7 @@ export class VoiceMeetingController {
       result = await this.validateAutomaticSession(this.automaticSessionContext(session));
     } catch (error) {
       this.logger.warn?.(`[voice] automatic_validation_failed code=${shortCode(error)}`);
-      await this.cancelPending("予定の有効性を確認できないため、自動同意確認を終了しました", {
+      await this.cancelPending("予定の有効性を確認できないため、自動文字起こしの開始待機を終了しました", {
         retryable: true,
         releaseReason: "schedule_validation_failed",
       });
@@ -178,7 +218,7 @@ export class VoiceMeetingController {
     }
     const valid = result === true || result?.valid === true;
     if (valid) return true;
-    await this.cancelPending("予定が終了・変更・中止されたため、自動同意確認を終了しました", {
+    await this.cancelPending("予定が終了・変更・中止されたため、自動文字起こしの開始待機を終了しました", {
       retryable: true,
       releaseReason: String(result?.reason || "schedule_invalid"),
     });
@@ -204,12 +244,14 @@ export class VoiceMeetingController {
   privacyText() {
     return [
       "**VC文字起こしのプライバシー**",
-      "- 管理者の手動操作、または予定で指定されたVCへの入室により同意確認を開始します。",
-      "- 自動開始でも、VC内の全員が毎回同意するまで録音しません。Botも同意完了前はVCへ入りません。",
-      "- 新しい参加者が入ると全録音を停止し、その人の同意後に再開します。",
+      "- 予定で指定されたVCでは、参加者の入室を検知するとBotが自動参加して文字起こしを開始します。",
+      "- 自動開始では同意ボタンを待たず、開始したことをVCチャットへ通知します。手動開始では従来どおり同意確認を行います。",
+      "- 自動録音中に新しい参加者が入った場合も、その参加者を文字起こし対象へ追加してVCチャットへ通知します。",
+      "- Discordの音声はユーザー別ストリームの送信者情報で話者を確定し、最終TXTに実際の表示名・時刻・発言を記録します。",
+      "- 読み上げBotの音声は除外し、録音中のVCチャット原文を投稿者名付きで取り込みます。",
       "- 音声はこのPCだけで文字起こしし、外部STT APIへ送りません。",
       "- ローカル音声・文字起こしは開始から24時間で削除します。管理者は早期削除もできます。",
-      "- 音声はDiscordへ送信しません。文字起こし・要約は権限制限された専用チャンネルへ投稿され、Discord側では24時間後も残ります。",
+      "- 音声はDiscordへ送信しません。文字起こし・要約は設定された議事録チャンネルへ投稿され、Discord側では24時間後も残ります。",
       this.summaryEnabled
         ? "- AI要約は話者名・URL・Discord ID・メール等をローカル除去してからCodexへ送ります。"
         : "- AI要約は現在無効です。",
@@ -228,7 +270,9 @@ export class VoiceMeetingController {
     return [
       `状態: **${this.session.state}**`,
       `セッション: **${safeDisplayText(this.session.id, 16)}**`,
-      `同意: **${this.session.consentedUserIds.size}/${this.session.requiredUserIds.size}人**`,
+      this.session.automatic
+        ? `文字起こし対象: **${this.session.requiredUserIds.size}人**`
+        : `同意: **${this.session.consentedUserIds.size}/${this.session.requiredUserIds.size}人**`,
       `ローカル削除期限: <t:${Math.floor(this.session.expiresAtMs / 1_000)}:R>`,
     ].join("\n");
   }
@@ -247,12 +291,6 @@ export class VoiceMeetingController {
       PermissionFlagsBits.ReadMessageHistory,
     ];
     if (!botPermissions?.has?.(required)) throw new Error("Botに議事録チャンネルの表示・送信・添付・履歴権限が必要です");
-    const everyoneOverwrite = channel.permissionOverwrites?.cache?.get?.(guild.roles.everyone.id);
-    if (!everyoneOverwrite?.deny?.has?.(PermissionFlagsBits.ViewChannel)) {
-      throw new Error("議事録チャンネルは @everyone のチャンネル表示を明示的に拒否してください");
-    }
-    const invisible = members.filter((member) => !channel.permissionsFor(member)?.has?.(PermissionFlagsBits.ViewChannel));
-    if (invisible.length) throw new Error("VC参加者全員が議事録チャンネルを見られるようにしてください");
     return channel;
   }
 
@@ -291,6 +329,10 @@ export class VoiceMeetingController {
       if (!voiceChannel || voiceChannel.guildId !== guild.id || voiceChannel.type !== ChannelType.GuildVoice) {
         throw new Error("予定で指定された通常のDiscord VCを確認できません");
       }
+      const botVoicePermissions = voiceChannel.permissionsFor?.(guild.members.me || this.client.user);
+      if (!botVoicePermissions?.has?.([PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect])) {
+        throw new Error("Botに指定VCのチャンネル表示・接続権限が必要です");
+      }
     const members = humanMembers(voiceChannel);
     if (!members.length || members.length > this.maxParticipants) {
       throw new Error(`VC参加者は1〜${this.maxParticipants}人の範囲で開始してください`);
@@ -300,6 +342,7 @@ export class VoiceMeetingController {
     const createdAtMs = this.now();
     const expiresAtMs = createdAtMs + 24 * 60 * 60_000;
     const requiredUserIds = new Set(members.map((member) => String(member.id)));
+    const automaticMode = Boolean(automatic);
     const record = await this.archive.createSession({
       sessionId: id,
       guildId: guild.id,
@@ -313,35 +356,38 @@ export class VoiceMeetingController {
       createdAtMs,
       expiresAtMs,
       requiredUserIds: [...requiredUserIds],
-      consentedUserIds: [],
+      consentedUserIds: automaticMode ? [...requiredUserIds] : [],
     });
-    const notice = await outputChannel.send(consentNotice({
+    const notice = automaticMode ? null : await outputChannel.send(consentNotice({
       id,
       title: record.title || title,
       required: requiredUserIds.size,
       consented: 0,
       summaryEnabled: this.summaryEnabled,
       factCheckEnabled: this.factCheckEnabled,
-      automatic,
+      automatic: false,
     }));
     this.session = {
       id,
       guild,
       voiceChannel,
       outputChannel,
-      noticeMessageId: notice.id,
+      noticeMessageId: notice?.id || null,
+      noticeChannel: notice ? outputChannel : null,
       requestedById: String(requestedById),
       sourceMeetingId: sourceMeetingId ? String(sourceMeetingId) : null,
-      automatic: Boolean(automatic),
-      automaticReady: !automatic,
+      automatic: automaticMode,
+      automaticReady: !automaticMode,
       title: record.title || safeDisplayText(title, 100),
       state: "pending_consent",
       createdAtMs,
       expiresAtMs,
       requiredUserIds,
-      consentedUserIds: new Set(),
+      consentedUserIds: automaticMode ? new Set(requiredUserIds) : new Set(),
+      chatSegments: [],
+      capturedMessageIds: new Set(),
     };
-    await this.archive.updateSession(id, { noticeMessageId: notice.id });
+    if (notice) await this.archive.updateSession(id, { noticeMessageId: notice.id });
     return { sessionId: id, required: requiredUserIds.size, outputChannelId: outputChannel.id };
     } finally {
       this.starting = false;
@@ -350,9 +396,9 @@ export class VoiceMeetingController {
 
   async updateConsentNotice({ paused = false } = {}) {
     const session = this.session;
-    if (!session) return;
+    if (!session || !session.noticeMessageId) return;
     try {
-      const notice = await session.outputChannel.messages.fetch(session.noticeMessageId);
+      const notice = await (session.noticeChannel || session.outputChannel).messages.fetch(session.noticeMessageId);
       await notice.edit(consentNotice({
         id: session.id,
         title: session.title,
@@ -439,7 +485,7 @@ export class VoiceMeetingController {
     if (this.session !== session || session.state !== "pending_consent") return false;
     const currentMembers = humanMembers(session.voiceChannel);
     if (!currentMembers.length) {
-      await this.cancelPending("VCが空になったため、自動同意確認を終了しました", {
+      await this.cancelPending("VCが空になったため、自動文字起こしの開始待機を終了しました", {
         retryable: session.automatic,
         releaseReason: "voice_empty",
       });
@@ -448,7 +494,7 @@ export class VoiceMeetingController {
     try {
       await this.validateOutputChannel(session.guild, currentMembers);
     } catch (error) {
-      await this.cancelPending("参加者が議事録チャンネルを確認できないため、録音を開始しませんでした", {
+      await this.cancelPending("Botが議事録チャンネルを利用できないため、録音を開始しませんでした", {
         retryable: false,
         releaseReason: "output_channel_forbidden",
       });
@@ -456,10 +502,31 @@ export class VoiceMeetingController {
     }
     const currentIds = new Set(currentMembers.map((member) => String(member.id)));
     session.requiredUserIds = currentIds;
+    if (session.automatic) {
+      session.consentedUserIds = new Set(currentIds);
+    }
     const allConsented = [...currentIds].every((id) => session.consentedUserIds.has(id));
     if (!allConsented) {
       await this.updateConsentNotice();
       return false;
+    }
+    const activeNotice = recordingNotice({
+      id: session.id,
+      title: session.title,
+      automatic: session.automatic,
+    });
+    if (session.automatic && !session.noticeMessageId) {
+      let noticeChannel = session.voiceChannel;
+      let notice;
+      try {
+        if (typeof noticeChannel?.send !== "function") throw new Error("voice_chat_unavailable");
+        notice = await noticeChannel.send(activeNotice);
+      } catch {
+        noticeChannel = session.outputChannel;
+        notice = await noticeChannel.send(activeNotice);
+      }
+      session.noticeChannel = noticeChannel;
+      session.noticeMessageId = notice.id;
     }
     await this.receiver.start({
       guild: session.guild,
@@ -470,17 +537,17 @@ export class VoiceMeetingController {
     clearInterval(this.automaticValidationTimer);
     this.automaticValidationTimer = null;
     session.state = "recording";
-    await this.archive.updateSession(session.id, { state: "recording", startedAtMs: this.now() });
-    const notice = await session.outputChannel.messages.fetch(session.noticeMessageId);
-    await notice.edit({
-      content: [
-        "🔴 **VC文字起こし中**",
-        `セッション: **${safeDisplayText(session.id, 16)}** / ${safeDisplayText(session.title, 100)}`,
-        "全参加者が同意しました。音声はローカル処理され、開始から24時間以内に削除されます。",
-        "誰でも下のボタンから直ちに停止できます。",
-      ].join("\n"),
-      components: buttonRows(session.id, { active: true }),
-      allowedMentions: { parse: [] },
+    session.startedAtMs = this.now();
+    if (!session.automatic && session.noticeMessageId) {
+      const notice = await (session.noticeChannel || session.outputChannel).messages.fetch(session.noticeMessageId);
+      await notice.edit(activeNotice);
+    }
+    await this.archive.updateSession(session.id, {
+      state: "recording",
+      startedAtMs: this.now(),
+      requiredUserIds: [...session.requiredUserIds],
+      consentedUserIds: [...session.consentedUserIds],
+      noticeMessageId: session.noticeMessageId,
     });
     this.maxTimer = setTimeout(() => {
       void this.stopSession({ reason: "max_duration", requestedById: "system" });
@@ -530,7 +597,7 @@ export class VoiceMeetingController {
     const notice = await session.outputChannel.messages.fetch(session.noticeMessageId);
     await notice.edit({
       content: `🔴 **VC文字起こしを再開しました** — セッション **${safeDisplayText(session.id, 16)}**`,
-      components: buttonRows(session.id, { active: true }),
+      components: buttonRows(session.id, { active: true, automatic: session.automatic }),
       allowedMentions: { parse: [] },
     });
     return true;
@@ -551,23 +618,15 @@ export class VoiceMeetingController {
     const left = String(oldState.channelId || "") === String(session.voiceChannel.id)
       && String(newState.channelId || "") !== String(session.voiceChannel.id);
     if (session.state === "pending_consent" && joined) {
-      try {
-        await this.validateOutputChannel(session.guild, humanMembers(session.voiceChannel));
-      } catch (error) {
-        await this.cancelPending("新しい参加者が議事録チャンネルを確認できないため、自動同意確認を終了しました", {
-          retryable: false,
-          releaseReason: "output_channel_forbidden",
-        });
-        return true;
-      }
       session.requiredUserIds.add(userId);
-      session.consentedUserIds.delete(userId);
+      if (session.automatic) session.consentedUserIds.add(userId);
+      else session.consentedUserIds.delete(userId);
       await this.archive.updateSession(session.id, {
         state: session.state,
         requiredUserIds: [...session.requiredUserIds],
         consentedUserIds: [...session.consentedUserIds],
       });
-      await this.updateConsentNotice();
+      if (!session.automatic) await this.updateConsentNotice();
       return true;
     }
     if (session.state === "pending_consent" && left) {
@@ -575,7 +634,7 @@ export class VoiceMeetingController {
       session.consentedUserIds.delete(userId);
       const remaining = humanMembers(session.voiceChannel);
       if (!remaining.length) {
-        await this.cancelPending("VCが空になったため、自動同意確認を終了しました", {
+        await this.cancelPending("VCが空になったため、自動文字起こしの開始待機を終了しました", {
           retryable: session.automatic,
           releaseReason: "voice_empty",
         });
@@ -586,30 +645,55 @@ export class VoiceMeetingController {
         requiredUserIds: [...session.requiredUserIds],
         consentedUserIds: [...session.consentedUserIds],
       });
-      if ([...session.requiredUserIds].every((id) => session.consentedUserIds.has(id))) {
+      if (session.automatic && session.automaticReady) {
+        await this.beginRecording();
+      } else if ([...session.requiredUserIds].every((id) => session.consentedUserIds.has(id))) {
         await this.beginRecording();
       } else {
         await this.updateConsentNotice();
       }
       return true;
     }
+    if (joined && session.automatic) {
+      session.requiredUserIds.add(userId);
+      session.consentedUserIds.add(userId);
+      this.receiver.setConsentedUserIds(session.consentedUserIds);
+      await this.archive.updateSession(session.id, {
+        state: session.state,
+        requiredUserIds: [...session.requiredUserIds],
+        consentedUserIds: [...session.consentedUserIds],
+      });
+      const noticeChannel = session.noticeChannel || session.voiceChannel || session.outputChannel;
+      try {
+        await noticeChannel?.send?.({
+          content: "🔴 新しい参加者を検知しました。このVCでは文字起こしを継続しています。",
+          allowedMentions: { parse: [] },
+        });
+      } catch {}
+      return true;
+    }
     if (joined && !session.consentedUserIds.has(userId)) {
       await this.pauseForConsent(userId);
-      try {
-        await this.validateOutputChannel(session.guild, humanMembers(session.voiceChannel));
-      } catch (error) {
-        await this.stopSession({ reason: "participant_output_channel_forbidden", requestedById: "system" });
-      }
       return true;
     }
     if (left) {
       session.requiredUserIds.delete(userId);
+      if (session.automatic) {
+        session.consentedUserIds.delete(userId);
+        this.receiver.setConsentedUserIds(session.consentedUserIds);
+      }
       const remaining = humanMembers(session.voiceChannel);
       if (!remaining.length) {
         await this.stopSession({ reason: "voice_empty", requestedById: "system" });
         return true;
       }
-      if (session.state === "paused_for_consent"
+      if (session.automatic) {
+        await this.archive.updateSession(session.id, {
+          state: session.state,
+          requiredUserIds: [...session.requiredUserIds],
+          consentedUserIds: [...session.consentedUserIds],
+        });
+      } else if (session.state === "paused_for_consent"
           && [...session.requiredUserIds].every((id) => session.consentedUserIds.has(id))) {
         await this.resumeRecording();
       } else {
@@ -618,6 +702,32 @@ export class VoiceMeetingController {
       return true;
     }
     return false;
+  }
+
+  async handleMessageCreate(message) {
+    return this.runSessionOperation(async () => {
+      const session = this.session;
+      if (!session || session.state !== "recording") return false;
+      if (String(message?.guildId || "") !== this.guildId) return false;
+      if (String(message?.channelId || message?.channel?.id || "") !== String(session.voiceChannel.id)) return false;
+      if (!message?.author || message.author.bot) return false;
+      const content = String(message.content || "").replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/gu, " ").trim();
+      if (!content) return false;
+      const messageId = String(message.id || "");
+      if (messageId && session.capturedMessageIds.has(messageId)) return true;
+      const createdAtMs = Number(message.createdTimestamp || message.createdAt?.getTime?.() || this.now());
+      const relativeMs = Math.max(0, createdAtMs - Number(session.startedAtMs || session.createdAtMs));
+      session.chatSegments.push({
+        speakerId: String(message.author.id || "unknown"),
+        speakerName: humanDisplayName(message.member, message.author),
+        startMs: relativeMs,
+        endMs: relativeMs,
+        text: `[チャット] ${content}`,
+        language: null,
+      });
+      if (messageId) session.capturedMessageIds.add(messageId);
+      return true;
+    });
   }
 
   async confirmAutomaticPending(expectedSessionId) {
@@ -681,8 +791,10 @@ export class VoiceMeetingController {
       }
     }
     try {
-      const notice = await session.outputChannel.messages.fetch(session.noticeMessageId);
-      await notice.edit({ content: safeDisplayText(reason, 300), components: [], allowedMentions: { parse: [] } });
+      if (session.noticeMessageId) {
+        const notice = await (session.noticeChannel || session.outputChannel).messages.fetch(session.noticeMessageId);
+        await notice.edit({ content: safeDisplayText(reason, 300), components: [], allowedMentions: { parse: [] } });
+      }
     } catch {}
     await this.archive.deleteSession(session.id);
     this.session = null;
@@ -721,7 +833,8 @@ export class VoiceMeetingController {
 
   async processSession(session) {
     try {
-      const transcript = await this.transcriber.transcribeSession(session.id);
+      const audioTranscript = await this.transcriber.transcribeSession(session.id);
+      const transcript = mergeTranscriptSegments(audioTranscript, session.chatSegments);
       await this.archive.writeTranscript(session.id, transcript);
       const analysis = this.analyzer
         ? await this.analyzer.analyze(transcript, { knownNames: transcript.segments?.map((item) => item.speakerName) || [] })

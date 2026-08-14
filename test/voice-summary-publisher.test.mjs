@@ -61,7 +61,7 @@ function analysis(overrides = {}) {
   };
 }
 
-test("publisherはメンションを無効化し、匿名text Bufferだけを添付してaudioを送らない", async () => {
+test("publisherはメンションを無効化し、発言者名付きtext Bufferだけを添付してaudioを送らない", async () => {
   const { client, sent } = mockDiscord();
   const publisher = new VoiceSummaryPublisher({ client, guildId, outputChannelId: channelId });
   const audio = Buffer.from("not-audio-for-discord");
@@ -82,7 +82,10 @@ test("publisherはメンションを無効化し、匿名text Bufferだけを添
   assert.notEqual(sent[0].files[0].attachment, audio);
   const attachedText = sent[0].files[0].attachment.toString("utf8");
   assert.match(attachedText, /speaker-01/u);
-  assert.doesNotMatch(attachedText, /登録名|user@example\.com|meeting\.wav/u);
+  assert.match(attachedText, /登録名/u);
+  assert.match(attachedText, /user@example\.com/u);
+  assert.doesNotMatch(attachedText, /@everyone|<@/u);
+  assert.doesNotMatch(attachedText, /meeting\.wav/u);
   assert.equal(attachedText.includes(guildId), false);
 });
 
@@ -126,7 +129,7 @@ test("publisherはprivate・credential付きsource URLを送信前に拒否す�
   assert.equal(sent.length, 0);
 });
 
-test("publisherは長いsummaryをDiscord上限内へ分割しattachmentは一度だけ送る", async () => {
+test("publisherは長いsummaryを分割し最後の投稿へ文字起こしtxtを一度だけ添付する", async () => {
   const { client, sent } = mockDiscord();
   const publisher = new VoiceSummaryPublisher({ client, guildId, outputChannelId: channelId });
   const longTopics = Array.from({ length: 12 }, (_, index) => `${index + 1}: ${"長い要約内容".repeat(45)}`);
@@ -150,5 +153,7 @@ test("publisherは長いsummaryをDiscord上限内へ分割しattachmentは一�
   assert.ok(sent.length > 1);
   assert.ok(sent.every((payload) => payload.content.length <= 2_000));
   assert.equal(sent.filter((payload) => Array.isArray(payload.files)).length, 1);
+  assert.equal(sent.slice(0, -1).some((payload) => Array.isArray(payload.files)), false);
+  assert.equal(sent.at(-1).files[0].name, "voice-transcript.txt");
   assert.ok(sent.every((payload) => payload.allowedMentions.parse.length === 0));
 });

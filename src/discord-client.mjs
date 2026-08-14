@@ -4,14 +4,14 @@ import {
   Partials,
 } from "discord.js";
 
-// DiscordはBot自身が直接メンションされたメッセージについては、
-// privilegedなMessageContent intentなしでもcontentを提供する。
-// 読み取り範囲を広げないため、このBotは必要最小限のintentだけを要求する。
+// VCチャットの原文を読み上げBotの音声から再文字起こしせず、
+// 発言者付き議事録に直接収録するためMessageContent intentを使用する。
 export const MEETING_GATEWAY_INTENTS = Object.freeze([
   GatewayIntentBits.Guilds,
   GatewayIntentBits.GuildMessages,
   GatewayIntentBits.DirectMessages,
   GatewayIntentBits.GuildVoiceStates,
+  GatewayIntentBits.MessageContent,
 ]);
 
 export const MEETING_PARTIALS = Object.freeze([Partials.Channel]);
