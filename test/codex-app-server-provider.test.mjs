@@ -43,7 +43,7 @@ function temporaryProviderPaths(t) {
   return { root, sourceHome, sandboxDir };
 }
 
-function fakeAppServer({ completeTurn = true, responseText = '{"action":"unknown"}', stallMethod = null, turnError = null } = {}) {
+function fakeAppServer({ completeTurn = true, responseText = '{"action":"unknown"}', stallMethod = null, turnError = null, retryableTurnError = null } = {}) {
   const child = new EventEmitter();
   child.stdin = new PassThrough();
   child.stdout = new PassThrough();
@@ -80,6 +80,14 @@ function fakeAppServer({ completeTurn = true, responseText = '{"action":"unknown
         send({ id: message.id, result: { thread: { id: "thread-test" } } });
       } else if (message.method === "turn/start") {
         send({ id: message.id, result: { turn: { id: "turn-test" } } });
+        if (retryableTurnError) {
+          queueMicrotask(() => send({ method: "error", params: {
+            threadId: "thread-test",
+            turnId: "turn-test",
+            willRetry: true,
+            error: retryableTurnError,
+          } }));
+        }
         if (turnError) {
           queueMicrotask(() => send({ method: "error", params: {
             threadId: "thread-test",
@@ -213,8 +221,38 @@ test("Codex App Serverをstdio・一時thread・read-only・承認なしで呼�
   assert.deepEqual(turn.params.sandboxPolicy, { type: "readOnly", networkAccess: false });
   assert.equal(turn.params.approvalPolicy, "never");
   assert.ok(turn.params.outputSchema);
+  assert.equal(Object.hasOwn(turn.params, "summary"), false);
   assert.equal(Object.hasOwn(turn.params, "maxOutputTokens"), false);
   assert.equal(Object.hasOwn(turn.params, "max_output_tokens"), false);
+});
+
+test("App Serverが内部再試行するstream切断は最終失敗にせず完了を待つ", async (t) => {
+  const paths = temporaryProviderPaths(t);
+  const fake = fakeAppServer({
+    responseText: '{"action":"unknown"}',
+    retryableTurnError: {
+      codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 502 } },
+    },
+  });
+  const provider = new CodexAppServerProvider({
+    environment: { PATH: "safe", USERPROFILE: paths.root, CODEX_HOME: paths.sourceHome },
+    sandboxDir: paths.sandboxDir,
+    spawnImpl: () => fake.child,
+  });
+  t.after(() => provider.close());
+
+  const result = await provider.generateStructured({
+    systemPrompt: "meeting parser",
+    userPayload: { messageText: "safe" },
+    outputSchema: { type: "object" },
+  });
+
+  assert.equal(result, '{"action":"unknown"}');
+  assert.deepEqual(provider.lastTurnDiagnostics, {
+    code: "responseStreamDisconnected",
+    willRetry: true,
+    error: { type: "responseStreamDisconnected", httpStatusCode: 502 },
+  });
 });
 
 test("Codex子プロセスへBot・Sheets・OpenAIの秘密環境変数を継承しない", () => {
@@ -295,8 +333,37 @@ test("Codex turn失敗の診断は安全な型と状態だけを残し本文を�
     willRetry: false,
     error: { type: "responseStreamDisconnected", httpStatusCode: 429 },
   });
+  assert.equal(fake.child.killedByProvider, true);
   const diagnostics = JSON.stringify(provider.lastTurnDiagnostics);
   assert.doesNotMatch(diagnostics, /private|1234567890|https:/u);
+});
+
+test("最終requestFailed後は隔離App Serverを作り直して次の要求を処理する", async (t) => {
+  const paths = temporaryProviderPaths(t);
+  const first = fakeAppServer({
+    turnError: { codexErrorInfo: { requestFailed: {} } },
+  });
+  const second = fakeAppServer({ responseText: '{"action":"unknown"}' });
+  let spawnCalls = 0;
+  const provider = new CodexAppServerProvider({
+    environment: { PATH: "safe", USERPROFILE: paths.root, CODEX_HOME: paths.sourceHome },
+    sandboxDir: paths.sandboxDir,
+    spawnImpl: () => {
+      spawnCalls += 1;
+      return spawnCalls === 1 ? first.child : second.child;
+    },
+  });
+  t.after(() => provider.close());
+
+  const request = {
+    systemPrompt: "meeting parser",
+    userPayload: { messageText: "safe" },
+    outputSchema: { type: "object" },
+  };
+  await assert.rejects(provider.generateStructured(request), (error) => error.code === "requestFailed");
+  assert.equal(first.child.killedByProvider, true);
+  assert.equal(await provider.generateStructured(request), '{"action":"unknown"}');
+  assert.equal(spawnCalls, 2);
 });
 
 test("Codexモデルcacheに未確認フィールドが増えても一時カタログへコピーしない", async (t) => {

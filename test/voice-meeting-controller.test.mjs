@@ -84,6 +84,7 @@ function buildDiscord({ everyoneViewDenied = true, invisibleMemberId = null, fai
       edited.push(payload);
       return this;
     },
+    async delete() {},
   };
   const voiceChannel = {
     id: VOICE_CHANNEL_ID,
@@ -199,6 +200,7 @@ function controllerFixture(options = {}) {
     sessionWatchdogIntervalMs: options.sessionWatchdogIntervalMs,
     emptyVoiceGraceMs: options.emptyVoiceGraceMs,
     connectionLossGraceMs: options.connectionLossGraceMs,
+    analysisRetryPollMs: options.analysisRetryPollMs,
     now: options.now || (() => 1_800_000_000_000),
     logger: options.logger || { warn() {}, error() {} },
   });
@@ -211,7 +213,9 @@ function clearControllerTimers(controller) {
   clearInterval(controller.janitorTimer);
   clearInterval(controller.automaticValidationTimer);
   clearInterval(controller.sessionWatchdogTimer);
+  clearInterval(controller.analysisRetryTimer);
   for (const timer of controller.processingExpiryTimers.values()) clearTimeout(timer);
+  for (const timer of controller.analysisRetryExpiryTimers.values()) clearTimeout(timer);
 }
 
 test("全員同意前はreceiverを開始せず、全員同意後だけ開始する", async (t) => {
@@ -588,10 +592,12 @@ test("VC接続後に録音状態を保存できなければreceiverを止めて�
   assert.equal(releases.at(-1)?.reason, "recording_state_persist_failed");
 });
 
-test("録音終了の補助メッセージ送信に失敗してもローカル文字起こしを開始する", async (t) => {
+test("結果placeholderの送信に失敗したら文字起こしを開始せず安全側で保持する", async (t) => {
+  let transcriberCalls = 0;
   const fixture = controllerFixture({
     validateAutomaticSession: async () => true,
     failProcessingSend: true,
+    transcriber: { async transcribeSession() { transcriberCalls += 1; return { version: 1, segments: [] }; } },
   });
   const { controller, archive, guild, voiceChannel } = fixture;
   t.after(() => clearControllerTimers(controller));
@@ -604,9 +610,86 @@ test("録音終了の補助メッセージ送信に失敗してもローカル�
   });
   await controller.confirmAutomaticPending(started.sessionId);
 
-  assert.equal((await controller.stopSession({ reason: "manual", requestedById: ACTOR_ID })).stopped, true);
+  const stopped = await controller.stopSession({ reason: "manual", requestedById: ACTOR_ID });
+  assert.equal(stopped.stopped, true);
+  assert.equal(stopped.processing, false);
+  assert.equal(stopped.code, "PROCESSING_MESSAGE_SEND_FAILED");
   await Promise.allSettled([...controller.processing.values()]);
-  assert.equal(archive.sessions.get(started.sessionId).state, "review_pending");
+  assert.equal(archive.sessions.get(started.sessionId).state, "processing_failed");
+  assert.equal(archive.sessions.get(started.sessionId).failureCode, "PROCESSING_MESSAGE_SEND_FAILED");
+  assert.equal(transcriberCalls, 0);
+});
+
+test("結果placeholderのcheckpoint失敗は投稿をrollbackして文字起こしを開始しない", async (t) => {
+  const archive = fakeArchive();
+  const updateSession = archive.updateSession.bind(archive);
+  let checkpointFailed = false;
+  archive.updateSession = async (id, patch) => {
+    if (!checkpointFailed && patch.resultMessageId && !patch.state) {
+      checkpointFailed = true;
+      throw Object.assign(new Error("private storage detail"), { code: "CHECKPOINT_IO_FAILED" });
+    }
+    return updateSession(id, patch);
+  };
+  let transcriberCalls = 0;
+  let deleted = 0;
+  const fixture = controllerFixture({
+    archive,
+    transcriber: { async transcribeSession() { transcriberCalls += 1; return { version: 1, segments: [] }; } },
+  });
+  t.after(() => clearControllerTimers(fixture.controller));
+  await fixture.controller.requestStart({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: PARTICIPANT_ID } });
+  const originalSend = fixture.outputChannel.send.bind(fixture.outputChannel);
+  fixture.outputChannel.send = async (payload) => {
+    if (!/録音終了・VC退出済み/u.test(payload?.content || "")) return originalSend(payload);
+    return { id: fakeId(8), async delete() { deleted += 1; } };
+  };
+
+  const stopped = await fixture.controller.stopSession({ reason: "manual", requestedById: ACTOR_ID });
+
+  assert.equal(stopped.processing, false);
+  assert.equal(stopped.code, "RESULT_MESSAGE_CHECKPOINT_FAILED");
+  assert.equal(deleted, 1);
+  assert.equal(transcriberCalls, 0);
+  assert.equal(archive.sessions.get(stopped.sessionId).state, "processing_failed");
+  assert.equal(archive.sessions.get(stopped.sessionId).resultMessageId, undefined);
+});
+
+test("placeholder checkpoint後のrollbackも失敗したら既知IDと固定codeを保持する", async (t) => {
+  const archive = fakeArchive();
+  const updateSession = archive.updateSession.bind(archive);
+  let checkpointFailed = false;
+  archive.updateSession = async (id, patch) => {
+    if (!checkpointFailed && patch.resultMessageId && !patch.state) {
+      checkpointFailed = true;
+      throw Object.assign(new Error("private storage detail"), { code: "CHECKPOINT_IO_FAILED" });
+    }
+    return updateSession(id, patch);
+  };
+  let safeEdit = null;
+  const fixture = controllerFixture({ archive });
+  t.after(() => clearControllerTimers(fixture.controller));
+  await fixture.controller.requestStart({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: ACTOR_ID } });
+  await fixture.controller.consent({ user: { id: PARTICIPANT_ID } });
+  fixture.outputChannel.send = async () => ({
+    id: fakeId(8),
+    async delete() { throw new Error("private Discord detail"); },
+    async edit(payload) { safeEdit = payload; },
+  });
+
+  const stopped = await fixture.controller.stopSession({ reason: "manual", requestedById: ACTOR_ID });
+  const stored = archive.sessions.get(stopped.sessionId);
+
+  assert.equal(stopped.processing, false);
+  assert.equal(stopped.code, "RESULT_MESSAGE_CHECKPOINT_ROLLBACK_FAILED");
+  assert.equal(stored.state, "deletion_failed");
+  assert.equal(stored.failureCode, "RESULT_MESSAGE_CHECKPOINT_ROLLBACK_FAILED");
+  assert.equal(stored.resultMessageId, fakeId(8));
+  assert.match(safeEdit.content, /RESULT_MESSAGE_CHECKPOINT_ROLLBACK_FAILED/u);
+  assert.doesNotMatch(JSON.stringify(safeEdit), /private storage detail|private Discord detail/u);
 });
 
 test("自動録音中のVCチャットを発言者付きで取り込み、最後の人の退室で自動処理する", async (t) => {
@@ -771,8 +854,9 @@ test("保存済み文字起こしの要約だけを再生成し、音声文字�
     id,
     guildId: GUILD_ID,
     outputChannelId: OUTPUT_CHANNEL_ID,
-    expiresAtMs: 1_800_000_060_000,
+    expiresAtMs: 1_800_003_600_000,
     state: "review_pending",
+    resultMessageId: fakeId(7),
     transcript,
   });
 
@@ -784,6 +868,411 @@ test("保存済み文字起こしの要約だけを再生成し、音声文字�
   assert.equal(publisherCalls[0].transcript, transcript);
   assert.equal(fixture.archive.sessions.get(id).state, "review_pending");
   assert.equal(fixture.controller.processing.size, 0);
+});
+
+test("AI要約の一時失敗は同一結果messageで代替表示し、1分後に文字起こしだけで自動復旧する", async (t) => {
+  let nowMs = 1_800_000_000_000;
+  let transcriberCalls = 0;
+  let analyzerCalls = 0;
+  let releaseRetry;
+  const publisherCalls = [];
+  const fallback = {
+    aiUsed: false,
+    factCheckUsed: false,
+    retryable: true,
+    errorCode: "timeout",
+    minutes: { overview: "未確認", topics: [], decisions: [], actionItems: [], openQuestions: [] },
+    factChecks: [],
+  };
+  const success = {
+    aiUsed: true,
+    factCheckUsed: false,
+    minutes: { overview: "復旧済み", topics: [], decisions: [], actionItems: [], openQuestions: [] },
+    factChecks: [],
+  };
+  const fixture = controllerFixture({
+    now: () => nowMs,
+    validateAutomaticSession: async () => true,
+    transcriber: {
+      async transcribeSession() {
+        transcriberCalls += 1;
+        return { version: 1, segments: [{ speakerId: ACTOR_ID, speakerName: "参加者", startMs: 0, endMs: 1, text: "発言" }] };
+      },
+    },
+    analyzer: {
+      async analyze() {
+        analyzerCalls += 1;
+        if (analyzerCalls === 1) return fallback;
+        return new Promise((resolve) => { releaseRetry = () => resolve(success); });
+      },
+    },
+    publisher: {
+      async publish(payload) {
+        publisherCalls.push(payload);
+        return {
+          messageId: payload.session.resultMessageId,
+          publicationRevision: Number(payload.session.publicationRevision || 0) + 1,
+          publicationCompletedAtMs: nowMs,
+        };
+      },
+    },
+  });
+  const { controller, archive, guild, voiceChannel } = fixture;
+  t.after(() => clearControllerTimers(controller));
+  const started = await controller.requestStartForVoiceChannel({
+    guild,
+    voiceChannel,
+    automatic: true,
+    requestedById: ACTOR_ID,
+    sourceMeetingId: "MEET0001",
+  });
+  await controller.confirmAutomaticPending(started.sessionId);
+  await controller.stopSession({ reason: "manual", requestedById: ACTOR_ID });
+  await Promise.allSettled([...controller.processing.values()]);
+
+  const placeholder = fixture.sent.find((payload) => String(payload.content || "").includes(`VOICE_RESULT:${started.sessionId}`));
+  assert.equal(placeholder.nonce, `voice-result-${started.sessionId}`);
+  assert.equal(placeholder.enforceNonce, true);
+
+  const failed = archive.sessions.get(started.sessionId);
+  assert.equal(failed.state, "analysis_retry_wait");
+  assert.equal(failed.analysisAttemptCount, 1);
+  assert.equal(failed.analysisNextAttemptAtMs, nowMs + 60_000);
+  assert.equal(failed.analysisLastErrorCode, "TIMEOUT");
+  assert.match(failed.resultMessageId, /^\d{16,20}$/u);
+  assert.equal(publisherCalls[0].session.resultMessageId, failed.resultMessageId);
+
+  nowMs += 60_000;
+  assert.equal(await controller.runAnalysisRetryTick(), true);
+  while (!releaseRetry) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(controller.analysisRetryTasks.size, 1);
+  releaseRetry();
+  await Promise.allSettled([...controller.analysisRetryTasks.values()]);
+
+  const recovered = archive.sessions.get(started.sessionId);
+  assert.equal(recovered.state, "review_pending");
+  assert.equal(recovered.analysisAttemptCount, 2);
+  assert.equal(recovered.failureCode, null);
+  assert.equal(transcriberCalls, 1);
+  assert.equal(analyzerCalls, 2);
+  assert.equal(publisherCalls.length, 2);
+  assert.equal(publisherCalls[1].session.resultMessageId, failed.resultMessageId);
+});
+
+test("初回のDiscord公開障害もanalysis再試行待ちへ戻し、後続成功で同一messageを完了する", async (t) => {
+  let nowMs = 1_800_000_000_000;
+  let transcriberCalls = 0;
+  let publishCalls = 0;
+  const successfulAnalysis = {
+    aiUsed: true,
+    factCheckUsed: false,
+    minutes: { overview: "要約", topics: [], decisions: [], actionItems: [], openQuestions: [] },
+    factChecks: [],
+  };
+  const fixture = controllerFixture({
+    now: () => nowMs,
+    validateAutomaticSession: async () => true,
+    transcriber: {
+      async transcribeSession() {
+        transcriberCalls += 1;
+        return { version: 1, segments: [{ speakerId: ACTOR_ID, speakerName: "参加者", startMs: 0, endMs: 1, text: "発言" }] };
+      },
+    },
+    analyzer: { async analyze() { return successfulAnalysis; } },
+    publisher: {
+      async publish({ session }) {
+        publishCalls += 1;
+        if (publishCalls === 1) throw Object.assign(new Error("discord down"), { code: "ETIMEDOUT" });
+        return { messageId: session.resultMessageId, publicationRevision: 1, publicationCompletedAtMs: nowMs };
+      },
+    },
+  });
+  t.after(() => clearControllerTimers(fixture.controller));
+  const started = await fixture.controller.requestStartForVoiceChannel({
+    guild: fixture.guild,
+    voiceChannel: fixture.voiceChannel,
+    automatic: true,
+    requestedById: ACTOR_ID,
+    sourceMeetingId: "MEET0001",
+  });
+  await fixture.controller.confirmAutomaticPending(started.sessionId);
+  await fixture.controller.stopSession({ reason: "manual", requestedById: ACTOR_ID });
+  await Promise.allSettled([...fixture.controller.processing.values()]);
+  assert.equal(fixture.archive.sessions.get(started.sessionId).state, "analysis_retry_wait");
+  assert.equal(fixture.archive.sessions.get(started.sessionId).analysisLastErrorCode, "ETIMEDOUT");
+
+  nowMs += 60_000;
+  assert.equal(await fixture.controller.runAnalysisRetryTick(), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.archive.sessions.get(started.sessionId).state, "review_pending");
+  assert.equal(fixture.archive.sessions.get(started.sessionId).failureCode, null);
+  assert.equal(transcriberCalls, 1);
+  assert.equal(publishCalls, 2);
+});
+
+test("AI要約の3回目失敗は自動再試行を終え、Whisperを再実行しない", async (t) => {
+  const nowMs = 1_800_000_000_000;
+  let transcriberCalls = 0;
+  let analyzerCalls = 0;
+  const fixture = controllerFixture({
+    now: () => nowMs,
+    transcriber: { async transcribeSession() { transcriberCalls += 1; throw new Error("must not run"); } },
+    analyzer: {
+      async analyze() {
+        analyzerCalls += 1;
+        return {
+          aiUsed: false,
+          factCheckUsed: false,
+          retryable: true,
+          errorCode: "serverOverloaded",
+          minutes: { overview: "未確認", topics: [], decisions: [], actionItems: [], openQuestions: [] },
+          factChecks: [],
+        };
+      },
+    },
+    publisher: {
+      async publish({ session }) {
+        return { messageId: session.resultMessageId, publicationRevision: 3, publicationCompletedAtMs: nowMs };
+      },
+    },
+  });
+  t.after(() => clearControllerTimers(fixture.controller));
+  const id = "ABCDEF9876";
+  fixture.archive.sessions.set(id, {
+    id,
+    sessionId: id,
+    guildId: GUILD_ID,
+    outputChannelId: OUTPUT_CHANNEL_ID,
+    createdAtMs: nowMs - 60_000,
+    expiresAtMs: nowMs + 60 * 60_000,
+    state: "analysis_retry_wait",
+    failureCode: "AI_RETRY_PENDING",
+    analysisAttemptCount: 2,
+    analysisNextAttemptAtMs: nowMs,
+    resultMessageId: fakeId(7),
+    publicationRevision: 2,
+    transcript: { version: 1, segments: [{ speakerId: ACTOR_ID, speakerName: "参加者", startMs: 0, endMs: 1, text: "発言" }] },
+  });
+
+  assert.equal(await fixture.controller.runAnalysisRetryTick(), true);
+  await new Promise((resolve) => setImmediate(resolve));
+  const stored = fixture.archive.sessions.get(id);
+  assert.equal(stored.state, "review_pending");
+  assert.equal(stored.analysisAttemptCount, 3);
+  assert.equal(stored.analysisNextAttemptAtMs, null);
+  assert.equal(stored.failureCode, "AI_RETRY_EXHAUSTED");
+  assert.equal(stored.analysisLastErrorCode, "SERVEROVERLOADED");
+  assert.equal(analyzerCalls, 1);
+  assert.equal(transcriberCalls, 0);
+});
+
+test("再起動復旧由来のattempt 3は4回目の自動AI処理を開始しない", async (t) => {
+  const nowMs = 1_800_000_000_000;
+  let analyzerCalls = 0;
+  const fixture = controllerFixture({
+    now: () => nowMs,
+    analyzer: { async analyze() { analyzerCalls += 1; throw new Error("must not run"); } },
+  });
+  t.after(() => clearControllerTimers(fixture.controller));
+  const id = "A3A3A3A3A3";
+  fixture.archive.sessions.set(id, {
+    id,
+    sessionId: id,
+    guildId: GUILD_ID,
+    outputChannelId: OUTPUT_CHANNEL_ID,
+    expiresAtMs: nowMs + 60 * 60_000,
+    state: "analysis_retry_wait",
+    failureCode: "AI_RETRY_PENDING",
+    analysisAttemptCount: 3,
+    analysisNextAttemptAtMs: nowMs,
+    resultMessageId: fakeId(7),
+    transcript: { version: 1, segments: [] },
+  });
+
+  assert.equal(await fixture.controller.runAnalysisRetryTick(), false);
+  assert.equal(fixture.archive.sessions.get(id).state, "analysis_failed");
+  assert.equal(fixture.archive.sessions.get(id).failureCode, "AI_RETRY_EXHAUSTED");
+  assert.equal(fixture.archive.sessions.get(id).analysisNextAttemptAtMs, null);
+  assert.equal(analyzerCalls, 0);
+});
+
+test("AI再試行は安全期限timerでabortしDiscord結果を残してローカルだけ削除する", async (t) => {
+  const nowMs = 1_800_000_000_000;
+  let publisherCalls = 0;
+  let resultMessageDeleted = false;
+  const fixture = controllerFixture({
+    now: () => nowMs,
+    analyzer: { async analyze() { return new Promise(() => {}); } },
+    publisher: { async publish() { publisherCalls += 1; } },
+  });
+  t.after(() => clearControllerTimers(fixture.controller));
+  fixture.outputChannel.messages.fetch = async () => ({
+    async delete() { resultMessageDeleted = true; },
+  });
+  const id = "B4B4B4B4B4";
+  const session = {
+    id,
+    sessionId: id,
+    guildId: GUILD_ID,
+    outputChannelId: OUTPUT_CHANNEL_ID,
+    expiresAtMs: nowMs + 5 * 60_000 + 20,
+    state: "reanalyzing",
+    analysisAttemptCount: 1,
+    resultMessageId: fakeId(7),
+  };
+  fixture.archive.sessions.set(id, session);
+  fixture.controller.registerAnalysisRetry(
+    { ...session, guild: fixture.guild, outputChannel: fixture.outputChannel },
+    (signal) => fixture.controller.runAnalysisAttempt(
+      { ...session, guild: fixture.guild, outputChannel: fixture.outputChannel },
+      { version: 1, segments: [] },
+      { signal },
+    ),
+  );
+
+  const deadline = Date.now() + 1_000;
+  while (fixture.archive.sessions.has(id) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  assert.equal(fixture.archive.sessions.has(id), false);
+  assert.equal(resultMessageDeleted, false);
+  assert.equal(publisherCalls, 0);
+});
+
+test("保持期限の5分前以降はAIを呼ばず自動再試行を終了する", async (t) => {
+  const nowMs = 1_800_000_000_000;
+  let analyzerCalls = 0;
+  const fixture = controllerFixture({
+    now: () => nowMs,
+    analyzer: { async analyze() { analyzerCalls += 1; throw new Error("must not run"); } },
+  });
+  t.after(() => clearControllerTimers(fixture.controller));
+  const id = "FEDCBA0123";
+  fixture.archive.sessions.set(id, {
+    id,
+    sessionId: id,
+    guildId: GUILD_ID,
+    outputChannelId: OUTPUT_CHANNEL_ID,
+    expiresAtMs: nowMs + 5 * 60_000,
+    state: "analysis_retry_wait",
+    failureCode: "AI_RETRY_PENDING",
+    analysisAttemptCount: 1,
+    analysisNextAttemptAtMs: nowMs,
+  });
+
+  assert.equal(await fixture.controller.runAnalysisRetryTick(), false);
+  const stored = fixture.archive.sessions.get(id);
+  assert.equal(stored.state, "review_pending");
+  assert.equal(stored.failureCode, "AI_RETRY_EXPIRED");
+  assert.equal(stored.analysisNextAttemptAtMs, null);
+  assert.equal(analyzerCalls, 0);
+});
+
+test("保持期限中のAI再試行は中断してDiscord結果を残しarchiveだけ削除する", async (t) => {
+  const nowMs = 1_800_000_000_000;
+  const fixture = controllerFixture({ now: () => nowMs });
+  t.after(() => clearControllerTimers(fixture.controller));
+  const id = "AB12CD34EF";
+  let resultMessageDeleted = false;
+  let retryStarted = false;
+  let retryAborted = false;
+  fixture.outputChannel.messages.fetch = async () => ({
+    async delete() { resultMessageDeleted = true; },
+  });
+  const session = {
+    id,
+    sessionId: id,
+    guildId: GUILD_ID,
+    outputChannelId: OUTPUT_CHANNEL_ID,
+    expiresAtMs: nowMs,
+    state: "reanalyzing",
+    resultMessageId: fakeId(7),
+  };
+  fixture.archive.sessions.set(id, session);
+  fixture.controller.registerAnalysisRetry(session, async (signal) => {
+    retryStarted = true;
+    await new Promise((resolve) => signal.addEventListener("abort", resolve, { once: true }));
+    retryAborted = true;
+    return { ok: false, code: "ABORTED", aborted: true };
+  });
+  while (!retryStarted) await new Promise((resolve) => setImmediate(resolve));
+
+  await fixture.controller.purgeExpiredSafely();
+
+  assert.equal(retryAborted, true);
+  assert.equal(resultMessageDeleted, false);
+  assert.equal(fixture.archive.sessions.has(id), false);
+  assert.equal(fixture.controller.analysisRetryTasks.has(id), false);
+});
+
+test("再起動時はBot自身の最新100件にある厳密なplaceholder markerを一意な場合だけ復旧する", async (t) => {
+  const fixture = controllerFixture();
+  t.after(() => clearControllerTimers(fixture.controller));
+  const exactId = "C1C1C1C1C1";
+  const ambiguousId = "D2D2D2D2D2";
+  const missingId = "E3E3E3E3E3";
+  for (const id of [exactId, ambiguousId, missingId]) {
+    fixture.archive.sessions.set(id, {
+      id,
+      sessionId: id,
+      guildId: GUILD_ID,
+      outputChannelId: OUTPUT_CHANNEL_ID,
+      expiresAtMs: 1_800_003_600_000,
+      state: "processing_failed",
+      failureCode: "PROCESS_INTERRUPTED",
+      resultMessageId: null,
+    });
+  }
+  const marker = (id) => `処理marker: \`VOICE_RESULT:${id}\``;
+  const exactMessageId = fakeId(8);
+  const recent = new Map([
+    [exactMessageId, { id: exactMessageId, channelId: OUTPUT_CHANNEL_ID, author: { id: "bot" }, content: `前文\n${marker(exactId)}` }],
+    [fakeId(9), { id: fakeId(9), channelId: OUTPUT_CHANNEL_ID, author: { id: "bot" }, content: marker(ambiguousId) }],
+    [String(BigInt(fakeId(9)) + 1n), { id: String(BigInt(fakeId(9)) + 1n), channelId: OUTPUT_CHANNEL_ID, author: { id: "bot" }, content: marker(ambiguousId) }],
+    [String(BigInt(fakeId(9)) + 2n), { id: String(BigInt(fakeId(9)) + 2n), channelId: OUTPUT_CHANNEL_ID, author: { id: "other" }, content: marker(missingId) }],
+  ]);
+  let fetchLimitCalls = 0;
+  fixture.outputChannel.messages.fetch = async (options) => {
+    assert.deepEqual(options, { limit: 100 });
+    fetchLimitCalls += 1;
+    return recent;
+  };
+
+  await fixture.controller.initialize();
+
+  assert.equal(fetchLimitCalls, 3);
+  assert.equal(fixture.archive.sessions.get(exactId).resultMessageId, exactMessageId);
+  assert.equal(fixture.archive.sessions.get(exactId).failureCode, "PROCESS_INTERRUPTED");
+  assert.equal(fixture.archive.sessions.get(ambiguousId).resultMessageId, null);
+  assert.equal(fixture.archive.sessions.get(ambiguousId).failureCode, "RESULT_MESSAGE_RECONCILE_AMBIGUOUS");
+  assert.equal(fixture.archive.sessions.get(missingId).resultMessageId, null);
+  assert.equal(fixture.archive.sessions.get(missingId).failureCode, "PROCESS_INTERRUPTED");
+});
+
+test("既知の結果messageを削除できなければarchiveを消さずdeletion_failedで保持する", async (t) => {
+  const fixture = controllerFixture();
+  t.after(() => clearControllerTimers(fixture.controller));
+  const id = "ABCDE01234";
+  fixture.archive.sessions.set(id, {
+    id,
+    sessionId: id,
+    guildId: GUILD_ID,
+    outputChannelId: OUTPUT_CHANNEL_ID,
+    expiresAtMs: 1_800_000_060_000,
+    state: "review_pending",
+    resultMessageId: fakeId(7),
+  });
+  fixture.outputChannel.messages.fetch = async () => {
+    throw Object.assign(new Error("private Discord detail"), { code: "EACCES" });
+  };
+
+  await assert.rejects(
+    fixture.controller.deleteSession(id),
+    (error) => error?.code === "RESULT_MESSAGE_DELETE_FAILED" && !error.message.includes("private Discord detail"),
+  );
+  assert.equal(fixture.archive.sessions.get(id).state, "deletion_failed");
+  assert.equal(fixture.archive.sessions.get(id).failureCode, "RESULT_MESSAGE_DELETE_FAILED");
 });
 
 test("録音中の削除は文字起こしを開始せずactive音声を破棄してからarchiveを消す", async (t) => {
@@ -908,7 +1397,7 @@ test("処理中の削除はworkerをabortし、失敗通知や議事録を投稿
   assert.equal(fixture.controller.processing.has(started.sessionId), false);
 });
 
-test("削除中のDiscord rollback失敗はABORTEDにせず固定codeだけを警告して成功扱いしない", async (t) => {
+test("削除abort後の非ABORTED publisher errorもABORTEDを優先して安全に削除する", async (t) => {
   const logs = [];
   let publishSignal;
   const fixture = controllerFixture({
@@ -929,16 +1418,12 @@ test("削除中のDiscord rollback失敗はABORTEDにせず固定codeだけを�
   await fixture.controller.stopSession({ reason: "manual", requestedById: ACTOR_ID });
   while (!publishSignal) await new Promise((resolve) => setImmediate(resolve));
 
-  await assert.rejects(
-    fixture.controller.deleteSession(started.sessionId),
-    (error) => error?.code === "PUBLISH_ROLLBACK_FAILED",
-  );
-  assert.equal(fixture.archive.sessions.get(started.sessionId).state, "deletion_failed");
-  assert.equal(fixture.archive.sessions.has(started.sessionId), true);
+  assert.equal(await fixture.controller.deleteSession(started.sessionId), true);
+  assert.equal(fixture.archive.sessions.has(started.sessionId), false);
   const combined = JSON.stringify({ logs, sent: fixture.sent });
-  assert.match(combined, /PUBLISH_ROLLBACK_FAILED/u);
+  assert.doesNotMatch(combined, /PUBLISH_ROLLBACK_FAILED/u);
   assert.doesNotMatch(combined, /private transcript body/u);
-  assert.equal(fixture.sent.some((payload) => /削除確認を完了できません/u.test(payload.content || "")), true);
+  assert.equal(fixture.sent.some((payload) => /削除確認を完了できません/u.test(payload.content || "")), false);
 });
 
 test("disabled時のprivacy/statusは要約・Web検索・機能の無効状態を明示する", () => {

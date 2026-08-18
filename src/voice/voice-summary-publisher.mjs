@@ -4,8 +4,12 @@ import {
 } from "./voice-summary-privacy.mjs";
 
 const DISCORD_CONTENT_LIMIT = 2_000;
-const CONTENT_CHUNK_LIMIT = 1_850;
 const ALLOWED_MENTIONS_NONE = Object.freeze({ parse: [], users: [], roles: [], repliedUser: false });
+const LONG_SUMMARY_NOTICE = [
+  "## VC議事録",
+  "要約が長いため、完全版を `voice-minutes.txt` に添付しました。",
+  "発言者別の全文は `voice-transcript.txt` で確認できます。",
+].join("\n");
 
 function codedError(message, code) {
   return Object.assign(new Error(message), { code });
@@ -122,21 +126,35 @@ function formatSummary(analysis, factChecks) {
   return neutralizeMentions(lines.join("\n").trim());
 }
 
-function splitContent(content) {
-  if (content.length <= CONTENT_CHUNK_LIMIT) return [content];
-  const chunks = [];
-  let remaining = content;
-  while (remaining.length > CONTENT_CHUNK_LIMIT) {
-    let cut = remaining.lastIndexOf("\n", CONTENT_CHUNK_LIMIT);
-    if (cut < Math.floor(CONTENT_CHUNK_LIMIT / 2)) cut = CONTENT_CHUNK_LIMIT;
-    chunks.push(remaining.slice(0, cut).trim());
-    remaining = remaining.slice(cut).trim();
+function publicationRevision(value) {
+  if (value == null) return 0;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw codedError("公開revisionが不正です", "invalid_publication_revision");
   }
-  if (remaining) chunks.push(remaining);
-  if (chunks.some((chunk) => chunk.length > DISCORD_CONTENT_LIMIT)) {
-    throw codedError("議事録の分割に失敗しました", "summary_split_failed");
+  return value;
+}
+
+function publicationPayload(summary, transcriptAttachment) {
+  const files = [];
+  let content = summary;
+  if (summary.length > DISCORD_CONTENT_LIMIT) {
+    content = LONG_SUMMARY_NOTICE;
+    files.push({
+      attachment: Buffer.from(`${summary}\n`, "utf8"),
+      name: "voice-minutes.txt",
+      description: "VC議事録の完全版",
+    });
   }
-  return chunks;
+  files.push({
+    attachment: transcriptAttachment,
+    name: "voice-transcript.txt",
+    description: "発言者名・時刻付きVC文字起こし",
+  });
+  return {
+    content,
+    files,
+    allowedMentions: { ...ALLOWED_MENTIONS_NONE, parse: [], users: [], roles: [] },
+  };
 }
 
 export class VoiceSummaryPublisher {
@@ -177,41 +195,39 @@ export class VoiceSummaryPublisher {
     // Any session audio buffers/paths are deliberately ignored and can never become files.
     const sanitizedTranscript = sanitizeVoiceTranscript(transcript, { knownNames: session.knownNames || [] });
     const factChecks = validatedFactChecks(analysis?.factChecks || []);
-    const chunks = splitContent(formatSummary(analysis, factChecks));
+    const summary = formatSummary(analysis, factChecks);
     const attachment = attributedTranscriptBuffer(transcript, sanitizedTranscript);
+    const payload = publicationPayload(summary, attachment);
+    const nextRevision = publicationRevision(session.publicationRevision) + 1;
     const channel = await this.resolveOutputChannel(session);
     throwIfAborted(signal);
-    const messageIds = [];
-    const sentMessages = [];
-    try {
-      for (let index = 0; index < chunks.length; index += 1) {
-        throwIfAborted(signal);
-        const payload = {
-          content: chunks[index],
-          allowedMentions: { ...ALLOWED_MENTIONS_NONE, parse: [], users: [], roles: [] },
-          ...(index === chunks.length - 1 ? {
-            files: [{
-              attachment,
-              name: "voice-transcript.txt",
-              description: "発言者名・時刻付きVC文字起こし",
-            }],
-          } : {}),
-        };
-        const message = await channel.send(payload);
-        sentMessages.push(message);
-        if (message?.id) messageIds.push(String(message.id));
-        throwIfAborted(signal);
-      }
-    } catch (error) {
-      const rollback = await Promise.allSettled(sentMessages.reverse().map(async (message) => {
-        if (typeof message?.delete !== "function") throw new Error("message delete unavailable");
-        await message.delete();
-      }));
-      if (rollback.some((result) => result.status === "rejected")) {
-        throw codedError("議事録の途中投稿を削除できませんでした", "PUBLISH_ROLLBACK_FAILED");
-      }
-      throw error;
+    if (session.resultMessageId == null || session.resultMessageId === "") {
+      throw codedError("保存済みの議事録メッセージが必要です", "PUBLISH_MESSAGE_ID_REQUIRED");
     }
-    return { channelId: this.outputChannelId, messageIds, partCount: chunks.length };
+    const existingId = requireSnowflake(session.resultMessageId, "resultMessageId");
+    let message;
+    try {
+      if (typeof channel.messages?.fetch !== "function") throw new Error("message fetch unavailable");
+      const existing = await channel.messages.fetch(existingId);
+      if (!existing || String(existing.id) !== existingId || typeof existing.edit !== "function") {
+        throw new Error("message edit unavailable");
+      }
+      message = await existing.edit({ ...payload, attachments: [] });
+    } catch {
+      throw codedError("既存の議事録を更新できませんでした", "PUBLISH_EDIT_FAILED");
+    }
+    // The controller checkpoints this ID before processing starts. No new send is
+    // allowed here, so restart and cancellation cannot create duplicate results.
+    throwIfAborted(signal);
+    const messageId = String(message?.id || existingId || "");
+    if (!/^\d{16,20}$/u.test(messageId)) {
+      throw codedError("議事録投稿のIDを確認できませんでした", "PUBLISH_EDIT_FAILED");
+    }
+    return {
+      channelId: this.outputChannelId,
+      messageId,
+      publicationRevision: nextRevision,
+      publicationCompletedAtMs: Date.now(),
+    };
   }
 }
