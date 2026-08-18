@@ -391,11 +391,6 @@ export class CodexAppServerProvider {
       throw codedError("指定したCodexモデルのカタログを確認できません", "model_catalog_unavailable");
     }
     const sourceModel = selectedModels[0];
-    const unexpectedModelKeys = Object.keys(sourceModel)
-      .filter((key) => !MODEL_CATALOG_ALLOWED_KEYS.has(key));
-    if (unexpectedModelKeys.length) {
-      throw codedError("Codexモデル一覧に未確認の項目があります", "model_catalog_schema_changed");
-    }
     for (const field of [
       "include_apps_usage_instructions",
       "include_plugin_usage_instructions",
@@ -405,13 +400,18 @@ export class CodexAppServerProvider {
         throw codedError("Codexモデル一覧の機能フラグ形式が正しくありません", "model_catalog_schema_changed");
       }
     }
+    // Codexの内部cache schemaはバージョンごとに拡張される。
+    // 会議BOTが確認した項目だけを投影し、未知項目は一時カタログへコピーしない。
+    const projectedModel = Object.fromEntries(
+      Object.entries(sourceModel).filter(([key]) => MODEL_CATALOG_ALLOWED_KEYS.has(key)),
+    );
     const {
       supports_reasoning_summary_parameter: supportsReasoningSummaryParameter,
       include_apps_usage_instructions: _includeAppsUsageInstructions,
       include_plugin_usage_instructions: _includePluginUsageInstructions,
       include_skills_usage_instructions: _includeSkillsUsageInstructions,
       ...compatibleModelFields
-    } = sourceModel;
+    } = projectedModel;
     // 0.145系cacheから0.144系model_catalog_jsonへ渡す際の公式schema差分を埋める。
     const compatibleModel = {
       ...compatibleModelFields,
