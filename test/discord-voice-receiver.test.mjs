@@ -11,6 +11,7 @@ function fixture({ consentedUserIds = [], memberIsBot = false } = {}) {
   let subscribeCalls = 0;
   const speaking = new EventEmitter();
   const connection = {
+    state: { status: "ready" },
     receiver: {
       speaking,
       subscribe() {
@@ -70,7 +71,13 @@ test("Discord VC接続は受信可能・発話不能で開始し、DAVEを無効
   assert.equal(item.joinOptions.selfDeaf, false);
   assert.equal(item.joinOptions.selfMute, true);
   assert.equal(Object.hasOwn(item.joinOptions, "daveEncryption"), false);
+  assert.equal(item.receiver.isConnected({
+    guildId: item.guild.id,
+    voiceChannelId: item.voiceChannelId,
+    sessionId: "ABCDEF1234",
+  }), true);
   await item.receiver.stop();
+  assert.equal(item.receiver.isConnected(), false);
 });
 
 test("読み上げBotを含むBotユーザーの音声は受信・segment作成しない", async () => {

@@ -11,7 +11,7 @@ const ACTOR_ID = fakeId(4);
 const PARTICIPANT_ID = fakeId(5);
 const NEW_PARTICIPANT_ID = fakeId(6);
 
-function fakeArchive() {
+function fakeArchive({ failRecordingUpdate = false } = {}) {
   const sessions = new Map();
   const updates = [];
   const events = [];
@@ -27,7 +27,14 @@ function fakeArchive() {
       return stored;
     },
     async getSession(id) { return sessions.get(id) || null; },
+    async listSessions({ states = [], limit = 100 } = {}) {
+      const filter = new Set(states);
+      return [...sessions.values()].filter((session) => !filter.size || filter.has(session.state)).slice(0, limit);
+    },
     async updateSession(id, patch) {
+      if (failRecordingUpdate && patch.state === "recording") {
+        throw Object.assign(new Error("recording state write failed"), { code: "STATE_WRITE_FAILED" });
+      }
       updates.push({ id, patch });
       const current = sessions.get(id) || {};
       const next = { ...current, ...patch };
@@ -54,17 +61,20 @@ function fakeArchive() {
 
 function fakeReceiver() {
   const calls = { start: [], pause: 0, resume: 0, stop: [], consentSets: [] };
+  let connected = false;
   return {
     calls,
-    async start(options) { calls.start.push(options); },
+    async start(options) { calls.start.push(options); connected = true; },
     async pause() { calls.pause += 1; },
     resume() { calls.resume += 1; },
-    async stop(options) { calls.stop.push(options); },
+    async stop(options) { calls.stop.push(options); connected = false; },
     setConsentedUserIds(ids) { calls.consentSets.push([...ids]); },
+    isConnected() { return connected; },
+    setConnected(value) { connected = Boolean(value); },
   };
 }
 
-function buildDiscord({ everyoneViewDenied = true, invisibleMemberId = null } = {}) {
+function buildDiscord({ everyoneViewDenied = true, invisibleMemberId = null, failProcessingSend = false } = {}) {
   const sent = [];
   const voiceSent = [];
   const edited = [];
@@ -116,6 +126,9 @@ function buildDiscord({ everyoneViewDenied = true, invisibleMemberId = null } = 
     },
     messages: { async fetch() { return notice; } },
     async send(payload) {
+      if (failProcessingSend && /録音終了・VC退出済み/u.test(payload?.content || "")) {
+        throw Object.assign(new Error("temporary Discord failure"), { code: "ETIMEDOUT" });
+      }
       sent.push(payload);
       return sent.length === 1 ? notice : { id: String(BigInt(fakeId(7)) + BigInt(sent.length)) };
     },
@@ -128,7 +141,11 @@ function buildDiscord({ everyoneViewDenied = true, invisibleMemberId = null } = 
       async fetch(id) { return memberById.get(String(id)); },
     },
     channels: {
-      async fetch(id) { return id === OUTPUT_CHANNEL_ID ? outputChannel : null; },
+      async fetch(id) {
+        if (id === OUTPUT_CHANNEL_ID) return outputChannel;
+        if (id === VOICE_CHANNEL_ID) return voiceChannel;
+        return null;
+      },
     },
   };
   const client = {
@@ -160,7 +177,7 @@ function interaction(customId, userId, replies) {
 
 function controllerFixture(options = {}) {
   const discord = buildDiscord(options);
-  const archive = fakeArchive();
+  const archive = options.archive || fakeArchive({ failRecordingUpdate: options.failRecordingUpdate });
   const receiver = fakeReceiver();
   const controller = new VoiceMeetingController({
     client: discord.client,
@@ -179,7 +196,10 @@ function controllerFixture(options = {}) {
     validateAutomaticSession: options.validateAutomaticSession,
     releaseAutomaticSession: options.releaseAutomaticSession,
     automaticValidationIntervalMs: options.automaticValidationIntervalMs,
-    now: () => 1_800_000_000_000,
+    sessionWatchdogIntervalMs: options.sessionWatchdogIntervalMs,
+    emptyVoiceGraceMs: options.emptyVoiceGraceMs,
+    connectionLossGraceMs: options.connectionLossGraceMs,
+    now: options.now || (() => 1_800_000_000_000),
     logger: options.logger || { warn() {}, error() {} },
   });
   return { controller, archive, receiver, ...discord };
@@ -190,6 +210,7 @@ function clearControllerTimers(controller) {
   clearInterval(controller.noticeTimer);
   clearInterval(controller.janitorTimer);
   clearInterval(controller.automaticValidationTimer);
+  clearInterval(controller.sessionWatchdogTimer);
   for (const timer of controller.processingExpiryTimers.values()) clearTimeout(timer);
 }
 
@@ -400,10 +421,201 @@ test("自動予定は参加者が議事録チャンネルを見られなくて�
   assert.equal(receiver.calls.start.length, 1);
   assert.equal(receiver.calls.pause, 0);
   assert.equal(controller.session.consentedUserIds.has(NEW_PARTICIPANT_ID), true);
+  assert.equal(fixture.voiceSent.length, 1);
+});
+
+test("VCチャットでBotへ会議終了を伝えるとローカル判定で停止し、元の表示を処理中へ更新する", async (t) => {
+  const fixture = controllerFixture({ validateAutomaticSession: async () => true });
+  const { controller, receiver, guild, voiceChannel, actor, edited } = fixture;
+  t.after(() => clearControllerTimers(controller));
+  const started = await controller.requestStartForVoiceChannel({
+    guild,
+    voiceChannel,
+    requestedById: ACTOR_ID,
+    automatic: true,
+    sourceMeetingId: "MEET0001",
+  });
+  await controller.confirmAutomaticPending(started.sessionId);
+  const reactions = [];
+
+  assert.equal(await controller.handleMeetingEndMessage({
+    id: fakeId(8),
+    guildId: GUILD_ID,
+    channelId: VOICE_CHANNEL_ID,
+    author: { id: ACTOR_ID, bot: false },
+    member: actor,
+    content: "<@bot> 会議終わったよ",
+    mentions: { users: { has: (id) => id === "bot" } },
+    async react(value) { reactions.push(value); },
+  }), true);
+  await Promise.allSettled([...controller.processing.values()]);
+
+  assert.equal(receiver.calls.stop.length, 1);
+  assert.equal(controller.session, null);
+  assert.deepEqual(reactions, ["✅"]);
+  assert.ok(edited.some((payload) => /VCから退出済み/u.test(payload.content || "")));
+  assert.ok(edited.some((payload) => /処理が完了/u.test(payload.content || "")));
+});
+
+test("会議終了予定の質問や条件文は停止命令へ誤判定しない", async (t) => {
+  const fixture = controllerFixture({ validateAutomaticSession: async () => true });
+  const { controller, receiver, guild, voiceChannel, actor } = fixture;
+  t.after(() => clearControllerTimers(controller));
+  const started = await controller.requestStartForVoiceChannel({
+    guild,
+    voiceChannel,
+    requestedById: ACTOR_ID,
+    automatic: true,
+    sourceMeetingId: "MEET0001",
+  });
+  await controller.confirmAutomaticPending(started.sessionId);
+  const base = {
+    guildId: GUILD_ID,
+    channelId: VOICE_CHANNEL_ID,
+    author: { id: ACTOR_ID, bot: false },
+    member: actor,
+    mentions: { users: { has: (id) => id === "bot" } },
+  };
+
+  assert.equal(await controller.handleMeetingEndMessage({ ...base, content: "<@bot> 会議終了予定を教えて" }), false);
+  assert.equal(await controller.handleMeetingEndMessage({ ...base, content: "<@bot> 会議が終わったら次を教えて" }), false);
+  assert.equal(await controller.handleMeetingEndMessage({ ...base, content: "<@bot> 会議終わった？" }), false);
+  assert.equal(await controller.handleMeetingEndMessage({ ...base, content: "<@bot> 終了?" }), false);
+  assert.equal(receiver.calls.stop.length, 0);
+  assert.equal(controller.session?.state, "recording");
+});
+
+test("VCイベントを取りこぼしても空室監視で自動停止する", async (t) => {
+  let nowMs = 1_800_000_000_000;
+  const fixture = controllerFixture({
+    validateAutomaticSession: async () => true,
+    emptyVoiceGraceMs: 1_000,
+    now: () => nowMs,
+  });
+  const { controller, receiver, guild, voiceChannel } = fixture;
+  t.after(() => clearControllerTimers(controller));
+  const started = await controller.requestStartForVoiceChannel({
+    guild,
+    voiceChannel,
+    requestedById: ACTOR_ID,
+    automatic: true,
+    sourceMeetingId: "MEET0001",
+  });
+  await controller.confirmAutomaticPending(started.sessionId);
+  voiceChannel.members.clear();
+
+  assert.equal(await controller.reconcileActiveSession(), false);
+  nowMs += 1_001;
+  assert.equal(await controller.reconcileActiveSession(), true);
+  assert.equal(receiver.calls.stop.length, 1);
+  assert.equal(controller.session, null);
+  await Promise.allSettled([...controller.processing.values()]);
+});
+
+test("BotのVC接続断が猶予時間を超えたら録音中表示を続けず自動停止する", async (t) => {
+  let nowMs = 1_800_000_000_000;
+  const fixture = controllerFixture({
+    validateAutomaticSession: async () => true,
+    connectionLossGraceMs: 1_000,
+    now: () => nowMs,
+  });
+  const { controller, receiver, guild, voiceChannel } = fixture;
+  t.after(() => clearControllerTimers(controller));
+  const started = await controller.requestStartForVoiceChannel({
+    guild,
+    voiceChannel,
+    requestedById: ACTOR_ID,
+    automatic: true,
+    sourceMeetingId: "MEET0001",
+  });
+  await controller.confirmAutomaticPending(started.sessionId);
+  receiver.setConnected(false);
+
+  assert.equal(await controller.reconcileActiveSession(), false);
+  nowMs += 1_001;
+  assert.equal(await controller.reconcileActiveSession(), true);
+  assert.equal(receiver.calls.stop.length, 1);
+  assert.equal(controller.session, null);
+  await Promise.allSettled([...controller.processing.values()]);
+});
+
+test("手動会議の途中参加同意待ち中でもVC接続断を監視して自動停止する", async (t) => {
+  let nowMs = 1_800_000_000_000;
+  const fixture = controllerFixture({ connectionLossGraceMs: 1_000, now: () => nowMs });
+  const { controller, receiver, addMember, guild, voiceChannel } = fixture;
+  t.after(() => clearControllerTimers(controller));
+  await controller.requestStart({ user: { id: ACTOR_ID } });
+  await controller.consent({ user: { id: ACTOR_ID } });
+  await controller.consent({ user: { id: PARTICIPANT_ID } });
+  const newcomer = addMember(NEW_PARTICIPANT_ID);
+  await controller.handleVoiceStateUpdate(
+    { guild, channelId: null, member: newcomer },
+    { guild, channelId: VOICE_CHANNEL_ID, member: newcomer },
+  );
+  assert.equal(controller.session.state, "paused_for_consent");
+  receiver.setConnected(false);
+
+  assert.equal(await controller.reconcileActiveSession(), false);
+  nowMs += 1_001;
+  assert.equal(await controller.reconcileActiveSession(), true);
+  assert.equal(receiver.calls.stop.length, 1);
+  assert.equal(controller.session, null);
+  await Promise.allSettled([...controller.processing.values()]);
+});
+
+test("VC接続後に録音状態を保存できなければreceiverを止めて自動開始を解放する", async (t) => {
+  const releases = [];
+  const fixture = controllerFixture({
+    validateAutomaticSession: async () => true,
+    releaseAutomaticSession: async (context) => releases.push(context),
+    failRecordingUpdate: true,
+  });
+  const { controller, receiver, guild, voiceChannel, archive } = fixture;
+  t.after(() => clearControllerTimers(controller));
+  const started = await controller.requestStartForVoiceChannel({
+    guild,
+    voiceChannel,
+    requestedById: ACTOR_ID,
+    automatic: true,
+    sourceMeetingId: "MEET0001",
+  });
+
+  await assert.rejects(controller.confirmAutomaticPending(started.sessionId), (error) => error?.code === "STATE_WRITE_FAILED");
+  assert.equal(receiver.calls.start.length, 1);
+  assert.deepEqual(receiver.calls.stop, [{ discardActive: true }]);
+  assert.equal(controller.session, null);
+  assert.equal(archive.sessions.size, 0);
+  assert.equal(releases.at(-1)?.reason, "recording_state_persist_failed");
+});
+
+test("録音終了の補助メッセージ送信に失敗してもローカル文字起こしを開始する", async (t) => {
+  const fixture = controllerFixture({
+    validateAutomaticSession: async () => true,
+    failProcessingSend: true,
+  });
+  const { controller, archive, guild, voiceChannel } = fixture;
+  t.after(() => clearControllerTimers(controller));
+  const started = await controller.requestStartForVoiceChannel({
+    guild,
+    voiceChannel,
+    requestedById: ACTOR_ID,
+    automatic: true,
+    sourceMeetingId: "MEET0001",
+  });
+  await controller.confirmAutomaticPending(started.sessionId);
+
+  assert.equal((await controller.stopSession({ reason: "manual", requestedById: ACTOR_ID })).stopped, true);
+  await Promise.allSettled([...controller.processing.values()]);
+  assert.equal(archive.sessions.get(started.sessionId).state, "review_pending");
 });
 
 test("自動録音中のVCチャットを発言者付きで取り込み、最後の人の退室で自動処理する", async (t) => {
-  const fixture = controllerFixture({ validateAutomaticSession: async () => true });
+  let nowMs = 1_800_000_000_000;
+  const fixture = controllerFixture({
+    validateAutomaticSession: async () => true,
+    emptyVoiceGraceMs: 1_000,
+    now: () => nowMs,
+  });
   const { controller, receiver, archive, guild, voiceChannel, actor } = fixture;
   t.after(() => clearControllerTimers(controller));
   const started = await controller.requestStartForVoiceChannel({
@@ -430,6 +642,9 @@ test("自動録音中のVCチャットを発言者付きで取り込み、最後
     { guild, channelId: VOICE_CHANNEL_ID, member: actor },
     { guild, channelId: null, member: actor },
   ), true);
+  assert.notEqual(controller.session, null);
+  nowMs += 1_001;
+  assert.equal(await controller.reconcileActiveSession(), true);
   await Promise.allSettled([...controller.processing.values()]);
 
   assert.equal(receiver.calls.stop.length, 1);
@@ -589,6 +804,7 @@ test("録音中の削除は文字起こしを開始せずactive音声を破棄�
   assert.equal(await fixture.controller.deleteSession(started.sessionId), true);
   assert.equal(transcribeCalls, 0);
   assert.equal(fixture.controller.session, null);
+  assert.equal(fixture.controller.sessionWatchdogTimer, null);
   assert.deepEqual(fixture.receiver.calls.stop, [{ discardActive: true }]);
   assert.equal(fixture.archive.sessions.has(started.sessionId), false);
 });
@@ -735,4 +951,21 @@ test("disabled時のprivacy/statusは要約・Web検索・機能の無効状態�
   assert.match(controller.privacyText(), /AI要約は現在無効/u);
   assert.match(controller.privacyText(), /Web検索による裏取りは現在無効/u);
   assert.match(controller.privacyText(), /同意ボタンを待たず/u);
+});
+
+test("PC終了で中断した処理は次回起動時にDiscordの処理中表示も失敗へ更新する", async (t) => {
+  const fixture = controllerFixture();
+  t.after(() => clearControllerTimers(fixture.controller));
+  await fixture.archive.createSession({
+    sessionId: "ABCDEF1234",
+    state: "processing_failed",
+    failureCode: "PROCESS_INTERRUPTED",
+    noticeMessageId: fakeId(7),
+    voiceChannelId: VOICE_CHANNEL_ID,
+    outputChannelId: OUTPUT_CHANNEL_ID,
+    title: "再起動された会議",
+  });
+
+  assert.equal(await fixture.controller.reconcileInterruptedNotices(), 1);
+  assert.ok(fixture.edited.some((payload) => /処理に失敗/u.test(payload.content || "")));
 });
