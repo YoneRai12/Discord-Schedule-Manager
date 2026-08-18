@@ -70,12 +70,13 @@ test("Structured Outputsで禁止されるuniqueItemsを使わずローカルで
   assert.deepEqual(result.providedFields, ["title", "startsAt", "meetingUrl"]);
 });
 
-test("AIが不足なしと答えてもURL有無はローカルで再判定する", () => {
+test("会議URLが未定でも会議名と日時があれば作成できる", () => {
   const result = validateInterpretation(validOutput(), {
     hasMeetingUrl: false,
     nowMs: Date.parse("2026-07-18T00:00:00Z"),
   });
-  assert.deepEqual(result.missingFields, ["meetingUrl"]);
+  assert.deepEqual(result.missingFields, []);
+  assert.deepEqual(result.providedFields, ["title", "startsAt"]);
 });
 
 test("会議更新ではlegacy 7文字IDと新しい8文字IDの両方を保持する", () => {

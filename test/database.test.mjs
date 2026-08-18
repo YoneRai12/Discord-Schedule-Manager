@@ -65,6 +65,172 @@ test("会議・出欠・通知をSQLiteへ再起動可能な形で保存する",
   assert.equal(rsvps[0].status, "declined");
 });
 
+test("会議URLが未定でも空文字へ正規化して保存する", (t) => {
+  const store = withDatabase(t);
+  const meeting = store.createMeeting(meetingInput({ meetingUrl: null }));
+  assert.equal(meeting.meetingUrl, "");
+  assert.equal(store.getSnapshot().meetings[0].meetingUrl, "");
+});
+
+test("指定Discord VCと自動議事録設定を保存し開始claimを一度だけ取得する", (t) => {
+  const store = withDatabase(t);
+  const guildId = `${"123456789"}${"012345678"}`;
+  const voiceChannelId = `${"223456789"}${"012345678"}`;
+  const startsAtMs = Date.now() + 10 * 60_000;
+  const meeting = store.createMeeting(meetingInput({
+    id: "VOICE001",
+    guildId,
+    startsAtMs,
+    endsAtMs: startsAtMs + 60 * 60_000,
+    meetingUrl: `https://discord.com/channels/${guildId}/${voiceChannelId}`,
+    voiceAutoRecord: true,
+  }));
+  assert.equal(meeting.voiceChannelId, voiceChannelId);
+  assert.equal(meeting.voiceAutoRecord, true);
+  assert.deepEqual(store.listVoiceAutoStartCandidates(guildId, {
+    nowMs: startsAtMs - 15 * 60_000,
+    earlyMinutes: 15,
+  }).map((item) => item.id), [meeting.id]);
+
+  assert.equal(store.claimVoiceAutoStart(meeting.id, "claimtoken01", {
+    nowMs: startsAtMs - 60_000,
+    earlyMinutes: 15,
+    expectedUpdatedAtMs: meeting.updatedAtMs,
+    expectedVoiceChannelId: voiceChannelId,
+  }), true);
+  assert.equal(store.claimVoiceAutoStart(meeting.id, "claimtoken02", { nowMs: startsAtMs - 60_000 }), false);
+  assert.equal(store.finalizeVoiceAutoStart(meeting.id, "claimtoken01", "ABCDEF0123", { nowMs: startsAtMs }), true);
+  const finalized = store.getMeeting(meeting.id);
+  assert.equal(finalized.voiceAutoSessionId, "ABCDEF0123");
+  assert.equal(store.isVoiceAutoSessionCurrent(meeting.id, "ABCDEF0123", {
+    voiceChannelId,
+    nowMs: startsAtMs,
+    earlyMinutes: 15,
+  }), true);
+  assert.equal(store.listVoiceAutoStartCandidates(guildId, { nowMs: startsAtMs, earlyMinutes: 15 }).length, 0);
+});
+
+test("VC自動開始claimは取得後の会議更新・中止・時刻窓外を原子的に拒否する", (t) => {
+  const store = withDatabase(t);
+  const guildId = `${"123456789"}${"012345678"}`;
+  const voiceChannelId = `${"223456789"}${"012345678"}`;
+  const startsAtMs = Date.now() + 10 * 60_000;
+  const input = {
+    guildId,
+    startsAtMs,
+    endsAtMs: startsAtMs + 60 * 60_000,
+    meetingUrl: `https://discord.com/channels/${guildId}/${voiceChannelId}`,
+    voiceAutoRecord: true,
+  };
+
+  const updated = store.createMeeting(meetingInput({ ...input, id: "VOICE003" }));
+  const staleUpdatedAtMs = updated.updatedAtMs;
+  store.updateMeeting(updated.id, { title: "更新後" });
+  assert.equal(store.claimVoiceAutoStart(updated.id, "staleupdate1", {
+    nowMs: startsAtMs - 60_000,
+    earlyMinutes: 15,
+    expectedUpdatedAtMs: staleUpdatedAtMs,
+    expectedVoiceChannelId: voiceChannelId,
+  }), false);
+
+  const cancelled = store.createMeeting(meetingInput({ ...input, id: "VOICE004" }));
+  store.cancelMeeting(cancelled.id);
+  assert.equal(store.claimVoiceAutoStart(cancelled.id, "cancelled01", {
+    nowMs: startsAtMs - 60_000,
+    earlyMinutes: 15,
+    expectedUpdatedAtMs: cancelled.updatedAtMs,
+    expectedVoiceChannelId: voiceChannelId,
+  }), false);
+
+  const outside = store.createMeeting(meetingInput({ ...input, id: "VOICE005" }));
+  assert.equal(store.claimVoiceAutoStart(outside.id, "tooearly001", {
+    nowMs: startsAtMs - 16 * 60_000,
+    earlyMinutes: 15,
+    expectedUpdatedAtMs: outside.updatedAtMs,
+    expectedVoiceChannelId: voiceChannelId,
+  }), false);
+  assert.equal(store.claimVoiceAutoStart(outside.id, "wrongvc001", {
+    nowMs: startsAtMs - 60_000,
+    earlyMinutes: 15,
+    expectedUpdatedAtMs: outside.updatedAtMs,
+    expectedVoiceChannelId: `${"323456789"}${"012345678"}`,
+  }), false);
+});
+
+test("確定済みVCセッションの検証とreleaseは会議・セッション・VCの一致を要求する", (t) => {
+  const store = withDatabase(t);
+  const guildId = `${"123456789"}${"012345678"}`;
+  const voiceChannelId = `${"223456789"}${"012345678"}`;
+  const startsAtMs = Date.now() + 10 * 60_000;
+  const meeting = store.createMeeting(meetingInput({
+    id: "VOICE006",
+    guildId,
+    startsAtMs,
+    endsAtMs: startsAtMs + 60 * 60_000,
+    meetingUrl: `https://discord.com/channels/${guildId}/${voiceChannelId}`,
+    voiceAutoRecord: true,
+  }));
+  assert.equal(store.claimVoiceAutoStart(meeting.id, "finalize001", {
+    nowMs: startsAtMs - 60_000,
+    earlyMinutes: 15,
+    expectedUpdatedAtMs: meeting.updatedAtMs,
+    expectedVoiceChannelId: voiceChannelId,
+  }), true);
+  assert.equal(store.finalizeVoiceAutoStart(meeting.id, "finalize001", "ABCDEF0123", {
+    nowMs: startsAtMs,
+  }), true);
+  assert.deepEqual(store.listFinalizedVoiceAutoStarts(guildId).map((item) => item.id), [meeting.id]);
+
+  assert.equal(store.isVoiceAutoSessionCurrent(meeting.id, "ABCDEF0123", {
+    voiceChannelId,
+    nowMs: startsAtMs,
+  }), true);
+  assert.equal(store.isVoiceAutoSessionCurrent(meeting.id, "ABCDEF0123", {
+    voiceChannelId: `${"323456789"}${"012345678"}`,
+    nowMs: startsAtMs,
+  }), false);
+  assert.equal(store.isVoiceAutoSessionCurrent(meeting.id, "ABCDEF0123", {
+    voiceChannelId,
+    nowMs: meeting.endsAtMs + 1,
+  }), false);
+  assert.equal(store.releaseVoiceAutoStart(meeting.id, "0000000000", {
+    expectedVoiceChannelId: voiceChannelId,
+  }), false);
+  assert.equal(store.releaseVoiceAutoStart(meeting.id, "ABCDEF0123", {
+    expectedVoiceChannelId: `${"323456789"}${"012345678"}`,
+  }), false);
+  store.cancelMeeting(meeting.id);
+  assert.equal(store.isVoiceAutoSessionCurrent(meeting.id, "ABCDEF0123", {
+    voiceChannelId,
+    nowMs: startsAtMs,
+  }), false);
+  assert.deepEqual(store.listFinalizedVoiceAutoStarts(guildId), []);
+  assert.equal(store.releaseVoiceAutoStart(meeting.id, "ABCDEF0123", {
+    expectedVoiceChannelId: voiceChannelId,
+  }), true);
+  assert.equal(store.getMeeting(meeting.id).voiceAutoSessionId, null);
+  assert.deepEqual(store.listFinalizedVoiceAutoStarts(guildId), []);
+});
+
+test("Discord VCを指定しても自動議事録OFFを保持し外部URL切替でVC設定を消す", (t) => {
+  const store = withDatabase(t);
+  const guildId = `${"123456789"}${"012345678"}`;
+  const voiceChannelId = `${"223456789"}${"012345678"}`;
+  const meeting = store.createMeeting(meetingInput({
+    id: "VOICE002",
+    guildId,
+    meetingUrl: `https://discord.com/channels/${guildId}/${voiceChannelId}`,
+    voiceAutoRecord: false,
+  }));
+  assert.equal(meeting.voiceChannelId, voiceChannelId);
+  assert.equal(meeting.voiceAutoRecord, false);
+  assert.equal(store.updateMeeting(meeting.id, { title: "更新後" }).voiceAutoRecord, false);
+
+  const external = store.updateMeetingUrl(meeting.id, "https://meet.google.com/example-room");
+  assert.equal(external.voiceChannelId, null);
+  assert.equal(external.voiceAutoRecord, false);
+});
+
 test("同じDBを別Discordテナントへ流用しない", (t) => {
   const store = withDatabase(t);
   store.bindTenant({ guildId: GUILD_ID, botUserId: BOT_ID });
