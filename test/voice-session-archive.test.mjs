@@ -304,3 +304,46 @@ test("再処理中の異常終了stateは次回lock取得後に再試行可能�
   await second.close();
   await rm(root, { recursive: true, force: true });
 });
+
+test("通常の文字起こし処理中にPCが終了しても次回起動で再処理可能へ戻る", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-archive-processing-recovery-"));
+  const archiveKey = key();
+  const first = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey });
+  await first.initialize();
+  await first.createSession({ sessionId: "processing_interrupted", state: "processing" });
+  await first.close();
+
+  const second = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey });
+  await second.initialize();
+  const recovered = await second.getSession("processing_interrupted");
+  assert.equal(recovered.state, "processing_failed");
+  assert.equal(recovered.failureCode, "PROCESS_INTERRUPTED");
+  assert.deepEqual((await second.listSessions({ states: ["processing_failed"] })).map((item) => item.sessionId), [
+    "processing_interrupted",
+  ]);
+  await second.close();
+  await rm(root, { recursive: true, force: true });
+});
+
+test("停止処理中のPC終了で未確定segmentを除去しても中断理由を保持する", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-archive-stopping-recovery-"));
+  const archiveKey = key();
+  const first = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey });
+  await first.initialize();
+  await first.createSession({ sessionId: "stopping_interrupted", state: "stopping" });
+  await first.createSegment("stopping_interrupted", {
+    speakerId: "participant",
+    speakerName: "参加者",
+    startedAtMs: Date.now(),
+  });
+  await first.close();
+
+  const second = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey });
+  await second.initialize();
+  const recovered = await second.getSession("stopping_interrupted");
+  assert.equal(recovered.state, "processing_failed");
+  assert.equal(recovered.failureCode, "PROCESS_INTERRUPTED");
+  assert.equal(recovered.segments[0].state, "discarded_after_restart");
+  await second.close();
+  await rm(root, { recursive: true, force: true });
+});

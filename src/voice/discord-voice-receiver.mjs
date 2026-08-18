@@ -56,6 +56,15 @@ export class DiscordVoiceReceiver {
     return this.sessionId;
   }
 
+  isConnected({ guildId = null, voiceChannelId = null, sessionId = null } = {}) {
+    if (!this.connection || !this.sessionId) return false;
+    if (this.connection.state?.status !== this.voice.VoiceConnectionStatus.Ready) return false;
+    if (guildId != null && String(this.guild?.id || "") !== String(guildId)) return false;
+    if (voiceChannelId != null && String(this.voiceChannelId || "") !== String(voiceChannelId)) return false;
+    if (sessionId != null && String(this.sessionId || "") !== String(sessionId)) return false;
+    return true;
+  }
+
   async start({ guild, voiceChannelId, sessionId, consentedUserIds = [] }) {
     if (this.connection || this.sessionId) throw new Error("別のVC録音セッションが動作中です");
     if (!guild?.voiceAdapterCreator || !guild?.id) throw new Error("VCへ接続できるDiscordサーバー情報がありません");

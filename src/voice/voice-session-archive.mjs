@@ -252,6 +252,21 @@ export class VoiceSessionArchive {
     });
   }
 
+  async listSessions({ states = [], limit = 100 } = {}) {
+    return this.#serialize(async () => {
+      this.#assertReady();
+      const stateFilter = new Set(Array.isArray(states) ? states.map(String).filter(Boolean) : []);
+      const max = Math.max(1, Math.min(1_000, Number(limit) || 100));
+      const records = [];
+      for (const [sessionId, entry] of this.#index) {
+        if (stateFilter.size && !stateFilter.has(entry.state)) continue;
+        records.push(await this.#getSessionInternal(sessionId));
+        if (records.length >= max) break;
+      }
+      return structuredClone(records);
+    });
+  }
+
   async updateSession(sessionId, patch = {}) {
     return this.#serialize(async () => {
       this.#assertReady();
@@ -601,10 +616,10 @@ export class VoiceSessionArchive {
         for (const segment of session.segments) {
           if (staleIds.has(segment.segmentId) && segment.state === "recording") segment.state = "discarded_after_restart";
         }
-        session.failureCode = "STALE_PART_REMOVED";
+        if (!session.failureCode) session.failureCode = "STALE_PART_REMOVED";
         await this.#writePrivateSession(sessionId, session);
         const indexEntry = this.#index.get(sessionId);
-        indexEntry.failureCode = "STALE_PART_REMOVED";
+        indexEntry.failureCode = session.failureCode;
       }
     }
     await this.#persistIndex();
@@ -640,6 +655,8 @@ export class VoiceSessionArchive {
 
   async #recoverInterruptedJobs() {
     const recoveries = new Map([
+      ["stopping", { state: "processing_failed", failureCode: "PROCESS_INTERRUPTED" }],
+      ["processing", { state: "processing_failed", failureCode: "PROCESS_INTERRUPTED" }],
       ["reprocessing", { state: "processing_failed", failureCode: "PROCESS_INTERRUPTED" }],
       ["reanalyzing", { state: "analysis_failed", failureCode: "ANALYSIS_INTERRUPTED" }],
     ]);

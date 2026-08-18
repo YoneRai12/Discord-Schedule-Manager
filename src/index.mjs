@@ -230,6 +230,8 @@ client.once(Events.ClientReady, async (readyClient) => {
 client.on(Events.MessageCreate, async (message) => {
   if (voiceMeetingController) {
     try {
+      const ended = await voiceMeetingController.handleMeetingEndMessage(message);
+      if (ended) return;
       await voiceMeetingController.handleMessageCreate(message);
     } catch (error) {
       const code = String(error?.code || error?.status || error?.name || "unknown").slice(0, 80);
