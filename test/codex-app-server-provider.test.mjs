@@ -33,6 +33,8 @@ function temporaryProviderPaths(t) {
         include_apps_usage_instructions: true,
         include_plugin_usage_instructions: true,
         include_skills_usage_instructions: true,
+        node_repl_auto_review_required: true,
+        node_repl_disabled: false,
       },
       { slug: "unrelated-model", description: "must not be copied" },
     ],
@@ -189,6 +191,8 @@ test("Codex App Serverをstdio・一時thread・read-only・承認なしで呼�
   assert.equal(isolatedCatalog.models[0].include_apps_usage_instructions, false);
   assert.equal(isolatedCatalog.models[0].include_plugin_usage_instructions, false);
   assert.equal(isolatedCatalog.models[0].include_skills_usage_instructions, false);
+  assert.equal(Object.hasOwn(isolatedCatalog.models[0], "node_repl_auto_review_required"), false);
+  assert.equal(Object.hasOwn(isolatedCatalog.models[0], "node_repl_disabled"), false);
   const isolatedConfig = fs.readFileSync(path.join(spawnCall.options.env.CODEX_HOME, "config.toml"), "utf8");
   assert.match(isolatedConfig, /^model_catalog_json = /mu);
   assert.match(isolatedConfig, /^cli_auth_credentials_store = "file"$/mu);
@@ -295,7 +299,7 @@ test("Codex turn失敗の診断は安全な型と状態だけを残し本文を�
   assert.doesNotMatch(diagnostics, /private|1234567890|https:/u);
 });
 
-test("Codexモデルcacheに未確認フィールドが増えた場合は安全側で起動しない", async (t) => {
+test("Codexモデルcacheに未確認フィールドが増えても一時カタログへコピーしない", async (t) => {
   const paths = temporaryProviderPaths(t);
   const cachePath = path.join(paths.sourceHome, "models_cache.json");
   const cache = JSON.parse(fs.readFileSync(cachePath, "utf8"));
@@ -312,11 +316,12 @@ test("Codexモデルcacheに未確認フィールドが増えた場合は安全�
   });
   t.after(() => provider.close());
 
-  await assert.rejects(
-    provider.initialize(),
-    (error) => error.code === "model_catalog_schema_changed",
+  await provider.initialize();
+  assert.equal(spawnCalls, 1);
+  const isolatedCatalog = JSON.parse(
+    fs.readFileSync(path.join(provider.isolatedCodexHome, "model_catalog.json"), "utf8"),
   );
-  assert.equal(spawnCalls, 0);
+  assert.equal(Object.hasOwn(isolatedCatalog.models[0], "unexpected_private_field"), false);
 });
 
 test("Codexモデルcacheの利用指示フラグがboolean以外なら安全側で起動しない", async (t) => {
