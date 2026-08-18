@@ -135,6 +135,7 @@ const SAFE_CODEX_ERROR_TYPES = new Set([
   "httpConnectionFailed",
   "internalServerError",
   "other",
+  "requestFailed",
   "responseStreamConnectionFailed",
   "responseStreamDisconnected",
   "responseTooManyFailedAttempts",
@@ -144,6 +145,16 @@ const SAFE_CODEX_ERROR_TYPES = new Set([
   "threadRollbackFailed",
   "unauthorized",
   "usageLimitExceeded",
+]);
+
+const TURN_ERRORS_REQUIRING_FRESH_PROCESS = new Set([
+  "httpConnectionFailed",
+  "internalServerError",
+  "other",
+  "requestFailed",
+  "responseStreamConnectionFailed",
+  "responseStreamDisconnected",
+  "serverOverloaded",
 ]);
 
 const MODEL_CATALOG_ALLOWED_KEYS = new Set([
@@ -626,14 +637,14 @@ export class CodexAppServerProvider {
     const threadId = threadResponse?.thread?.id;
     if (!threadId) throw Object.assign(new Error("Codex threadを開始できませんでした"), { code: "thread_start_failed" });
 
+    let turnFailure = null;
     try {
-      const turnResponse = await this.request("turn/start", {
+      const turnParams = {
         threadId,
         model: this.model,
         effort: this.reasoningEffort,
         approvalPolicy: "never",
         sandboxPolicy: { type: "readOnly", networkAccess: webSearchEnabled },
-        summary: "none",
         outputSchema,
         input: [{
           type: "text",
@@ -642,12 +653,23 @@ export class CodexAppServerProvider {
             JSON.stringify(userPayload),
           ].join("\n"),
         }],
-      });
+      };
+      // Sparkではreasoning summary指定を送らない。`none`も含め、未対応の
+      // optional fieldを省略してApp Server側のモデル既定値に任せる。
+      if (this.model !== "gpt-5.3-codex-spark") turnParams.summary = "none";
+      const turnResponse = await this.request("turn/start", turnParams);
       const turnId = turnResponse?.turn?.id;
       if (!turnId) throw Object.assign(new Error("Codex turnを開始できませんでした"), { code: "turn_start_failed" });
       return await this.waitForTurn(turnId);
+    } catch (error) {
+      turnFailure = error;
+      throw error;
     } finally {
       await this.request("thread/delete", { threadId }, { timeoutMs: 5_000 }).catch(() => {});
+      if (TURN_ERRORS_REQUIRING_FRESH_PROCESS.has(errorCode(turnFailure))) {
+        this.startPromise = null;
+        await this.stopProcess();
+      }
     }
   }
 
@@ -740,6 +762,9 @@ export class CodexAppServerProvider {
         willRetry: Boolean(params.willRetry),
         error: errorInfo,
       };
+      // App Serverが内部再試行すると明示した途中通知ではturnを失敗扱いにしない。
+      // 最終error、turn/completed、または既存timeoutのいずれかを待つ。
+      if (params.willRetry === true) return;
       state.error = Object.assign(new Error("Codex turn failed"), { code });
       this.settleTurn(params.turnId);
     }

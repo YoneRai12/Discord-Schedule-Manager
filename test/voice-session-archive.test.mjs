@@ -52,12 +52,24 @@ test("session private metadata, segments, transcript, and analysis remain encryp
     consentedUserIds: [testSnowflake(9)],
     policyRevision: "voice-policy-v1",
     startedAtMs: started + 100,
+    analysisAttemptCount: 2,
+    analysisNextAttemptAtMs: started + 5_000,
+    analysisLastErrorCode: "MODEL_TIMEOUT",
+    resultMessageId: testSnowflake(7),
+    publicationRevision: 3,
+    publicationCompletedAtMs: started + 4_000,
     state: "recording",
   });
   assert.equal(session.expiresAt, "2026-08-02T00:00:00.000Z");
   assert.equal(session.createdAtMs, started);
   assert.equal(session.expiresAtMs, started + VOICE_ARCHIVE_RETENTION_MS);
   assert.deepEqual(session.requiredUserIds, [testSnowflake(8)]);
+  assert.equal(session.analysisAttemptCount, 2);
+  assert.equal(session.analysisNextAttemptAtMs, started + 5_000);
+  assert.equal(session.analysisLastErrorCode, "MODEL_TIMEOUT");
+  assert.equal(session.resultMessageId, testSnowflake(7));
+  assert.equal(session.publicationRevision, 3);
+  assert.equal(session.publicationCompletedAtMs, started + 4_000);
   const consented = await archive.updateSession("session_safe_1", {
     consent: {
       userId: testSnowflake(9),
@@ -124,6 +136,69 @@ test("session private metadata, segments, transcript, and analysis remain encryp
   await reopened.initialize();
   assert.equal((await reopened.getSession("session_safe_1")).title, "PRIVATE_MEETING_TITLE");
   await reopened.close();
+});
+
+test("再試行と公開のmetadataは型を検証し、未知fieldと公開index混入を拒否する", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "voice-metadata-schema-"));
+  const archive = new VoiceSessionArchive({ rootDir: root, encryptionKey: key() });
+  await archive.initialize();
+
+  await assert.rejects(
+    archive.createSession({ sessionId: "unknown_meta", unknownPrivateValue: "secret" }),
+    (error) => error?.code === "UNSUPPORTED_SESSION_FIELD",
+  );
+  await assert.rejects(
+    archive.createSession({ sessionId: "invalid_retry", analysisAttemptCount: -1 }),
+    (error) => error?.code === "INVALID_SESSION_FIELD",
+  );
+  await assert.rejects(
+    archive.createSession({ sessionId: "invalid_message", resultMessageId: "not-a-snowflake" }),
+    (error) => error?.code === "INVALID_SESSION_FIELD",
+  );
+
+  await archive.createSession({ sessionId: "private_retry" });
+  const updated = await archive.updateSession("private_retry", {
+    analysisAttemptCount: 1,
+    analysisNextAttemptAtMs: Date.now() + 1_000,
+    analysisLastErrorCode: "SERVER_OVERLOADED",
+    resultMessageId: testSnowflake(4),
+    publicationRevision: 1,
+    publicationCompletedAtMs: Date.now(),
+  });
+  assert.equal(updated.analysisAttemptCount, 1);
+  await assert.rejects(
+    archive.updateSession("private_retry", { publicationRevision: 1.5 }),
+    (error) => error?.code === "INVALID_SESSION_FIELD",
+  );
+  await assert.rejects(
+    archive.updateSession("private_retry", { analysisLastErrorCode: "private detail" }),
+    (error) => error?.code === "INVALID_FAILURE_CODE",
+  );
+  const privateRetry = await archive.getSession("private_retry");
+  await assert.rejects(
+    archive.updateSession("private_retry", { analysisNextAttemptAtMs: privateRetry.createdAtMs - 1 }),
+    (error) => error?.code === "INVALID_SESSION_FIELD",
+  );
+  await assert.rejects(
+    archive.updateSession("private_retry", { publicationCompletedAtMs: privateRetry.expiresAtMs + 1 }),
+    (error) => error?.code === "INVALID_SESSION_FIELD",
+  );
+
+  const plaintextIndex = JSON.parse(await readFile(path.join(root, "index.json"), "utf8"));
+  const serializedIndex = JSON.stringify(plaintextIndex);
+  for (const privateField of [
+    "analysisAttemptCount",
+    "analysisNextAttemptAtMs",
+    "analysisLastErrorCode",
+    "resultMessageId",
+    "publicationRevision",
+    "publicationCompletedAtMs",
+    testSnowflake(4),
+  ]) {
+    assert.equal(serializedIndex.includes(privateField), false, privateField);
+  }
+  await archive.close();
+  await rm(root, { recursive: true, force: true });
 });
 
 test("expiry stays fixed at session start plus 24 hours and purge removes expired data", async () => {
@@ -284,23 +359,39 @@ test("再処理state claimはarchive内部でcompare-and-setされる", async ()
   await rm(root, { recursive: true, force: true });
 });
 
-test("再処理中の異常終了stateは次回lock取得後に再試行可能へ戻る", async () => {
+test("再処理中の異常終了stateは次回lock取得後に即時再試行可能へ戻る", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "voice-archive-recovery-"));
   const archiveKey = key();
-  const first = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey });
+  const now = Date.parse("2026-08-01T12:00:00.000Z");
+  const first = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey, now: () => now });
   await first.initialize();
   await first.createSession({ sessionId: "reprocess_interrupted", state: "reprocessing" });
-  await first.createSession({ sessionId: "reanalyze_interrupted", state: "reanalyzing" });
+  await first.createSession({
+    sessionId: "reanalyze_interrupted",
+    state: "reanalyzing",
+    analysisAttemptCount: 3,
+    analysisNextAttemptAtMs: now + 10_000,
+    analysisLastErrorCode: "MODEL_TIMEOUT",
+    resultMessageId: testSnowflake(4),
+    publicationRevision: 2,
+    publicationCompletedAtMs: now + 5_000,
+  });
   await first.close();
 
-  const second = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey });
+  const second = new VoiceSessionArchive({ rootDir: root, encryptionKey: archiveKey, now: () => now + 1_000 });
   await second.initialize();
   const reprocess = await second.getSession("reprocess_interrupted");
   const reanalyze = await second.getSession("reanalyze_interrupted");
   assert.equal(reprocess.state, "processing_failed");
   assert.equal(reprocess.failureCode, "PROCESS_INTERRUPTED");
   assert.equal(reanalyze.state, "analysis_failed");
-  assert.equal(reanalyze.failureCode, "ANALYSIS_INTERRUPTED");
+  assert.equal(reanalyze.failureCode, "AI_RETRY_EXHAUSTED");
+  assert.equal(reanalyze.analysisAttemptCount, 3);
+  assert.equal(reanalyze.analysisNextAttemptAtMs, null);
+  assert.equal(reanalyze.analysisLastErrorCode, "MODEL_TIMEOUT");
+  assert.equal(reanalyze.resultMessageId, testSnowflake(4));
+  assert.equal(reanalyze.publicationRevision, 2);
+  assert.equal(reanalyze.publicationCompletedAtMs, now + 5_000);
   await second.close();
   await rm(root, { recursive: true, force: true });
 });

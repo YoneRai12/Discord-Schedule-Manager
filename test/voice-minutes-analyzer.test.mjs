@@ -78,18 +78,37 @@ test("map/reduce要約はweb検索なし、fact-checkは安全な単一claimだ�
 
 test("provider失敗時も匿名化済みローカルtranscriptを保持し未確認にする", async () => {
   const analyzer = new VoiceMinutesAnalyzer({
-    provider: { async generateStructured() { throw Object.assign(new Error("down"), { code: "provider_down" }); } },
+    provider: { async generateStructured() { throw Object.assign(new Error("down"), { code: "timeout" }); } },
     factCheckEnabled: true,
     logger: { warn() {} },
   });
   const result = await analyzer.analyze(transcript("実名 太郎から user@example.com へ連絡"));
   assert.equal(result.aiUsed, false);
   assert.equal(result.factCheckUsed, false);
-  assert.equal(result.errorCode, "provider_down");
+  assert.equal(result.errorCode, "timeout");
+  assert.equal(result.retryable, true);
   assert.match(result.minutes.overview, /未確認/u);
   assert.equal(result.transcript.segments[0].speaker, "speaker-01");
   assert.doesNotMatch(JSON.stringify(result.transcript), /実名 太郎|user@example\.com/u);
   assert.equal(JSON.stringify(result.transcript).includes(discordId), false);
+});
+
+test("providerの未知error codeは固定codeへ丸め、決定的な形式障害は再試行不可にする", async () => {
+  const unknown = new VoiceMinutesAnalyzer({
+    provider: { async generateStructured() { throw Object.assign(new Error("private"), { code: "private-meeting-title" }); } },
+    logger: { warn() {} },
+  });
+  const unknownResult = await unknown.analyze(transcript());
+  assert.equal(unknownResult.errorCode, "summary_failed");
+  assert.equal(unknownResult.retryable, true);
+
+  const invalid = new VoiceMinutesAnalyzer({
+    provider: { async generateStructured() { throw Object.assign(new Error("invalid"), { code: "invalid_provider_schema" }); } },
+    logger: { warn() {} },
+  });
+  const invalidResult = await invalid.analyze(transcript());
+  assert.equal(invalidResult.errorCode, "invalid_provider_schema");
+  assert.equal(invalidResult.retryable, false);
 });
 
 test("schemaの未知fieldと未知speaker tokenを厳格拒否する", () => {

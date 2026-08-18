@@ -50,7 +50,36 @@ const PRIVATE_META_FIELDS = [
   "completedAtMs",
   "stopReason",
   "stoppedById",
+  "analysisAttemptCount",
+  "analysisNextAttemptAtMs",
+  "analysisLastErrorCode",
+  "resultMessageId",
+  "publicationRevision",
+  "publicationCompletedAtMs",
 ];
+const PRIVATE_METADATA_INTERNAL_FIELDS = [
+  "version",
+  "sessionId",
+  "createdAt",
+  "expiresAt",
+  "createdAtMs",
+  "expiresAtMs",
+  "state",
+  "failureCode",
+  "segments",
+];
+const PRIVATE_METADATA_ALLOWED_FIELDS = new Set([
+  ...PRIVATE_METADATA_INTERNAL_FIELDS,
+  ...PRIVATE_META_FIELDS,
+]);
+const CREATE_META_ALLOWED_FIELDS = new Set([
+  "sessionId",
+  "state",
+  "failureCode",
+  "createdAtMs",
+  "expiresAtMs",
+  ...PRIVATE_META_FIELDS,
+]);
 
 export class VoiceArchiveError extends Error {
   constructor(code, message, options = undefined) {
@@ -109,6 +138,83 @@ function cleanFailureCode(value) {
     throw new VoiceArchiveError("INVALID_FAILURE_CODE", "failureCode contains unsupported characters");
   }
   return code;
+}
+
+function optionalNonNegativeSafeInteger(value, label, { nullable = true } = {}) {
+  if (nullable && (value === null || value === undefined)) return null;
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new VoiceArchiveError("INVALID_SESSION_FIELD", `${label} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function cleanResultMessageId(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const id = String(value);
+  if (!/^\d{16,20}$/u.test(id)) {
+    throw new VoiceArchiveError("INVALID_SESSION_FIELD", "resultMessageId must be a Discord snowflake");
+  }
+  return id;
+}
+
+function optionalSessionTimestamp(value, label, createdAtMs, expiresAtMs) {
+  const timestamp = optionalNonNegativeSafeInteger(value, label);
+  if (timestamp !== null && (timestamp < createdAtMs || timestamp > expiresAtMs)) {
+    throw new VoiceArchiveError("INVALID_SESSION_FIELD", `${label} must be within the immutable session retention window`);
+  }
+  return timestamp;
+}
+
+function validatePrivateMetadata(record, { corruption = false } = {}) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    throw new VoiceArchiveError(corruption ? "CORRUPT_METADATA" : "INVALID_SESSION_FIELD", "session metadata is invalid");
+  }
+  const unknown = Object.keys(record).filter((field) => !PRIVATE_METADATA_ALLOWED_FIELDS.has(field));
+  if (unknown.length) {
+    throw new VoiceArchiveError(
+      corruption ? "CORRUPT_METADATA" : "UNSUPPORTED_SESSION_FIELD",
+      "session metadata contains an unsupported field",
+    );
+  }
+  try {
+    const createdAtMs = optionalNonNegativeSafeInteger(record.createdAtMs, "createdAtMs", { nullable: false });
+    const expiresAtMs = optionalNonNegativeSafeInteger(record.expiresAtMs, "expiresAtMs", { nullable: false });
+    if (expiresAtMs < createdAtMs) {
+      throw new VoiceArchiveError("INVALID_SESSION_FIELD", "expiresAtMs cannot be earlier than createdAtMs");
+    }
+    record.analysisAttemptCount = optionalNonNegativeSafeInteger(
+      record.analysisAttemptCount ?? 0,
+      "analysisAttemptCount",
+      { nullable: false },
+    );
+    record.analysisNextAttemptAtMs = optionalSessionTimestamp(
+      record.analysisNextAttemptAtMs,
+      "analysisNextAttemptAtMs",
+      createdAtMs,
+      expiresAtMs,
+    );
+    record.analysisLastErrorCode = cleanFailureCode(record.analysisLastErrorCode);
+    record.resultMessageId = cleanResultMessageId(record.resultMessageId);
+    record.publicationRevision = optionalNonNegativeSafeInteger(
+      record.publicationRevision ?? 0,
+      "publicationRevision",
+      { nullable: false },
+    );
+    record.publicationCompletedAtMs = optionalSessionTimestamp(
+      record.publicationCompletedAtMs,
+      "publicationCompletedAtMs",
+      createdAtMs,
+      expiresAtMs,
+    );
+  } catch (error) {
+    if (corruption && error instanceof VoiceArchiveError) {
+      throw new VoiceArchiveError("CORRUPT_METADATA", "encrypted session metadata has invalid retry or publication fields", {
+        cause: error,
+      });
+    }
+    throw error;
+  }
+  return record;
 }
 
 function isWithin(root, candidate) {
@@ -204,6 +310,13 @@ export class VoiceSessionArchive {
   async createSession(meta = {}) {
     return this.#serialize(async () => {
       this.#assertReady();
+      if (!meta || typeof meta !== "object" || Array.isArray(meta)) {
+        throw new VoiceArchiveError("INVALID_SESSION_FIELD", "session metadata is invalid");
+      }
+      const unknown = Object.keys(meta).filter((field) => !CREATE_META_ALLOWED_FIELDS.has(field));
+      if (unknown.length) {
+        throw new VoiceArchiveError("UNSUPPORTED_SESSION_FIELD", "session metadata contains an unsupported field");
+      }
       const sessionId = safeId(meta.sessionId ?? randomUUID().replaceAll("-", ""), "sessionId");
       if (this.#index.has(sessionId)) throw new VoiceArchiveError("SESSION_EXISTS", "voice session already exists");
       const createdMs = dateMs(this.#now(), "now");
@@ -227,10 +340,17 @@ export class VoiceSessionArchive {
         failureCode,
         segments: [],
         consents: [],
+        analysisAttemptCount: 0,
+        analysisNextAttemptAtMs: null,
+        analysisLastErrorCode: null,
+        resultMessageId: null,
+        publicationRevision: 0,
+        publicationCompletedAtMs: null,
       };
       for (const field of PRIVATE_META_FIELDS) {
         if (Object.hasOwn(meta, field)) privateMeta[field] = structuredClone(meta[field]);
       }
+      validatePrivateMetadata(privateMeta);
       await this.#writeEncryptedJson(this.#metadataPath(sessionId), privateMeta, this.#aad("metadata", sessionId));
       const indexEntry = { sessionId, state, createdAt, expiresAt, failureCode };
       this.#index.set(sessionId, indexEntry);
@@ -658,15 +778,30 @@ export class VoiceSessionArchive {
       ["stopping", { state: "processing_failed", failureCode: "PROCESS_INTERRUPTED" }],
       ["processing", { state: "processing_failed", failureCode: "PROCESS_INTERRUPTED" }],
       ["reprocessing", { state: "processing_failed", failureCode: "PROCESS_INTERRUPTED" }],
-      ["reanalyzing", { state: "analysis_failed", failureCode: "ANALYSIS_INTERRUPTED" }],
     ]);
     let changed = false;
     for (const [sessionId, entry] of this.#index) {
-      const recovery = recoveries.get(entry.state);
+      let recovery = recoveries.get(entry.state);
+      let retryAtMs = null;
+      if (entry.state === "reanalyzing") {
+        const session = await this.#getSessionInternal(sessionId);
+        const nowMs = dateMs(this.#now(), "now");
+        if (session.analysisAttemptCount >= 3) {
+          recovery = { state: "analysis_failed", failureCode: "AI_RETRY_EXHAUSTED" };
+        } else if (nowMs < session.expiresAtMs) {
+          recovery = { state: "analysis_retry_wait", failureCode: "AI_RETRY_PENDING" };
+          // The lock is held and the interrupted attempt is no longer active, so an
+          // immediate durable retry is safe. Validation below keeps it inside TTL.
+          retryAtMs = Math.max(session.createdAtMs, nowMs);
+        } else {
+          recovery = { state: "analysis_failed", failureCode: "ANALYSIS_INTERRUPTED" };
+        }
+      }
       if (!recovery) continue;
       const session = await this.#getSessionInternal(sessionId);
       session.state = recovery.state;
       session.failureCode = recovery.failureCode;
+      session.analysisNextAttemptAtMs = retryAtMs;
       await this.#writePrivateSession(sessionId, session);
       entry.state = recovery.state;
       entry.failureCode = recovery.failureCode;
@@ -699,7 +834,10 @@ export class VoiceSessionArchive {
   async #getSessionInternal(sessionId) {
     const entry = this.#index.get(sessionId);
     if (!entry) return null;
-    const privateMeta = await this.#readEncryptedJson(this.#metadataPath(sessionId), this.#aad("metadata", sessionId));
+    const privateMeta = validatePrivateMetadata(
+      await this.#readEncryptedJson(this.#metadataPath(sessionId), this.#aad("metadata", sessionId)),
+      { corruption: true },
+    );
     if (privateMeta.sessionId !== sessionId
       || privateMeta.createdAt !== entry.createdAt
       || privateMeta.expiresAt !== entry.expiresAt) {
@@ -732,6 +870,7 @@ export class VoiceSessionArchive {
     next.state = String(next.state ?? "");
     if (!next.state || next.state.length > 96) throw new VoiceArchiveError("INVALID_STATE", "session state is invalid");
     next.failureCode = cleanFailureCode(next.failureCode);
+    validatePrivateMetadata(next);
     await this.#writePrivateSession(sessionId, next);
     const indexEntry = this.#index.get(sessionId);
     indexEntry.state = next.state;
@@ -748,6 +887,7 @@ export class VoiceSessionArchive {
 
   async #writePrivateSession(sessionId, session) {
     const privateMeta = { ...session };
+    validatePrivateMetadata(privateMeta);
     await this.#writeEncryptedJson(this.#metadataPath(sessionId), privateMeta, this.#aad("metadata", sessionId));
   }
 

@@ -17,6 +17,52 @@ const MINUTES_KEYS = Object.freeze([
 ]);
 const MAX_PROVIDER_OUTPUT_BYTES = 64 * 1024;
 const MAX_ITEMS_PER_FIELD = 40;
+const SUMMARY_ERROR_CODES = new Set([
+  "activeTurnNotSteerable",
+  "badRequest",
+  "chatgpt_auth_required",
+  "codex_auth_invalid",
+  "codex_auth_missing",
+  "contextWindowExceeded",
+  "cyberPolicy",
+  "empty_output",
+  "httpConnectionFailed",
+  "internalServerError",
+  "invalid_provider_json",
+  "invalid_provider_output",
+  "invalid_provider_schema",
+  "model_cache_invalid",
+  "model_cache_missing",
+  "model_cache_unsafe",
+  "model_catalog_schema_changed",
+  "model_catalog_unavailable",
+  "other",
+  "output_too_large",
+  "partial_minutes_too_large",
+  "provider_closed",
+  "provider_output_too_large",
+  "responseStreamConnectionFailed",
+  "responseStreamDisconnected",
+  "responseTooManyFailedAttempts",
+  "sandboxError",
+  "serverOverloaded",
+  "sessionBudgetExceeded",
+  "summary_failed",
+  "threadRollbackFailed",
+  "timeout",
+  "too_many_transcript_chunks",
+  "transport_unavailable",
+  "unauthorized",
+  "usageLimitExceeded",
+]);
+const NON_RETRYABLE_SUMMARY_ERROR_CODES = new Set([
+  "badRequest",
+  "contextWindowExceeded",
+  "cyberPolicy",
+  "invalid_provider_schema",
+  "partial_minutes_too_large",
+  "too_many_transcript_chunks",
+]);
 
 const stringArraySchema = {
   type: "array",
@@ -67,6 +113,15 @@ export const FACT_CHECK_SCHEMA = Object.freeze({
 
 function codedError(message, code) {
   return Object.assign(new Error(message), { code });
+}
+
+function safeSummaryErrorCode(error) {
+  const code = String(error?.code || error?.name || "summary_failed");
+  return SUMMARY_ERROR_CODES.has(code) ? code : "summary_failed";
+}
+
+function retryableSummaryError(code) {
+  return !NON_RETRYABLE_SUMMARY_ERROR_CODES.has(code);
 }
 
 function parseStructured(value, label) {
@@ -275,7 +330,7 @@ export class VoiceMinutesAnalyzer {
             });
             factChecks.push(validateFactCheck(response, claim));
           } catch (error) {
-            this.logger.warn?.(`[voice-minutes] fact-check failed code=${String(error?.code || error?.name || "unknown").slice(0, 80)}`);
+            this.logger.warn?.(`[voice-minutes] fact-check failed code=${safeSummaryErrorCode(error)}`);
           }
         }
       }
@@ -287,14 +342,16 @@ export class VoiceMinutesAnalyzer {
         factCheckUsed: factChecks.length > 0,
       };
     } catch (error) {
-      this.logger.warn?.(`[voice-minutes] summary failed code=${String(error?.code || error?.name || "unknown").slice(0, 80)}`);
+      const errorCode = safeSummaryErrorCode(error);
+      this.logger.warn?.(`[voice-minutes] summary failed code=${errorCode}`);
       return {
         transcript: sanitizedTranscript,
         minutes: localFallbackMinutes("AI要約に失敗しました。文字起こしは保存されています（未確認）。"),
         factChecks: [],
         aiUsed: false,
         factCheckUsed: false,
-        errorCode: String(error?.code || error?.name || "summary_failed").slice(0, 80),
+        errorCode,
+        retryable: retryableSummaryError(errorCode),
       };
     }
   }

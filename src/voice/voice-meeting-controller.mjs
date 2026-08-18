@@ -11,14 +11,36 @@ import { safeDisplayText } from "../privacy.mjs";
 
 const CONSENT_POLICY_REVISION = "voice-local-24h-v1";
 const ACTIVE_STATES = new Set(["pending_consent", "recording", "paused_for_consent", "stopping", "processing", "deleting"]);
+const ANALYSIS_RETRY_DELAYS_MS = Object.freeze([60_000, 5 * 60_000]);
+const ANALYSIS_MAX_ATTEMPTS = 3;
+const ANALYSIS_EXPIRY_SAFETY_MS = 5 * 60_000;
 
 function shortCode(error) {
   const value = String(error?.code || error?.status || error?.name || "voice_error").slice(0, 80);
   return /^[A-Za-z0-9_:-]{1,80}$/u.test(value) ? value : "voice_error";
 }
 
+function archiveFailureCode(error, fallback = "VOICE_ERROR") {
+  const value = String(error?.code || error?.status || error?.name || fallback)
+    .toUpperCase()
+    .replace(/[^A-Z0-9_:-]/gu, "_")
+    .slice(0, 96);
+  return value || fallback;
+}
+
+function nextAnalysisRetryAt({ attemptCount, expiresAtMs, nowMs }) {
+  const delayMs = ANALYSIS_RETRY_DELAYS_MS[Math.max(0, Number(attemptCount) - 1)];
+  if (!Number.isFinite(delayMs)) return null;
+  const nextAtMs = nowMs + delayMs;
+  return nextAtMs < Number(expiresAtMs) - ANALYSIS_EXPIRY_SAFETY_MS ? nextAtMs : null;
+}
+
 function abortedError() {
   return Object.assign(new Error("VC議事録の処理は取り消されました"), { code: "ABORTED" });
+}
+
+function analysisExpiredError() {
+  return Object.assign(new Error("VC議事録のAI処理期限を過ぎました"), { code: "ANALYSIS_EXPIRED" });
 }
 
 function throwIfAborted(signal) {
@@ -157,12 +179,33 @@ function processingNotice({ id, title }) {
   };
 }
 
+function resultPlaceholderMarker(sessionId) {
+  return `処理marker: \`VOICE_RESULT:${safeDisplayText(sessionId, 16)}\``;
+}
+
+function hasExactResultPlaceholderMarker(content, sessionId) {
+  const marker = resultPlaceholderMarker(sessionId);
+  return String(content || "").split(/\r?\n/gu).some((line) => line === marker);
+}
+
 function completedNotice({ id, title }) {
   return {
     content: [
       "✅ **文字起こし・議事録の処理が完了しました**",
       `セッション: **${safeDisplayText(id, 16)}** / ${safeDisplayText(title || "VCミーティング", 100)}`,
       "結果は議事録チャンネルへ投稿しました。",
+    ].join("\n"),
+    components: [],
+    allowedMentions: { parse: [] },
+  };
+}
+
+function analysisRetryNotice({ id, title }) {
+  return {
+    content: [
+      "⚠️ **文字起こしは完了し、AI要約を自動再試行します**",
+      `セッション: **${safeDisplayText(id, 16)}** / ${safeDisplayText(title || "VCミーティング", 100)}`,
+      "文字起こしと未確認の代替結果は議事録チャンネルへ保存済みです。",
     ].join("\n"),
     components: [],
     allowedMentions: { parse: [] },
@@ -229,6 +272,7 @@ export class VoiceMeetingController {
     sessionWatchdogIntervalMs = 5_000,
     emptyVoiceGraceMs = 8_000,
     connectionLossGraceMs = 20_000,
+    analysisRetryPollMs = 30_000,
     logger = console,
     now = () => Date.now(),
   } = {}) {
@@ -261,18 +305,24 @@ export class VoiceMeetingController {
     this.connectionLossGraceMs = Number.isFinite(Number(connectionLossGraceMs))
       ? Math.max(0, Math.min(120_000, Number(connectionLossGraceMs)))
       : 20_000;
+    this.analysisRetryPollMs = Math.max(1_000, Math.min(60_000, Number(analysisRetryPollMs) || 30_000));
     this.logger = logger;
     this.now = now;
     this.session = null;
     this.processing = new Map();
     this.processingAbortControllers = new Map();
     this.processingExpiryTimers = new Map();
+    this.analysisRetryTasks = new Map();
+    this.analysisRetryAbortControllers = new Map();
+    this.analysisRetryExpiryTimers = new Map();
     this.deletionTasks = new Map();
     this.maxTimer = null;
     this.noticeTimer = null;
     this.janitorTimer = null;
     this.automaticValidationTimer = null;
     this.sessionWatchdogTimer = null;
+    this.analysisRetryTimer = null;
+    this.analysisRetryTickPromise = null;
     this.emptyVoiceSinceMs = null;
     this.connectionLostAtMs = null;
     this.starting = false;
@@ -320,11 +370,44 @@ export class VoiceMeetingController {
     return task;
   }
 
+  registerAnalysisRetry(session, operation) {
+    const id = String(session.id);
+    if (this.analysisRetryTasks.has(id) || this.analysisRetryAbortControllers.has(id) || this.processing.has(id)) {
+      throw new Error("このセッションはすでに処理中です");
+    }
+    const abortController = new AbortController();
+    this.analysisRetryAbortControllers.set(id, abortController);
+    const task = Promise.resolve().then(() => operation(abortController.signal));
+    this.analysisRetryTasks.set(id, task);
+    const remainingMs = Number(session.expiresAtMs) - ANALYSIS_EXPIRY_SAFETY_MS - this.now();
+    if (Number.isFinite(remainingMs)) {
+      const expiryTimer = setTimeout(() => {
+        void this.deleteSession(id, { reason: "expired" }).catch((error) => {
+          this.logger.warn?.(`[voice] analysis_retention_delete_failed code=${shortCode(error)}`);
+        });
+      }, Math.max(0, Math.min(remainingMs, 0x7FFFFFFF)));
+      expiryTimer.unref?.();
+      this.analysisRetryExpiryTimers.set(id, expiryTimer);
+    }
+    const cleanup = () => {
+      if (this.analysisRetryTasks.get(id) === task) this.analysisRetryTasks.delete(id);
+      if (this.analysisRetryAbortControllers.get(id) === abortController) {
+        this.analysisRetryAbortControllers.delete(id);
+      }
+      const expiryTimer = this.analysisRetryExpiryTimers.get(id);
+      if (expiryTimer) clearTimeout(expiryTimer);
+      this.analysisRetryExpiryTimers.delete(id);
+    };
+    task.then(cleanup, cleanup);
+    return task;
+  }
+
   async purgeExpiredSafely() {
     const nowMs = this.now();
     const candidates = new Set([
       ...(this.session?.expiresAtMs <= nowMs ? [this.session.id] : []),
       ...this.processing.keys(),
+      ...this.analysisRetryTasks.keys(),
     ]);
     for (const id of candidates) {
       const record = await this.archive.getSession(id).catch(() => null);
@@ -332,7 +415,11 @@ export class VoiceMeetingController {
     }
     return this.archive.purgeExpired?.({
       nowMs,
-      excludeSessionIds: [this.session?.id, ...this.processing.keys()].filter(Boolean),
+      excludeSessionIds: [
+        this.session?.id,
+        ...this.processing.keys(),
+        ...this.analysisRetryTasks.keys(),
+      ].filter(Boolean),
     });
   }
 
@@ -381,6 +468,101 @@ export class VoiceMeetingController {
     return false;
   }
 
+  startAnalysisRetryTimer() {
+    clearInterval(this.analysisRetryTimer);
+    this.analysisRetryTimer = setInterval(() => {
+      void this.runAnalysisRetryTick().catch((error) => {
+        this.logger.warn?.(`[voice] analysis_retry_tick_failed code=${shortCode(error)}`);
+      });
+    }, this.analysisRetryPollMs);
+    this.analysisRetryTimer.unref?.();
+  }
+
+  async runAnalysisRetryTick() {
+    if (this.closing) return false;
+    if (this.analysisRetryTickPromise) return this.analysisRetryTickPromise;
+    const task = this.runAnalysisRetryTickInternal();
+    this.analysisRetryTickPromise = task;
+    try {
+      return await task;
+    } finally {
+      if (this.analysisRetryTickPromise === task) this.analysisRetryTickPromise = null;
+    }
+  }
+
+  async runAnalysisRetryTickInternal() {
+    if (typeof this.archive?.listSessions !== "function") return false;
+    const nowMs = this.now();
+    const records = await this.archive.listSessions({ states: ["analysis_retry_wait"], limit: 1_000 });
+    records.sort((left, right) => Number(left.analysisNextAttemptAtMs || 0) - Number(right.analysisNextAttemptAtMs || 0));
+    for (const candidate of records) {
+      if (Number(candidate.analysisAttemptCount) >= ANALYSIS_MAX_ATTEMPTS) {
+        await this.archive.transitionSession(candidate.sessionId, ["analysis_retry_wait"], {
+          state: "analysis_failed",
+          failureCode: "AI_RETRY_EXHAUSTED",
+          analysisNextAttemptAtMs: null,
+        });
+        continue;
+      }
+      if (Number(candidate.expiresAtMs) - ANALYSIS_EXPIRY_SAFETY_MS <= nowMs) {
+        await this.archive.transitionSession(candidate.sessionId, ["analysis_retry_wait"], {
+          state: "review_pending",
+          failureCode: "AI_RETRY_EXPIRED",
+          analysisNextAttemptAtMs: null,
+        });
+        continue;
+      }
+      if (!Number.isFinite(Number(candidate.analysisNextAttemptAtMs)) || Number(candidate.analysisNextAttemptAtMs) > nowMs) continue;
+      const started = await this.runSessionOperation(async () => {
+        const id = String(candidate.sessionId);
+        if (this.processing.has(id) || this.analysisRetryTasks.has(id)) return false;
+        const record = await this.archive.getSession(id);
+        if (!record || record.state !== "analysis_retry_wait" || Number(record.analysisNextAttemptAtMs) > this.now()) return false;
+        if (Number(record.analysisAttemptCount) >= ANALYSIS_MAX_ATTEMPTS) {
+          await this.archive.transitionSession(id, ["analysis_retry_wait"], {
+            state: "analysis_failed",
+            failureCode: "AI_RETRY_EXHAUSTED",
+            analysisNextAttemptAtMs: null,
+          });
+          return false;
+        }
+        if (!record.resultMessageId) {
+          await this.archive.transitionSession(id, ["analysis_retry_wait"], {
+            state: "analysis_failed",
+            failureCode: "RESULT_MESSAGE_ID_MISSING",
+            analysisNextAttemptAtMs: null,
+          });
+          return false;
+        }
+        const transcript = await this.archive.readTranscript?.(id);
+        if (!Array.isArray(transcript?.segments)) {
+          await this.archive.transitionSession(id, ["analysis_retry_wait"], {
+            state: "review_pending",
+            failureCode: "AI_RETRY_TRANSCRIPT_MISSING",
+            analysisNextAttemptAtMs: null,
+          });
+          return false;
+        }
+        const guild = await this.client.guilds.fetch(this.guildId);
+        const outputChannel = await guild.channels.fetch(record.outputChannelId);
+        const attemptCount = Math.max(0, Number(record.analysisAttemptCount) || 0) + 1;
+        const claimed = await this.archive.transitionSession(id, ["analysis_retry_wait"], {
+          state: "reanalyzing",
+          failureCode: null,
+          analysisAttemptCount: attemptCount,
+          analysisNextAttemptAtMs: null,
+          analysisLastErrorCode: null,
+        });
+        if (!claimed) return false;
+        const session = { ...claimed, guild, outputChannel, id, analysisAttemptCount: attemptCount };
+        this.registerAnalysisRetry(session, (signal) => this.runAnalysisAttempt(session, transcript, { signal }));
+        return true;
+      });
+      if (started) return true;
+    }
+    return false;
+  }
+
   async initialize() {
     if (!this.enabled) return { enabled: false };
     await this.archive.initialize?.();
@@ -388,7 +570,10 @@ export class VoiceMeetingController {
     if (purge?.failed) {
       throw Object.assign(new Error("期限切れ音声データを削除できないためVC録音を開始できません"), { code: "voice_purge_failed" });
     }
+    await this.reconcileInterruptedResultMessages();
     await this.reconcileInterruptedNotices();
+    this.startAnalysisRetryTimer();
+    await this.runAnalysisRetryTick();
     this.janitorTimer = setInterval(() => {
       void this.purgeExpiredSafely().catch((error) => {
         this.logger.warn?.(`[voice] retention_purge_failed code=${shortCode(error)}`);
@@ -396,6 +581,54 @@ export class VoiceMeetingController {
     }, 60_000);
     this.janitorTimer.unref?.();
     return { enabled: true };
+  }
+
+  async reconcileInterruptedResultMessages() {
+    if (typeof this.archive?.listSessions !== "function") return 0;
+    const records = await this.archive.listSessions({ states: ["processing_failed"], limit: 100 });
+    const interrupted = records.filter((record) => (
+      record?.failureCode === "PROCESS_INTERRUPTED"
+      && !record.resultMessageId
+      && record.outputChannelId
+    ));
+    if (!interrupted.length) return 0;
+    let guild;
+    try {
+      guild = await this.client.guilds.fetch(this.guildId);
+    } catch (error) {
+      this.logger.warn?.(`[voice] result_reconcile_guild_failed code=${shortCode(error)}`);
+      return 0;
+    }
+    let reconciled = 0;
+    for (const record of interrupted) {
+      try {
+        const channel = await guild.channels.fetch(record.outputChannelId);
+        if (typeof channel?.messages?.fetch !== "function") throw new Error("message history unavailable");
+        // Discord exposes at most the latest 100 messages in this bounded recovery scan.
+        const recent = await channel.messages.fetch({ limit: 100 });
+        const messages = Array.isArray(recent)
+          ? recent
+          : [...(recent?.values?.() || [])];
+        const matches = messages.filter((message) => (
+          String(message?.author?.id || "") === String(this.client.user?.id || "")
+          && String(message?.channelId || channel.id) === String(channel.id)
+          && /^\d{16,20}$/u.test(String(message?.id || ""))
+          && hasExactResultPlaceholderMarker(message?.content, record.sessionId)
+        ));
+        if (matches.length === 1) {
+          await this.archive.updateSession(record.sessionId, { resultMessageId: String(matches[0].id) });
+          reconciled += 1;
+        } else if (matches.length > 1) {
+          await this.archive.updateSession(record.sessionId, {
+            failureCode: "RESULT_MESSAGE_RECONCILE_AMBIGUOUS",
+          });
+          this.logger.warn?.("[voice] result_reconcile_ambiguous code=RESULT_MESSAGE_RECONCILE_AMBIGUOUS");
+        }
+      } catch (error) {
+        this.logger.warn?.(`[voice] result_reconcile_failed code=${shortCode(error)}`);
+      }
+    }
+    return reconciled;
   }
 
   async reconcileInterruptedNotices() {
@@ -1112,12 +1345,73 @@ export class VoiceMeetingController {
     session.state = "processing";
     await this.archive.updateSession(session.id, { state: "processing", stoppedAtMs: this.now() });
     await this.updateSessionNotice(session, processingNotice(session), "processing_notice_update_failed");
-    await session.outputChannel.send({
-      content: `⏳ セッション **${safeDisplayText(session.id, 16)}** は録音終了・VC退出済みです。保存済み音声をこのPCで文字起こししています。`,
-      allowedMentions: { parse: [] },
-    }).catch((error) => {
-      this.logger.warn?.(`[voice] processing_message_send_failed code=${shortCode(error)}`);
-    });
+    let resultMessage = null;
+    try {
+      resultMessage = await session.outputChannel.send({
+        content: [
+          `⏳ セッション **${safeDisplayText(session.id, 16)}** は録音終了・VC退出済みです。保存済み音声をこのPCで文字起こしています。`,
+          resultPlaceholderMarker(session.id),
+        ].join("\n"),
+        nonce: `voice-result-${session.id}`,
+        enforceNonce: true,
+        allowedMentions: { parse: [] },
+      });
+      const resultMessageId = String(resultMessage?.id || "");
+      try {
+        if (!/^\d{16,20}$/u.test(resultMessageId)) {
+          throw Object.assign(new Error("結果メッセージIDを確認できません"), { code: "RESULT_MESSAGE_ID_INVALID" });
+        }
+        await this.archive.updateSession(session.id, { resultMessageId });
+        session.resultMessageId = resultMessageId;
+      } catch (error) {
+        let rollbackFailed = false;
+        try {
+          if (typeof resultMessage?.delete !== "function") throw new Error("message delete unavailable");
+          await resultMessage.delete();
+        } catch {
+          rollbackFailed = true;
+        }
+        const code = rollbackFailed
+          ? "RESULT_MESSAGE_CHECKPOINT_ROLLBACK_FAILED"
+          : "RESULT_MESSAGE_CHECKPOINT_FAILED";
+        const patch = {
+          state: rollbackFailed ? "deletion_failed" : "processing_failed",
+          failureCode: code,
+          ...(rollbackFailed && /^\d{16,20}$/u.test(resultMessageId) ? { resultMessageId } : {}),
+        };
+        await this.archive.updateSession(session.id, patch).catch(() => {});
+        Object.assign(session, patch);
+        if (rollbackFailed && typeof resultMessage?.edit === "function") {
+          await resultMessage.edit({
+            content: `⚠️ 議事録の処理を安全に開始できませんでした。管理者は固定エラーコードを確認してください。エラーコード: ${code}`,
+            attachments: [],
+            components: [],
+            allowedMentions: { parse: [] },
+          }).catch(() => {});
+        }
+        await this.updateSessionNotice(session, {
+          ...failedNotice(session),
+          content: `${failedNotice(session).content}\nエラーコード: ${code}`,
+        }, "result_message_checkpoint_notice_failed");
+        this.logger.error?.(`[voice] result_message_checkpoint_failed code=${code}`);
+        this.session = null;
+        return { stopped: true, processing: false, failed: true, sessionId: session.id, code };
+      }
+    } catch (error) {
+      const code = archiveFailureCode(error, "PROCESSING_MESSAGE_SEND_FAILED") === "RESULT_MESSAGE_ID_INVALID"
+        ? "RESULT_MESSAGE_ID_INVALID"
+        : "PROCESSING_MESSAGE_SEND_FAILED";
+      const patch = { state: "processing_failed", failureCode: code };
+      await this.archive.updateSession(session.id, patch).catch(() => {});
+      Object.assign(session, patch);
+      await this.updateSessionNotice(session, {
+        ...failedNotice(session),
+        content: `${failedNotice(session).content}\nエラーコード: ${code}`,
+      }, "processing_message_send_notice_failed");
+      this.logger.warn?.(`[voice] processing_message_send_failed code=${code}`);
+      this.session = null;
+      return { stopped: true, processing: false, failed: true, sessionId: session.id, code };
+    }
     const processPromise = this.registerProcessing(
       session,
       (signal) => this.processSession(session, { signal }),
@@ -1129,14 +1423,38 @@ export class VoiceMeetingController {
   async processSession(session, { signal = undefined } = {}) {
     try {
       throwIfAborted(signal);
+      if (!session.resultMessageId) {
+        throw Object.assign(new Error("議事録の結果メッセージが保存されていません"), { code: "RESULT_MESSAGE_ID_MISSING" });
+      }
       const audioTranscript = await this.transcriber.transcribeSession(session.id, { signal });
       throwIfAborted(signal);
       const transcript = mergeTranscriptSegments(audioTranscript, session.chatSegments);
       await this.archive.writeTranscript(session.id, transcript);
       throwIfAborted(signal);
-      const outcome = await this.analyzeAndPublish(session, transcript, { signal });
-      await this.updateSessionNotice(session, completedNotice(session), "completed_notice_update_failed");
-      return { ok: true, aiUsed: outcome.aiUsed === true };
+      const attemptCount = Math.max(0, Number(session.analysisAttemptCount) || 0) + 1;
+      const claimed = await this.archive.transitionSession(session.id, ["processing", "reprocessing"], {
+        state: "reanalyzing",
+        failureCode: null,
+        analysisAttemptCount: attemptCount,
+        analysisNextAttemptAtMs: null,
+        analysisLastErrorCode: null,
+      });
+      if (!claimed) throw Object.assign(new Error("AI要約開始stateを取得できません"), { code: "ANALYSIS_CLAIM_FAILED" });
+      Object.assign(session, claimed, { state: "reanalyzing", analysisAttemptCount: attemptCount });
+      const outcome = await this.runAnalysisAttempt(session, transcript, { signal });
+      await this.updateSessionNotice(
+        session,
+        outcome.retryScheduled
+          ? analysisRetryNotice(session)
+          : (outcome.ok === false ? failedNotice(session) : completedNotice(session)),
+        "completed_notice_update_failed",
+      );
+      return {
+        ok: outcome.ok !== false,
+        aiUsed: outcome.aiUsed === true,
+        retryScheduled: outcome.retryScheduled === true,
+        ...(outcome.code ? { code: outcome.code } : {}),
+      };
     } catch (error) {
       if (isAborted(error)) return { ok: false, code: "ABORTED", aborted: true };
       if (signal?.aborted) {
@@ -1148,7 +1466,24 @@ export class VoiceMeetingController {
         }).catch(() => {});
         return { ok: false, code, cancellationFailed: true };
       }
-      await this.archive.updateSession(session.id, { state: "processing_failed", failureCode: shortCode(error) }).catch(() => {});
+      const analysisStage = session.state === "reanalyzing";
+      if (analysisStage) {
+        const recovery = await this.scheduleAnalysisInfrastructureFailure(session, error).catch(() => ({ retryScheduled: false }));
+        await this.updateSessionNotice(
+          session,
+          recovery.retryScheduled ? analysisRetryNotice(session) : failedNotice(session),
+          "analysis_failed_notice_update_failed",
+        );
+        return {
+          ok: false,
+          code: shortCode(error),
+          retryScheduled: recovery.retryScheduled === true,
+        };
+      }
+      await this.archive.updateSession(session.id, {
+        state: "processing_failed",
+        failureCode: archiveFailureCode(error),
+      }).catch(() => {});
       await this.updateSessionNotice(session, failedNotice(session), "failed_notice_update_failed");
       await session.outputChannel.send({
         content: [
@@ -1164,6 +1499,10 @@ export class VoiceMeetingController {
 
   async analyzeAndPublish(session, transcript, { signal = undefined } = {}) {
     throwIfAborted(signal);
+    if (this.now() >= Number(session.expiresAtMs) - ANALYSIS_EXPIRY_SAFETY_MS) throw analysisExpiredError();
+    if (!session.resultMessageId) {
+      throw Object.assign(new Error("議事録の結果メッセージが保存されていません"), { code: "RESULT_MESSAGE_ID_MISSING" });
+    }
     const analysis = this.analyzer
       ? await awaitWithAbort(
         this.analyzer.analyze(transcript, { knownNames: transcript.segments?.map((item) => item.speakerName) || [] }),
@@ -1173,17 +1512,102 @@ export class VoiceMeetingController {
     throwIfAborted(signal);
     await this.archive.writeAnalysis?.(session.id, analysis);
     throwIfAborted(signal);
+    if (this.now() >= Number(session.expiresAtMs) - ANALYSIS_EXPIRY_SAFETY_MS) throw analysisExpiredError();
+    let publication = null;
     if (this.publisher) {
-      await this.publisher.publish({
-        session: { ...session, state: "review_pending" },
+      publication = await this.publisher.publish({
+        session: { ...session },
         transcript,
         analysis,
         signal,
       });
     }
     throwIfAborted(signal);
-    await this.archive.updateSession(session.id, { state: "review_pending", completedAtMs: this.now() });
-    return { ok: true, aiUsed: analysis.aiUsed === true };
+    const publicationPatch = {
+      ...(publication?.messageId ? { resultMessageId: String(publication.messageId) } : {}),
+      ...(Number.isSafeInteger(publication?.publicationRevision)
+        ? { publicationRevision: publication.publicationRevision }
+        : {}),
+      ...(publication ? { publicationCompletedAtMs: this.now() } : {}),
+    };
+    if (analysis.aiUsed === true || !analysis.errorCode) {
+      const patch = {
+        ...publicationPatch,
+        state: "review_pending",
+        failureCode: null,
+        analysisNextAttemptAtMs: null,
+        analysisLastErrorCode: null,
+        completedAtMs: this.now(),
+      };
+      await this.archive.updateSession(session.id, patch);
+      Object.assign(session, patch);
+      return { ok: true, aiUsed: analysis.aiUsed === true };
+    }
+
+    const attemptCount = Math.max(1, Number(session.analysisAttemptCount) || 1);
+    const nextAttemptAtMs = analysis.retryable === true && attemptCount < ANALYSIS_MAX_ATTEMPTS
+      ? nextAnalysisRetryAt({ attemptCount, expiresAtMs: session.expiresAtMs, nowMs: this.now() })
+      : null;
+    const retryScheduled = Number.isFinite(nextAttemptAtMs);
+    const patch = {
+      ...publicationPatch,
+      state: retryScheduled ? "analysis_retry_wait" : "review_pending",
+      failureCode: retryScheduled
+        ? "AI_RETRY_PENDING"
+        : (analysis.retryable === true ? "AI_RETRY_EXHAUSTED" : "AI_SUMMARY_FAILED"),
+      analysisAttemptCount: attemptCount,
+      analysisNextAttemptAtMs: retryScheduled ? nextAttemptAtMs : null,
+      analysisLastErrorCode: archiveFailureCode({ code: analysis.errorCode }, "AI_SUMMARY_FAILED"),
+      ...(retryScheduled ? {} : { completedAtMs: this.now() }),
+    };
+    await this.archive.updateSession(session.id, patch);
+    Object.assign(session, patch);
+    return { ok: true, aiUsed: false, retryScheduled };
+  }
+
+  async runAnalysisAttempt(session, transcript, { signal = undefined } = {}) {
+    try {
+      return await this.analyzeAndPublish(session, transcript, { signal });
+    } catch (error) {
+      if (signal?.aborted || isAborted(error)) throw abortedError();
+      if (error?.code === "ANALYSIS_EXPIRED") {
+        await this.archive.transitionSession(session.id, ["reanalyzing"], {
+          state: "review_pending",
+          failureCode: "AI_RETRY_EXPIRED",
+          analysisNextAttemptAtMs: null,
+          analysisLastErrorCode: "ANALYSIS_EXPIRED",
+        }).catch(() => {});
+        return { ok: false, aiUsed: false, code: "ANALYSIS_EXPIRED", retryScheduled: false };
+      }
+      const recovery = await this.scheduleAnalysisInfrastructureFailure(session, error);
+      return {
+        ok: false,
+        aiUsed: false,
+        code: shortCode(error),
+        retryScheduled: recovery.retryScheduled === true,
+      };
+    }
+  }
+
+  async scheduleAnalysisInfrastructureFailure(session, error) {
+    const attemptCount = Math.max(1, Number(session.analysisAttemptCount) || 1);
+    const nextAttemptAtMs = attemptCount < ANALYSIS_MAX_ATTEMPTS
+      ? nextAnalysisRetryAt({ attemptCount, expiresAtMs: session.expiresAtMs, nowMs: this.now() })
+      : null;
+    const retryScheduled = Number.isFinite(nextAttemptAtMs);
+    const patch = {
+      state: retryScheduled ? "analysis_retry_wait" : "analysis_failed",
+      failureCode: retryScheduled ? "AI_RETRY_PENDING" : "AI_RETRY_EXHAUSTED",
+      analysisAttemptCount: attemptCount,
+      analysisNextAttemptAtMs: retryScheduled ? nextAttemptAtMs : null,
+      analysisLastErrorCode: archiveFailureCode(error, "AI_RETRY_FAILED"),
+    };
+    const updated = await this.archive.transitionSession(session.id, ["reanalyzing"], patch);
+    if (!updated) {
+      return { retryScheduled: false, nextAttemptAtMs: null, stateChanged: true };
+    }
+    Object.assign(session, updated);
+    return { retryScheduled, nextAttemptAtMs, stateChanged: false };
   }
 
   async reprocess(sessionIdValue) {
@@ -1199,6 +1623,7 @@ export class VoiceMeetingController {
       if (record.state !== "processing_failed") {
         throw new Error("失敗状態のセッションだけ再処理できます");
       }
+      if (!record.resultMessageId) throw new Error("保存済みの議事録メッセージがないため再処理できません");
       const guild = await this.client.guilds.fetch(this.guildId);
       const outputChannel = await guild.channels.fetch(record.outputChannelId);
       const claimed = await this.archive.transitionSession(id, ["processing_failed"], {
@@ -1217,38 +1642,35 @@ export class VoiceMeetingController {
     const id = String(sessionIdValue || "").trim().toUpperCase();
     if (!/^[A-F0-9]{10}$/u.test(id)) throw new Error("セッションIDの形式が正しくありません");
     const prepared = await this.runSessionOperation(async () => {
-      if (this.processing.has(id)) throw new Error("このセッションはすでに処理中です");
+      if (this.processing.has(id) || this.analysisRetryTasks.has(id)) throw new Error("このセッションはすでに処理中です");
       const record = await this.archive.getSession(id);
       if (!record || record.guildId !== this.guildId || record.expiresAtMs <= this.now()) {
         throw new Error("再処理できるローカル音声が見つかりません");
       }
-      if (!["review_pending", "analysis_failed"].includes(record.state)) {
+      if (!["review_pending", "analysis_failed", "analysis_retry_wait"].includes(record.state)) {
         throw new Error("文字起こし完了後のセッションだけ要約を再生成できます");
       }
+      if (!record.resultMessageId) throw new Error("保存済みの議事録メッセージがないため要約を再生成できません");
       const transcript = await this.archive.readTranscript?.(id);
       if (!transcript?.segments || !Array.isArray(transcript.segments)) {
         throw new Error("再利用できる文字起こしが見つかりません");
       }
       const guild = await this.client.guilds.fetch(this.guildId);
       const outputChannel = await guild.channels.fetch(record.outputChannelId);
-      const claimed = await this.archive.transitionSession(id, ["review_pending", "analysis_failed"], {
+      const attemptCount = Math.max(0, Number(record.analysisAttemptCount) || 0) + 1;
+      const claimed = await this.archive.transitionSession(id, ["review_pending", "analysis_failed", "analysis_retry_wait"], {
         state: "reanalyzing",
         failureCode: null,
+        analysisAttemptCount: attemptCount,
+        analysisNextAttemptAtMs: null,
+        analysisLastErrorCode: null,
       });
       if (!claimed) throw new Error("このセッションは別の処理が開始済みです");
-      const session = { ...claimed, guild, outputChannel, id };
-      const task = this.registerProcessing(session, async (signal) => {
-        try {
-          return await this.analyzeAndPublish(session, transcript, { signal });
-        } catch (error) {
-          if (isAborted(error)) throw error;
-          await this.archive.updateSession(id, {
-            state: "analysis_failed",
-            failureCode: shortCode(error),
-          }).catch(() => {});
-          throw error;
-        }
-      });
+      const session = { ...claimed, guild, outputChannel, id, analysisAttemptCount: attemptCount };
+      const task = this.registerAnalysisRetry(
+        session,
+        (signal) => this.runAnalysisAttempt(session, transcript, { signal }),
+      );
       return { task };
     });
     return prepared.task;
@@ -1291,7 +1713,12 @@ export class VoiceMeetingController {
         this.connectionLostAtMs = null;
       }
       this.processingAbortControllers.get(id)?.abort(reason);
-      return { activeSession, task: this.processing.get(id) || null };
+      this.analysisRetryAbortControllers.get(id)?.abort(reason);
+      return {
+        record: claimed,
+        activeSession,
+        task: this.processing.get(id) || this.analysisRetryTasks.get(id) || null,
+      };
     });
     if (prepared.missing) return false;
     if (prepared.activeSession) await this.receiver.stop({ discardActive: true });
@@ -1311,7 +1738,32 @@ export class VoiceMeetingController {
     if (taskOutcome?.ok === false && taskOutcome.code !== "ABORTED") {
       const code = shortCode({ code: taskOutcome.code });
       await this.archive.updateSession(id, { state: "deletion_failed", failureCode: code }).catch(() => {});
+      this.logger.error?.(`[voice] cancellation_cleanup_failed code=${code}`);
+      try {
+        const guild = await this.client.guilds.fetch(this.guildId);
+        const channel = await guild.channels.fetch(prepared.record.outputChannelId);
+        await channel.send({
+          content: `⚠️ VC議事録の削除確認を完了できませんでした。管理者はログの固定エラーコードを確認してください。エラーコード: ${safeDisplayText(code, 80)}`,
+          allowedMentions: { parse: [] },
+        });
+      } catch {}
       throw Object.assign(new Error("削除確認に失敗しました。管理者ログを確認してください"), { code });
+    }
+    if (reason !== "expired" && prepared.record?.resultMessageId) {
+      try {
+        const guild = await this.client.guilds.fetch(this.guildId);
+        const channel = await guild.channels.fetch(prepared.record.outputChannelId);
+        const message = await channel.messages.fetch(prepared.record.resultMessageId);
+        await message.delete();
+      } catch (error) {
+        const missing = Number(error?.code) === 10_008 || String(error?.code) === "UnknownMessage";
+        if (!missing) {
+          const code = "RESULT_MESSAGE_DELETE_FAILED";
+          await this.archive.updateSession(id, { state: "deletion_failed", failureCode: code }).catch(() => {});
+          this.logger.error?.(`[voice] result_message_delete_failed code=${archiveFailureCode(error)}`);
+          throw Object.assign(new Error("議事録メッセージを削除できないためローカルデータを保持しました"), { code });
+        }
+      }
     }
     await this.archive.deleteSession(id);
     return true;
@@ -1366,10 +1818,15 @@ export class VoiceMeetingController {
     clearInterval(this.noticeTimer);
     clearInterval(this.automaticValidationTimer);
     clearInterval(this.sessionWatchdogTimer);
+    clearInterval(this.analysisRetryTimer);
+    for (const timer of this.analysisRetryExpiryTimers.values()) clearTimeout(timer);
+    this.analysisRetryExpiryTimers.clear();
     this.automaticValidationTimer = null;
     this.sessionWatchdogTimer = null;
+    this.analysisRetryTimer = null;
     this.emptyVoiceSinceMs = null;
     this.connectionLostAtMs = null;
+    await this.analysisRetryTickPromise?.catch(() => {});
     await this.operationTail.catch(() => {});
     await Promise.allSettled([...this.deletionTasks.values()]);
     if (this.session) {
@@ -1378,7 +1835,33 @@ export class VoiceMeetingController {
       await this.archive.updateSession(session.id, { state: "interrupted", stoppedAtMs: this.now() }).catch(() => {});
       this.session = null;
     }
+    const interruptedAnalysisIds = new Set([
+      ...this.processing.keys(),
+      ...this.analysisRetryTasks.keys(),
+    ]);
+    for (const abortController of this.processingAbortControllers.values()) {
+      abortController.abort("shutdown");
+    }
+    for (const abortController of this.analysisRetryAbortControllers.values()) {
+      abortController.abort("shutdown");
+    }
+    await Promise.allSettled([...this.analysisRetryTasks.values()]);
     await Promise.allSettled([...this.processing.values()]);
+    for (const id of interruptedAnalysisIds) {
+      const record = await this.archive.getSession(id).catch(() => null);
+      if (record?.state !== "reanalyzing") continue;
+      const nextAttemptAtMs = nextAnalysisRetryAt({
+        attemptCount: Math.max(1, Number(record.analysisAttemptCount) || 1),
+        expiresAtMs: record.expiresAtMs,
+        nowMs: this.now(),
+      });
+      await this.archive.transitionSession(id, ["reanalyzing"], {
+        state: Number.isFinite(nextAttemptAtMs) ? "analysis_retry_wait" : "review_pending",
+        failureCode: Number.isFinite(nextAttemptAtMs) ? "AI_RETRY_PENDING" : "AI_RETRY_EXPIRED",
+        analysisNextAttemptAtMs: Number.isFinite(nextAttemptAtMs) ? nextAttemptAtMs : null,
+        analysisLastErrorCode: "ANALYSIS_INTERRUPTED",
+      }).catch(() => {});
+    }
     await this.archive.close?.();
     this.automaticPendingOutcomes.clear();
   }

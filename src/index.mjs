@@ -28,10 +28,15 @@ import {
   stopSchedulerAndDrain,
 } from "../scripts/runtime-support.mjs";
 
+function safeRuntimeCode(error) {
+  const value = String(error?.code || error?.status || error?.name || "unknown");
+  return /^[A-Za-z0-9_:-]{1,80}$/u.test(value) ? value : "unknown";
+}
+
 const config = loadConfig();
 const client = createDiscordClient();
 const store = new MeetingDatabase(config.databasePath);
-const codexProvider = (config.meetingAiProvider === "codex_app_server" || config.meetingVoiceAiSummaryEnabled)
+const codexProvider = config.meetingAiProvider === "codex_app_server"
   ? new CodexAppServerProvider({
     command: config.codexAppServerCommand,
     model: config.codexMeetingModel,
@@ -82,6 +87,14 @@ const voiceArchive = config.meetingVoiceEnabled
     logger: console,
   })
   : null;
+const voiceCodexProvider = config.meetingVoiceEnabled && config.meetingVoiceAiSummaryEnabled
+  ? new CodexAppServerProvider({
+    command: config.codexAppServerCommand,
+    model: config.codexMeetingModel,
+    reasoningEffort: config.codexReasoningEffort,
+    timeoutMs: config.codexAppServerTimeoutMs,
+  })
+  : null;
 const voiceReceiver = voiceArchive ? new DiscordVoiceReceiver({ archive: voiceArchive }) : null;
 const voiceTranscriber = voiceArchive
   ? new LocalTranscriber({
@@ -94,7 +107,7 @@ const voiceTranscriber = voiceArchive
   : null;
 const voiceAnalyzer = config.meetingVoiceEnabled && config.meetingVoiceAiSummaryEnabled
   ? new VoiceMinutesAnalyzer({
-    provider: codexProvider,
+    provider: voiceCodexProvider,
     summaryEnabled: true,
     factCheckEnabled: config.meetingVoiceFactCheckEnabled,
   })
@@ -212,6 +225,14 @@ client.once(Events.ClientReady, async (readyClient) => {
         console.warn(`[ai] codex app-server unavailable code=${code}`);
       });
     }
+    if (voiceCodexProvider) {
+      void voiceCodexProvider.initialize().then(() => {
+        console.log(`[voice-ai] codex app-server ready model=${config.codexMeetingModel} effort=${config.codexReasoningEffort}`);
+      }).catch((error) => {
+        const code = safeRuntimeCode(error);
+        console.warn(`[voice-ai] codex app-server unavailable code=${code}`);
+      });
+    }
     void coordinator.repairActiveInvitationUrls().then((urlRepair) => {
       if (urlRepair.repaired || urlRepair.failed || urlRepair.skippedByDeadline) {
         console.log(`[meeting-url] invitation repair repaired=${urlRepair.repaired} failed=${urlRepair.failed} skipped=${urlRepair.skippedByDeadline}`);
@@ -294,7 +315,7 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
 });
 
 client.on(Events.Error, (error) => {
-  const code = String(error?.code || error?.name || "unknown").slice(0, 80);
+        const code = safeRuntimeCode(error);
   console.error(`[discord] client error code=${code}`);
 });
 
@@ -315,7 +336,10 @@ async function shutdown(exitCode = 0) {
       stopSchedulerAndDrain(meetingCardUpdateScheduler, { timeoutMs: 10_000, label: "meeting-card-update-scheduler" }),
     ]);
     await voiceMeetingController?.close?.();
-    await codexProvider?.close?.();
+    await Promise.allSettled([
+      codexProvider?.close?.(),
+      voiceCodexProvider?.close?.(),
+    ]);
     try {
       client.destroy();
     } finally {
