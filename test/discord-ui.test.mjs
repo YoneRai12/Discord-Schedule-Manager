@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildDirectInvitePayload, buildMeetingPayload } from "../src/discord-ui.mjs";
+import {
+  buildDirectInvitePayload,
+  buildDraftPayload,
+  buildMeetingPayload,
+  buildNotificationPayload,
+  buildPersonalReminderPayload,
+} from "../src/discord-ui.mjs";
 
 const meeting = {
   id: "ABCD1234",
@@ -54,4 +60,53 @@ test("終了済み会議はURLを隠し出欠ボタンを無効化する", () =>
   assert.match(embed.title, /終了/u);
   assert.equal(buttons.length, 3);
   assert.equal(buttons.every((button) => button.disabled), true);
+});
+
+test("URL未定の会議は存在しないリンクを出さず後から追加できると案内する", () => {
+  const undecided = { ...meeting, meetingUrl: "" };
+  const card = buildMeetingPayload(undecided, []);
+  const cardJson = card.embeds[0].toJSON();
+  assert.match(cardJson.description, /開催場所:\*\* 未定/u);
+  assert.match(cardJson.description, /あとから/u);
+  assert.equal(card.components[0].toJSON().components.length, 3);
+
+  const direct = buildDirectInvitePayload(undecided);
+  assert.match(direct.embeds[0].toJSON().description, /追加されたらこのDMを自動更新/u);
+  assert.equal(direct.components[0].toJSON().components.length, 3);
+
+  const personal = buildPersonalReminderPayload({
+    meetingId: undecided.id,
+    title: undecided.title,
+    startsAtMs: undecided.startsAtMs,
+    endsAtMs: undecided.endsAtMs,
+    meetingUrl: "",
+    offsetMinutes: 10,
+  });
+  assert.match(personal.embeds[0].toJSON().description, /まだ未定/u);
+  assert.equal(personal.components[0].toJSON().components.length, 3);
+
+  const notification = buildNotificationPayload({
+    meetingId: undecided.id,
+    title: undecided.title,
+    startsAtMs: undecided.startsAtMs,
+    meetingUrl: "",
+    offsetMinutes: 0,
+    mentionAttendees: true,
+  }, []);
+  assert.match(notification.content, /参加先はまだ未定/u);
+  assert.doesNotMatch(notification.content, /null|undefined/u);
+});
+
+test("URL未定の作成確認は開催方法をボタンで選べる", () => {
+  const payload = buildDraftPayload({
+    draftId: "draft-example",
+    action: "create",
+    title: "全体MTG",
+    startsAtMs: meeting.startsAtMs,
+    endsAtMs: meeting.endsAtMs,
+    reminderMinutes: [30, 0],
+    meetingUrl: "",
+  });
+  const labels = payload.components[0].toJSON().components.map((button) => button.label);
+  assert.deepEqual(labels, ["Discord VCを選ぶ", "Google Meet / 外部URL", "未定で登録", "取り消す"]);
 });

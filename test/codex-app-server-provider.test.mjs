@@ -27,7 +27,15 @@ function temporaryProviderPaths(t) {
     etag: "test-etag",
     client_version: "test-version",
     models: [
-      { slug: "gpt-5.3-codex-spark", description: "test model" },
+      {
+        slug: "gpt-5.3-codex-spark",
+        description: "test model",
+        include_apps_usage_instructions: true,
+        include_plugin_usage_instructions: true,
+        include_skills_usage_instructions: true,
+        node_repl_auto_review_required: true,
+        node_repl_disabled: false,
+      },
       { slug: "unrelated-model", description: "must not be copied" },
     ],
   }), "utf8");
@@ -35,7 +43,7 @@ function temporaryProviderPaths(t) {
   return { root, sourceHome, sandboxDir };
 }
 
-function fakeAppServer({ completeTurn = true, responseText = '{"action":"unknown"}', stallMethod = null, turnError = null } = {}) {
+function fakeAppServer({ completeTurn = true, responseText = '{"action":"unknown"}', stallMethod = null, turnError = null, retryableTurnError = null } = {}) {
   const child = new EventEmitter();
   child.stdin = new PassThrough();
   child.stdout = new PassThrough();
@@ -72,6 +80,14 @@ function fakeAppServer({ completeTurn = true, responseText = '{"action":"unknown
         send({ id: message.id, result: { thread: { id: "thread-test" } } });
       } else if (message.method === "turn/start") {
         send({ id: message.id, result: { turn: { id: "turn-test" } } });
+        if (retryableTurnError) {
+          queueMicrotask(() => send({ method: "error", params: {
+            threadId: "thread-test",
+            turnId: "turn-test",
+            willRetry: true,
+            error: retryableTurnError,
+          } }));
+        }
         if (turnError) {
           queueMicrotask(() => send({ method: "error", params: {
             threadId: "thread-test",
@@ -180,6 +196,11 @@ test("Codex App Serverをstdio・一時thread・read-only・承認なしで呼�
   assert.equal(Object.hasOwn(isolatedCatalog.models[0], "tool_mode"), false);
   assert.equal(Object.hasOwn(isolatedCatalog.models[0], "multi_agent_version"), false);
   assert.equal(Object.hasOwn(isolatedCatalog.models[0], "supports_reasoning_summary_parameter"), false);
+  assert.equal(isolatedCatalog.models[0].include_apps_usage_instructions, false);
+  assert.equal(isolatedCatalog.models[0].include_plugin_usage_instructions, false);
+  assert.equal(isolatedCatalog.models[0].include_skills_usage_instructions, false);
+  assert.equal(Object.hasOwn(isolatedCatalog.models[0], "node_repl_auto_review_required"), false);
+  assert.equal(Object.hasOwn(isolatedCatalog.models[0], "node_repl_disabled"), false);
   const isolatedConfig = fs.readFileSync(path.join(spawnCall.options.env.CODEX_HOME, "config.toml"), "utf8");
   assert.match(isolatedConfig, /^model_catalog_json = /mu);
   assert.match(isolatedConfig, /^cli_auth_credentials_store = "file"$/mu);
@@ -200,8 +221,38 @@ test("Codex App Serverをstdio・一時thread・read-only・承認なしで呼�
   assert.deepEqual(turn.params.sandboxPolicy, { type: "readOnly", networkAccess: false });
   assert.equal(turn.params.approvalPolicy, "never");
   assert.ok(turn.params.outputSchema);
+  assert.equal(Object.hasOwn(turn.params, "summary"), false);
   assert.equal(Object.hasOwn(turn.params, "maxOutputTokens"), false);
   assert.equal(Object.hasOwn(turn.params, "max_output_tokens"), false);
+});
+
+test("App Serverが内部再試行するstream切断は最終失敗にせず完了を待つ", async (t) => {
+  const paths = temporaryProviderPaths(t);
+  const fake = fakeAppServer({
+    responseText: '{"action":"unknown"}',
+    retryableTurnError: {
+      codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 502 } },
+    },
+  });
+  const provider = new CodexAppServerProvider({
+    environment: { PATH: "safe", USERPROFILE: paths.root, CODEX_HOME: paths.sourceHome },
+    sandboxDir: paths.sandboxDir,
+    spawnImpl: () => fake.child,
+  });
+  t.after(() => provider.close());
+
+  const result = await provider.generateStructured({
+    systemPrompt: "meeting parser",
+    userPayload: { messageText: "safe" },
+    outputSchema: { type: "object" },
+  });
+
+  assert.equal(result, '{"action":"unknown"}');
+  assert.deepEqual(provider.lastTurnDiagnostics, {
+    code: "responseStreamDisconnected",
+    willRetry: true,
+    error: { type: "responseStreamDisconnected", httpStatusCode: 502 },
+  });
 });
 
 test("Codex子プロセスへBot・Sheets・OpenAIの秘密環境変数を継承しない", () => {
@@ -218,6 +269,36 @@ test("Codex子プロセスへBot・Sheets・OpenAIの秘密環境変数を継承
     PATH: "safe",
     TEMP: "C:\\Temp",
   });
+});
+
+test("allowWebSearch=trueの要求だけweb_search liveとnetworkを許可し、他ツールは無効のまま", async (t) => {
+  const paths = temporaryProviderPaths(t);
+  const fake = fakeAppServer();
+  const provider = new CodexAppServerProvider({
+    environment: { PATH: "safe", USERPROFILE: paths.root, CODEX_HOME: paths.sourceHome },
+    sandboxDir: paths.sandboxDir,
+    spawnImpl: () => fake.child,
+    logger: { warn() {}, error() {} },
+  });
+  t.after(() => provider.close());
+
+  await provider.generateStructured({
+    systemPrompt: "単一の公開claimを検証する",
+    userPayload: { claim: "Node.js 24は2025年に公開された。" },
+    outputSchema: { type: "object" },
+    allowWebSearch: true,
+  });
+
+  const thread = fake.messages.find((message) => message.method === "thread/start");
+  const turn = fake.messages.find((message) => message.method === "turn/start");
+  assert.equal(thread.params.config.web_search, "live");
+  assert.deepEqual(turn.params.sandboxPolicy, { type: "readOnly", networkAccess: true });
+  assert.deepEqual(thread.params.config.mcp_servers, {});
+  assert.equal(thread.params.config.features.apps, false);
+  assert.equal(thread.params.config.features.remote_plugin, false);
+  assert.equal(thread.params.config.features.shell_tool, false);
+  assert.equal(thread.params.config.features.unified_exec, false);
+  assert.match(thread.params.baseInstructions, /ウェブ検索以外のツール/u);
 });
 
 test("Codex turn失敗の診断は安全な型と状態だけを残し本文を保持しない", async (t) => {
@@ -252,11 +333,40 @@ test("Codex turn失敗の診断は安全な型と状態だけを残し本文を�
     willRetry: false,
     error: { type: "responseStreamDisconnected", httpStatusCode: 429 },
   });
+  assert.equal(fake.child.killedByProvider, true);
   const diagnostics = JSON.stringify(provider.lastTurnDiagnostics);
   assert.doesNotMatch(diagnostics, /private|1234567890|https:/u);
 });
 
-test("Codexモデルcacheに未確認フィールドが増えた場合は安全側で起動しない", async (t) => {
+test("最終requestFailed後は隔離App Serverを作り直して次の要求を処理する", async (t) => {
+  const paths = temporaryProviderPaths(t);
+  const first = fakeAppServer({
+    turnError: { codexErrorInfo: { requestFailed: {} } },
+  });
+  const second = fakeAppServer({ responseText: '{"action":"unknown"}' });
+  let spawnCalls = 0;
+  const provider = new CodexAppServerProvider({
+    environment: { PATH: "safe", USERPROFILE: paths.root, CODEX_HOME: paths.sourceHome },
+    sandboxDir: paths.sandboxDir,
+    spawnImpl: () => {
+      spawnCalls += 1;
+      return spawnCalls === 1 ? first.child : second.child;
+    },
+  });
+  t.after(() => provider.close());
+
+  const request = {
+    systemPrompt: "meeting parser",
+    userPayload: { messageText: "safe" },
+    outputSchema: { type: "object" },
+  };
+  await assert.rejects(provider.generateStructured(request), (error) => error.code === "requestFailed");
+  assert.equal(first.child.killedByProvider, true);
+  assert.equal(await provider.generateStructured(request), '{"action":"unknown"}');
+  assert.equal(spawnCalls, 2);
+});
+
+test("Codexモデルcacheに未確認フィールドが増えても一時カタログへコピーしない", async (t) => {
   const paths = temporaryProviderPaths(t);
   const cachePath = path.join(paths.sourceHome, "models_cache.json");
   const cache = JSON.parse(fs.readFileSync(cachePath, "utf8"));
@@ -273,11 +383,31 @@ test("Codexモデルcacheに未確認フィールドが増えた場合は安全�
   });
   t.after(() => provider.close());
 
+  await provider.initialize();
+  assert.equal(spawnCalls, 1);
+  const isolatedCatalog = JSON.parse(
+    fs.readFileSync(path.join(provider.isolatedCodexHome, "model_catalog.json"), "utf8"),
+  );
+  assert.equal(Object.hasOwn(isolatedCatalog.models[0], "unexpected_private_field"), false);
+});
+
+test("Codexモデルcacheの利用指示フラグがboolean以外なら安全側で起動しない", async (t) => {
+  const paths = temporaryProviderPaths(t);
+  const cachePath = path.join(paths.sourceHome, "models_cache.json");
+  const cache = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+  cache.models[0].include_apps_usage_instructions = "true";
+  fs.writeFileSync(cachePath, JSON.stringify(cache), "utf8");
+  const provider = new CodexAppServerProvider({
+    environment: { PATH: "safe", USERPROFILE: paths.root, CODEX_HOME: paths.sourceHome },
+    sandboxDir: paths.sandboxDir,
+    spawnImpl: () => fakeAppServer().child,
+  });
+  t.after(() => provider.close());
+
   await assert.rejects(
     provider.initialize(),
     (error) => error.code === "model_catalog_schema_changed",
   );
-  assert.equal(spawnCalls, 0);
 });
 
 test("turnタイムアウト後は子プロセスを破棄し次回呼び出しで再初期化する", async (t) => {

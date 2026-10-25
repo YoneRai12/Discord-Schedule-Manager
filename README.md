@@ -95,7 +95,7 @@ powershell -NoProfile -ExecutionPolicy RemoteSigned -File ".\scripts\manage-auto
 
 Discord Developer Portalで専用Applicationを作成し、Botを追加します。既存Botのトークンを流用しないことを推奨します。
 
-このBotは`GUILDS`、`GUILD_MESSAGES`、`DIRECT_MESSAGES`だけを要求し、特権的な`MESSAGE CONTENT INTENT`を要求しません。サーバー内ではBot自身が直接メンションされたメッセージだけを自然言語操作の対象にします。
+このBotは`GUILDS`、`GUILD_MESSAGES`、`DIRECT_MESSAGES`、`GUILD_VOICE_STATES`を使います。読み上げBotの音声を再認識せずVCチャット原文を議事録に収録するため、Discord Developer Portalの`Privileged Gateway Intents`で`MESSAGE CONTENT INTENT`をONにしてください。議事録へ収録する通常メッセージは、録音中の指定VCチャットに限定します。
 
 招待URLには`bot`と`applications.commands`スコープを付け、次の権限を許可します。
 
@@ -103,6 +103,8 @@ Discord Developer Portalで専用Applicationを作成し、Botを追加します
 - メッセージを送信
 - 埋め込みリンク
 - メッセージ履歴を読む
+- ファイルを添付
+- 接続
 - アプリコマンドを使う
 
 `Administrator`は不要です。
@@ -133,7 +135,7 @@ Discord Developer Portalで専用Applicationを作成し、Botを追加します
 
 ## 会議を登録する
 
-会議名・日時・固定メンバー・URLは、順番をそろえたり定型文にしたりする必要はありません。登録済みの呼び名やDiscordメンションはローカルで参加者へ変換し、残りの文章からAIが会議名と日時を整理します。
+会議名・日時・固定メンバー・URLは、順番をそろえたり定型文にしたりする必要はありません。URLは未定のままでも登録できます。登録済みの呼び名やDiscordメンションはローカルで参加者へ変換し、残りの文章からAIが会議名と日時を整理します。
 
 ```text
 @予定管理 メンバーAとメンバーB 30分前 全体定例
@@ -142,7 +144,7 @@ https://calendar.app.google/招待用トークン 来週月曜20時30分 1時間
 
 Googleカレンダーの招待URLを送った場合は、Botが動くPCからGoogleへ直接アクセスし、ページ内のGoogle Meet URLをbest-effortで自動取得します。このページ内容やURLをOpenAIへは送りません。Google側の表示形式やログイン状態によって取得できない場合は、直接のMeet URLを貼ってください。直接のMeet・Zoom・Teams・Whereby・Jitsiなど、HTTPSの会議URLも使えます。直接URLはBotからアクセスせず、そのまま保存します。
 
-足りない必須項目があれば「開始日時が足りません」のように項目名を返します。会議名だけ無い場合は`会議 7/21 19:00`のような仮名を付け、黄色い確認画面で自動設定と明示します。日時、URLが登録済みであること、個別DMの相手を確認して「登録する」を押します。
+足りない必須項目があれば「開始日時が足りません」のように項目名を返します。会議名だけ無い場合は`会議 7/21 19:00`のような仮名を付け、黄色い確認画面で自動設定と明示します。URL未定の確認画面では「Discord VCを選ぶ」「Google Meet / 外部URL」「未定で登録」をボタンで選びます。Discord VCは一覧から指定でき、自分が先に入室する必要はありません。「自動議事録 ON/OFF」も同じ確認画面で切り替えられます。`/meeting create`では`voice_channel`と`auto_transcribe`を指定でき、`url`と`voice_channel`の両方を省略すれば未定で作成できます。
 
 作成後にURLだけ直す場合、チャンネル内の開催予定が1件だけなら、`@予定管理`の後へURLだけ貼っても認識します。通常チャンネルでは誤作動を避けるため、会議カードへの返信でもBotの直接メンションが必要です。
 
@@ -174,7 +176,7 @@ AIを使わず項目を直接入力する場合は`/meeting create`を使いま�
 
 | Slash Command | 通常チャンネルの例 | 利用者 |
 |---|---|---|
-| `create` | `来週月曜20:30から定例、URLは…` | 管理者 |
+| `create` | `来週月曜20:30から定例、URL未定` | 管理者 |
 | `url` | `@予定管理 URL`、複数候補なら会議カードへBotをメンションして返信 | 管理者 |
 | `list` | `今後の会議を見せて` | 全員 |
 | `status` | `MEET0001の出欠状況` | 全員 |
@@ -214,6 +216,48 @@ AIを使わず項目を直接入力する場合は`/meeting create`を使いま�
 ```
 
 会議が複数ある場合は`MEET0001 参加`のようにDMへ表示された会議IDを付けます。新しいIDは8文字で、修正前に作成された7文字IDもそのまま使えます。DMだけでなく、通常チャンネルで`@予定管理 MEET0001の会議に参加します`と回答することもできます。公開チャンネルの確認返信には会議URLを再掲しません。
+
+## Discord VCの文字起こし・議事録
+
+会議の開催場所にDiscord VCを選び、自動議事録をONにすると、開始15分前から終了予定までの間に人が指定VCへ入った時点でBotが自動参加し、同意ボタンを待たずに録音と文字起こしを始めます。開始したことはVCチャットへ明示し、誰でも停止ボタンから止められます。すでに入室している場合やBotを再起動した場合も定期確認で拾います。同じVCで複数の会議時間が重なっている場合は、誤った会議を選ばず自動開始を見送ります。自動議事録をOFFにして手動で開始する場合だけ、従来の同意確認を使います。自動録音中に途中参加者が入った場合は、その人を無言で文字起こし対象へ追加し、参加検知のチャット通知は増やしません。
+
+音声認識は`faster-whisper`を使ってBotのPC内だけで行います。Discordからユーザー別に受け取った音声をそのまま話者情報として使い、読み上げBotの音声は除外してVCチャット原文を取り込みます。最後の参加者がVCから抜けた状態が8秒続くと自動停止します。VCチャットでBotへ`会議終わったよ`、`会議終了`、`録音止めて`などとメンションしても、AIを使わない固定判定で停止できます。録音終了時は開始メッセージを「BotはVCから退出済み・保存済み音声を処理中」へ編集し、処理完了時にも同じメッセージを更新します。要約の一番最後の投稿には、実際のDiscord表示名・時刻・発言内容付きの`voice-transcript.txt`を添付します。AI要約には話者名・Discord ID・URL等を除いた匿名版だけを送ります。音声をOpenAIや外部STT APIへ送りません。暗号化した音声・文字起こし・要約のローカルバックアップは、再処理や人間確認のため開始から固定24時間だけ保持し、再処理しても期限を延ばしません。PC終了などで結果メッセージ作成直後にローカル処理が中断した場合は、次回起動時にBot自身が投稿した議事録チャンネルの最新100件だけを確認し、セッション固有markerが厳密に1件一致した場合だけ同じメッセージへ復旧します。2件以上なら誤更新を避けて停止し、100件より古い投稿は自動復旧対象外です。期限後はローカルデータだけが自動削除され、管理者はそれより前に削除できます。議事録チャンネルへ投稿した文字起こし・議事録はDiscord側のデータなので、ローカルの24時間削除には含まれません。
+
+準備は一度だけです。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup-local-voice.ps1 -PythonPath "Pythonの実行ファイル"
+```
+
+既定の`-Device cuda`では、固定バージョンの`faster-whisper`に加えてNVIDIA公式のCUDA 12用cuBLAS・cuDNN・runtimeをWindows x64の`.voice-venv`内だけへ入れます。システム全体のCUDAや他プロジェクトのPython環境は変更しません。CPUだけで使う環境は`-Device cpu`を指定すると巨大なNVIDIA依存を導入しません。`MEETING_VOICE_STT_DEVICE=cuda`で使う場合は、次のローカル合成音声テストで実際のGPU推論まで確認できます。
+
+```powershell
+.\.voice-venv\Scripts\python.exe scripts\verify_voice_cuda.py
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup-local-voice.ps1 -PythonPath "Pythonの実行ファイル" -Device cpu
+```
+
+GPUモデルの初期化後にcuBLAS・cuDNN・VRAM不足など既知のCUDA実行時障害が起きた場合だけ、同じローカルモデルをCPU `int8`で再試行します。壊れた音声や未知の例外をCPU再試行で隠さず、安全側で失敗として残します。
+
+`.env`へ`.env.example`の`MEETING_VOICE_*`を設定します。`MEETING_VOICE_OUTPUT_CHANNEL_ID`には文字起こしと議事録を投稿するテキストチャンネルを指定します。`@everyone`の閲覧拒否は必須ではありません。公開チャンネルを指定すると議事録も公開されるため、用途に合うチャンネルを選んでください。暗号鍵は32バイトのランダム値をBase64化したものを使い、GitやDiscordへ貼らないでください。
+
+```text
+@予定管理 VCの文字起こしを開始して
+@予定管理 VC文字起こしの状態を見せて
+@予定管理 VCの録音を止めて
+@予定管理 VC録音のプライバシーを教えて
+```
+
+同じ操作は`/meeting voice-start`、`voice-stop`、`voice-status`、`voice-privacy`でもできます。24時間以内の失敗データは`voice-reprocess`、即時削除は`voice-delete`です。AI要約を有効にした場合も、実名・Discord ID・URL・メール・電話番号・会議IDをローカルで除去した文字起こしだけをCodexへ送ります。裏取りを有効にした場合は、個人情報を含まない公開事実の短い主張だけがWeb検索対象です。
+
+障害対応でBOTを止めてローカル管理者が再処理する場合は、次の保守コマンドも使えます。コード側にもプロセス間排他ロックがあり、BOT録音・別の再処理がアーカイブを使用中なら実行を拒否します。IDを省略すると、24時間内で最新の`processing_failed`だけを選びます。すでに文字起こしが完成していて要約だけ直す場合は、音声推論を繰り返さない`--reuse-transcript`を使います。コマンドのログにはセッションID・会議名・本文を出しません。
+
+```powershell
+node scripts/reprocess_failed_voice_session.mjs
+node scripts/reprocess_failed_voice_session.mjs --reuse-transcript セッションID
+```
 
 ## プライバシー設計
 
@@ -356,6 +400,14 @@ POST
 - `src/web-projection.mjs`: WEB公開用の明示allowlist projection
 - `src/web-sync.mjs`: HMAC署名付きの任意片方向WEB同期
 - `src/discord-ui.mjs`: 会議カード、DM、ボタン
+- `src/voice/discord-voice-receiver.mjs`: Discordのユーザー別音声受信とBot音声除外
+- `src/voice/voice-session-archive.mjs`: 24時間固定・AES-256-GCM暗号化アーカイブ
+- `src/voice/local-transcriber.mjs`: 単一ローカルPythonワーカーの実行・上限・後始末
+- `src/voice/voice-meeting-controller.mjs`: VC自動開始、停止、再処理、保存済み文字起こしの再要約
+- `src/voice/voice-minutes-analyzer.mjs`: 匿名化済み議事録の要約と安全な公開事実候補の裏取り
+- `src/voice/voice-summary-publisher.mjs`: 要約分割と最後の発言者付きTXT添付
+- `scripts/reprocess_failed_voice_session.mjs`: 通常BOT停止中の安全な再処理・再要約
+- `scripts/verify_voice_cuda.py`: 合成音声だけを使うCUDA実推論診断
 - `scripts/runtime-support.mjs`: 任意連携の起動分離と安全な終了待ち
 - `scripts/manage-autostart.ps1`: Windowsタスクの登録・確認・解除
 - `scripts/backup-database.mjs`: WAL対応SQLiteオンラインバックアップ
